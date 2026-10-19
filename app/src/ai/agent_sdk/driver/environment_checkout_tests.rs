@@ -616,24 +616,20 @@ fn cold_and_warm_mirrors_refresh_default_and_remain_independent() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn mirror_tracks_all_refs_and_cached_checkout_survives_commit_graphs() {
+fn mirror_tracks_branches_and_tags_and_cached_checkout_survives_commit_graphs() {
     fixture_test(
-        "mirror_tracks_all_refs_and_cached_checkout_survives_commit_graphs",
+        "mirror_tracks_branches_and_tags_and_cached_checkout_survives_commit_graphs",
         |fixture| {
             fixture.prepare(fixture.request("cold", None), true);
             let mirror = fixture.mirror();
             assert_eq!(
-                git(&mirror, &["config", "--local", "remote.origin.fetch"]),
-                "+refs/*:refs/*"
+                git(
+                    &mirror,
+                    &["config", "--local", "--get-all", "remote.origin.fetch"]
+                ),
+                "+refs/heads/*:refs/heads/*\n+refs/tags/*:refs/tags/*"
             );
-            assert_eq!(
-                git(&mirror, &["config", "--local", "remote.origin.mirror"]),
-                "true"
-            );
-            assert_eq!(
-                git(&mirror, &["rev-parse", "refs/pinned/base"]),
-                fixture.pinned()
-            );
+            assert!(git(&mirror, &["for-each-ref", "refs/pinned"]).is_empty());
             git(
                 &mirror,
                 &["commit-graph", "write", "--reachable", "--split"],
