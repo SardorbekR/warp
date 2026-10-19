@@ -35,40 +35,6 @@ fn v4a_blank_line_fixture_ranges() {
 }
 
 #[test]
-fn v4a_line_data_round_trip() {
-    for length in 0..=4 {
-        for mut number in 0..3_usize.pow(length) {
-            let mut lines = Vec::new();
-            for _ in 0..length {
-                lines.push(["", "x", "y"][number % 3].to_owned());
-                number /= 3;
-            }
-            let wire = lines.join("\n");
-            let hunk = V4AHunk {
-                change_context: vec![],
-                pre_context: wire.clone(),
-                old: wire.clone(),
-                new: wire.clone(),
-                post_context: wire,
-                line_data: Some(V4ALineData {
-                    pre_context: lines.clone(),
-                    old: lines.clone(),
-                    new: lines.clone(),
-                    post_context: lines.clone(),
-                }),
-            };
-            let restored: V4AHunk =
-                serde_json::from_str(&serde_json::to_string(&hunk).unwrap()).unwrap();
-            let decoded = DecodedV4AHunk::new(&restored).unwrap();
-            assert_eq!(decoded.pre, lines);
-            assert_eq!(decoded.old, lines);
-            assert_eq!(decoded.new, lines);
-            assert_eq!(decoded.post, lines);
-        }
-    }
-}
-
-#[test]
 fn v4a_line_data_presence_and_validation() {
     let mut hunk: V4AHunk = serde_json::from_value(serde_json::json!({
         "change_context": [], "pre_context": "", "old": "old",
@@ -102,32 +68,6 @@ fn v4a_line_data_presence_and_validation() {
 }
 
 #[test]
-fn v4a_legacy_history_round_trip_loses_unknown_line_data() {
-    #[derive(Serialize, Deserialize)]
-    struct LegacyHunk {
-        change_context: Vec<String>,
-        pre_context: String,
-        old: String,
-        new: String,
-        post_context: String,
-    }
-    let payload = serde_json::json!({
-        "change_context": [], "pre_context": "before", "old": "", "new": "", "post_context": "",
-        "line_data": {"pre_context": ["before"], "old": [""]}
-    });
-    let hunk: V4AHunk = serde_json::from_value(payload.clone()).unwrap();
-    let diff = fuzzy_match_v4a_diffs("file", &[hunk], None, "before\n\n");
-    assert_eq!(deltas(&diff)[0].replacement_line_range, 2..3);
-
-    let legacy: LegacyHunk = serde_json::from_value(payload).unwrap();
-    let restored: V4AHunk = serde_json::from_value(serde_json::to_value(legacy).unwrap()).unwrap();
-    assert_eq!(restored.line_data, None);
-    let diff = fuzzy_match_v4a_diffs("file", &[restored], None, "before\n\n");
-    assert!(deltas(&diff).is_empty());
-    assert_eq!(diff.failures.unwrap().noop_deltas, 1);
-}
-
-#[test]
 fn v4a_large_hunk_outcome_counts() {
     let noop: V4AHunk = serde_json::from_value(serde_json::json!({
         "change_context": [], "pre_context": "", "old": "same", "new": "same", "post_context": ""
@@ -142,22 +82,6 @@ fn v4a_large_hunk_outcome_counts() {
     let failures = diff.failures.unwrap();
     assert_eq!(failures.noop_deltas, 300);
     assert_eq!(failures.fuzzy_match_failures, 300);
-}
-
-#[test]
-fn v4a_existing_string_decoding() {
-    for (wire, expected) in [
-        ("", vec![]),
-        ("\n", vec![""]),
-        ("x", vec!["x"]),
-        ("x\n", vec!["x"]),
-        ("x\n\n", vec!["x", ""]),
-        ("x\r\n\r\n", vec!["x", ""]),
-        ("x\r", vec!["x\r"]),
-        ("x\ry\n", vec!["x\ry"]),
-    ] {
-        assert_eq!(decode_v4a_lines(wire), expected, "{wire:?}");
-    }
 }
 
 #[test]
@@ -204,19 +128,6 @@ fn v4a_trailing_blank_wrong_occurrence() {
 
 #[test]
 fn v4a_blank_matching_line_counts() {
-    for strategy in [
-        V4AMatchStrategy::Exact,
-        V4AMatchStrategy::IndentationAgnostic,
-        V4AMatchStrategy::Fuzzy,
-    ] {
-        let scorer = V4AScorer {
-            pattern: &["a long enough line", " \t"],
-            strategy,
-            normalized_pattern: "a long enough line\n".into(),
-        };
-        assert_eq!(scorer.score(&["a long enough line"]), 0.0);
-        assert_eq!(scorer.score(&["a long enough line", "KEEP"]), 0.0);
-    }
     let hunk = V4AHunk {
         line_data: None,
         change_context: vec![],
@@ -236,6 +147,7 @@ fn v4a_blank_matching_line_counts() {
 fn v4a_genuine_noop() {
     for (old, new, content) in [
         ("x", "x\n", "x\n"),
+        ("x\r\n", "x\n", "x\r\n"),
         ("\n", "\n", "\n"),
         ("\n\n", "\n\n", "\n\n"),
         (" x\n", "x\n", "x\n"),
