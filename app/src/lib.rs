@@ -446,11 +446,13 @@ enum AuthInitialization {
 }
 
 impl LaunchMode {
+    /// Sets command-line launch flags so standby uses sandbox initialization without a run prompt.
     fn command_line(command: CliCommand, global_options: GlobalOptions, debug: bool) -> Self {
         let (is_sandboxed, computer_use_override) = match &command {
             CliCommand::Agent(AgentCommand::Run(args)) => {
                 (args.sandboxed, args.computer_use.computer_use_override())
             }
+            CliCommand::Agent(AgentCommand::RunCloudStandby(_)) => (true, None),
             _ => (false, None),
         };
         Self::CommandLine {
@@ -625,7 +627,14 @@ impl LaunchMode {
     fn supports_indexing(&self) -> bool {
         match self {
             LaunchMode::CommandLine { command, .. } => {
-                matches!(command, CliCommand::Agent(AgentCommand::Run { .. }))
+                // A pre-warmed sandbox indexes its repositories during preparation, so the
+                // claimed run inherits a warm index instead of rebuilding one.
+                matches!(
+                    command,
+                    CliCommand::Agent(
+                        AgentCommand::Run { .. } | AgentCommand::RunCloudStandby { .. }
+                    )
+                )
             }
             LaunchMode::RemoteServerDaemon { .. } => {
                 FeatureFlag::RemoteCodebaseIndexing.is_enabled()
@@ -1588,6 +1597,14 @@ pub(crate) fn initialize_app(
     }
     #[cfg(not(target_family = "wasm"))]
     server_api.set_ambient_agent_task_id(ambient_agent_task_id);
+    #[cfg(not(target_family = "wasm"))]
+    if let LaunchMode::CommandLine {
+        command: CliCommand::Agent(AgentCommand::RunCloudStandby(args)),
+        ..
+    } = launch_mode
+    {
+        server_api.set_prewarmed_sandbox_id(args.standby_id.clone());
+    }
     let ai_client = server_api_provider.as_ref(ctx).get_ai_client();
     #[cfg(not(target_family = "wasm"))]
     // Refresh starts only after the authenticated server client exists; tracing initialization
