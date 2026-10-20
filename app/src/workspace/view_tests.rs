@@ -2674,6 +2674,191 @@ fn test_selecting_rename_from_pane_context_menu_preserves_editor_focus() {
 }
 
 #[test]
+fn test_pane_context_menu_toggles_read_state_in_status_order() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let open_menu = |workspace: &mut Workspace, ctx: &mut ViewContext<Workspace>| {
+            let pane_group = workspace.active_tab_pane_group().clone();
+            let pane_id = pane_group.as_ref(ctx).pane_id_from_index(0).unwrap();
+            let terminal_view_id = pane_group
+                .as_ref(ctx)
+                .terminal_view_from_pane_id(pane_id, ctx)
+                .expect("mock workspace starts with a terminal pane")
+                .id();
+            workspace.toggle_vertical_tabs_pane_context_menu(
+                0,
+                VerticalTabsPaneContextMenuTarget::ClickedPane(PaneViewLocator {
+                    pane_group_id: pane_group.id(),
+                    pane_id,
+                }),
+                Vector2F::zero(),
+                ctx,
+            );
+            (workspace.tab_right_click_menu.clone(), terminal_view_id)
+        };
+
+        let (menu, terminal_view_id) = workspace.update(&mut app, open_menu);
+        menu.update(&mut app, |menu, ctx| {
+            assert!(!menu.set_selected_by_name("Mark as read", ctx));
+            assert!(menu.set_selected_by_name("Mark as unread", ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+        AgentNotificationsModel::handle(&app).read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(terminal_view_id));
+            assert!(model.is_terminal_view_unread(terminal_view_id));
+        });
+
+        // Reopening the menu offers the inverse action.
+        let (menu, _) = workspace.update(&mut app, open_menu);
+        menu.update(&mut app, |menu, ctx| {
+            assert!(!menu.set_selected_by_name("Mark as unread", ctx));
+            assert!(menu.set_selected_by_name("Mark as read", ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+        AgentNotificationsModel::handle(&app).read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(terminal_view_id));
+        });
+    });
+}
+
+#[test]
+fn test_pane_context_menu_hides_read_state_in_manual_order() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let menu = workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group().clone();
+            let pane_id = pane_group.as_ref(ctx).pane_id_from_index(0).unwrap();
+            workspace.toggle_vertical_tabs_pane_context_menu(
+                0,
+                VerticalTabsPaneContextMenuTarget::ClickedPane(PaneViewLocator {
+                    pane_group_id: pane_group.id(),
+                    pane_id,
+                }),
+                Vector2F::zero(),
+                ctx,
+            );
+            workspace.tab_right_click_menu.clone()
+        });
+        menu.update(&mut app, |menu, ctx| {
+            assert!(!menu.set_selected_by_name("Mark as unread", ctx));
+            assert!(!menu.set_selected_by_name("Mark as read", ctx));
+            assert!(menu.set_selected_by_name("Rename pane", ctx));
+        });
+    });
+}
+
+/// Three single-pane tabs, the first marked unread so it sorts to the top of
+/// the status-ordered list: rows show as [tab 0 (unread), tab 2, tab 1], with
+/// the idle rows in most-recently-used order and tab 2 active.
+fn status_ordered_workspace_with_unread_first_tab(
+    workspace: &mut Workspace,
+    ctx: &mut ViewContext<Workspace>,
+) {
+    workspace.add_terminal_tab(false, ctx);
+    workspace.add_terminal_tab(false, ctx);
+    assert_eq!(workspace.active_tab_index, 2);
+    let first_terminal_view_id = workspace.tabs[0]
+        .pane_group
+        .as_ref(ctx)
+        .focused_session_view(ctx)
+        .expect("each tab starts with a terminal pane")
+        .id();
+    AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+        model.mark_terminal_view_unread(first_terminal_view_id, ctx);
+    });
+}
+
+#[test]
+fn test_next_and_previous_tab_follow_the_status_ordered_rows() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            status_ordered_workspace_with_unread_first_tab(workspace, ctx);
+
+            // Each step follows the displayed rows, not the tab order, and the
+            // order stays put while stepping even though focusing a row
+            // changes its recency (and clears its unread mark).
+            let mut visited = Vec::new();
+            for _ in 0..3 {
+                workspace.activate_next_tab(ctx);
+                visited.push(workspace.active_tab_index);
+            }
+            assert_eq!(visited, vec![1, 0, 2]);
+
+            workspace.activate_prev_tab(ctx);
+            assert_eq!(workspace.active_tab_index, 0);
+            workspace.activate_prev_tab(ctx);
+            assert_eq!(
+                workspace.active_tab_index, 1,
+                "previous wraps to the last row"
+            );
+        });
+    });
+}
+
+#[test]
+fn test_tab_number_shortcuts_follow_the_status_ordered_rows() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            status_ordered_workspace_with_unread_first_tab(workspace, ctx);
+
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+            assert_eq!(
+                workspace.active_tab_index, 0,
+                "the first row is the unread tab"
+            );
+            workspace.handle_action(&WorkspaceAction::ActivateLastTab, ctx);
+            assert_eq!(workspace.active_tab_index, 1);
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(2), ctx);
+            assert_eq!(workspace.active_tab_index, 2);
+            // A number past the last row does nothing.
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(8), ctx);
+            assert_eq!(workspace.active_tab_index, 2);
+        });
+    });
+}
+
+#[test]
+fn test_next_tab_uses_tab_order_in_manual_order() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            status_ordered_workspace_with_unread_first_tab(workspace, ctx);
+            workspace.activate_next_tab(ctx);
+            assert_eq!(workspace.active_tab_index, 0);
+            workspace.activate_next_tab(ctx);
+            assert_eq!(workspace.active_tab_index, 1);
+        });
+    });
+}
+
+#[test]
 fn test_selecting_rename_from_tab_group_context_menu_preserves_editor_focus() {
     let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
 
@@ -3962,6 +4147,12 @@ fn test_vertical_tabs_panel_auto_shows_when_setting_enabled() {
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
+        // Vertical tabs default to on in this fork; start from horizontal tabs.
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
 
         let workspace = mock_workspace(&mut app);
 
@@ -4000,6 +4191,12 @@ fn test_active_tab_bar_position_id_tracks_layout() {
     let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
     App::test((), |mut app| async move {
         initialize_app(&mut app);
+        // Vertical tabs default to on in this fork; start from horizontal tabs.
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+            });
+        });
 
         // Horizontal tabs (setting off): the horizontal bar is the drop zone.
         app.read(|ctx| {

@@ -1,7 +1,7 @@
 use settings::Setting as _;
 use warp_core::features::FeatureFlag;
 use warp_errors::report_if_error;
-use warpui::{App, EntityId, ModelHandle, SingletonEntity};
+use warpui::{App, EntityId, ModelHandle, SingletonEntity, WindowId};
 
 use super::AgentNotificationsModel;
 use crate::BlocklistAIHistoryModel;
@@ -13,7 +13,11 @@ use crate::ai::agent_management::notifications::{
 use crate::ai::artifacts::Artifact;
 use crate::ai::blocklist::BlocklistAIHistoryEvent;
 use crate::settings::AISettings;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::CLIAgent;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
+    CLIAgentSessionsModelEvent,
+};
 use crate::test_util::settings::initialize_settings_for_tests;
 
 fn setup_app(
@@ -437,5 +441,353 @@ fn in_progress_resume_clears_stale_notification_and_adds_none() {
                  (covers PRODUCT.md (18))"
             );
         });
+    });
+}
+
+#[test]
+fn mark_terminal_view_unread_and_read_round_trip() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let other_view_id = EntityId::new();
+
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(terminal_view_id));
+            assert!(!model.is_terminal_view_manually_unread(terminal_view_id));
+        });
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(terminal_view_id, ctx);
+            // Marking twice is a no-op.
+            model.mark_terminal_view_unread(terminal_view_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_unread(terminal_view_id));
+            assert!(model.is_terminal_view_manually_unread(terminal_view_id));
+            assert!(!model.is_terminal_view_unread(other_view_id));
+        });
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_read(terminal_view_id, ctx);
+            // Marking an unknown view read is a no-op.
+            model.mark_terminal_view_read(other_view_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(terminal_view_id));
+            assert!(!model.is_terminal_view_manually_unread(terminal_view_id));
+        });
+    });
+}
+
+#[test]
+fn mark_terminal_view_read_also_marks_notifications_read() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::HOANotifications.override_enabled(true);
+        let (_history, notifications) = setup_app(&mut app);
+        disable_telemetry_path(&mut app);
+
+        let conversation_id = AIConversationId::new();
+        let terminal_view_id = EntityId::new();
+        seed_stale_notification(&notifications, &mut app, conversation_id, terminal_view_id);
+        notifications.read(&app, |model, _| {
+            assert!(
+                model
+                    .notifications()
+                    .has_unread_for_terminal_view(terminal_view_id),
+                "precondition: the seeded notification is unread"
+            );
+            assert!(model.is_terminal_view_unread(terminal_view_id));
+            assert!(!model.is_terminal_view_manually_unread(terminal_view_id));
+        });
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_read(terminal_view_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(
+                !model
+                    .notifications()
+                    .has_unread_for_terminal_view(terminal_view_id)
+            );
+            assert!(!model.is_terminal_view_unread(terminal_view_id));
+            // The notification itself is kept, only marked read.
+            assert_eq!(
+                model
+                    .notifications()
+                    .filtered_count(NotificationFilter::All),
+                1
+            );
+        });
+    });
+}
+
+#[test]
+fn focus_clears_manual_unread_only_when_focus_moves_to_the_view() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+        let (_history, notifications) = setup_app(&mut app);
+        let window_id = WindowId::new();
+        let first_view = EntityId::new();
+        let second_view = EntityId::new();
+
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
+            model.mark_terminal_view_unread(first_view, ctx);
+            model.mark_terminal_view_unread(second_view, ctx);
+            // Focus returning to the already-focused view (e.g. after the
+            // context menu closes, or the window regaining focus) keeps the mark.
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(first_view));
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Focus that moves while the window is inactive never clears a mark,
+        // even once the window is active again with focus still there.
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), false, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Moving focus to the first view and back to the second clears only
+        // the views focus moved to while the window was active.
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), false, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(first_view));
+            assert!(!model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Moving away to a non-terminal pane and back clears the first view.
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(second_view, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, None, true, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_manually_unread(first_view));
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Windows are tracked independently.
+        let other_window_id = WindowId::new();
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(
+                other_window_id,
+                Some(second_view),
+                true,
+                ctx,
+            );
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_manually_unread(second_view));
+        });
+    });
+}
+
+#[test]
+fn focus_does_not_clear_manual_unread_when_status_order_is_disabled() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(false);
+        let (_history, notifications) = setup_app(&mut app);
+        let window_id = WindowId::new();
+        let first_view = EntityId::new();
+        let second_view = EntityId::new();
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(second_view, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+    });
+}
+
+#[test]
+fn cli_session_events_record_and_clear_activity() {
+    App::test((), |mut app| async move {
+        // Activity is tracked even when notifications are disabled.
+        let _guard = FeatureFlag::HOANotifications.override_enabled(false);
+        let (_history, notifications) = setup_app(&mut app);
+        let cli_sessions = CLIAgentSessionsModel::handle(&app);
+        let terminal_view_id = EntityId::new();
+
+        notifications.read(&app, |model, _| {
+            assert!(model.last_activity_at(terminal_view_id).is_none());
+        });
+
+        cli_sessions.update(&mut app, |_: &mut CLIAgentSessionsModel, ctx| {
+            ctx.emit(CLIAgentSessionsModelEvent::Started {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            });
+        });
+        let started_at =
+            notifications.read(&app, |model, _| model.last_activity_at(terminal_view_id));
+        assert!(started_at.is_some());
+
+        cli_sessions.update(&mut app, |_: &mut CLIAgentSessionsModel, ctx| {
+            ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+                status: CLIAgentSessionStatus::InProgress,
+                is_prompt_submit: true,
+                session_context: Box::default(),
+            });
+        });
+        let changed_at =
+            notifications.read(&app, |model, _| model.last_activity_at(terminal_view_id));
+        assert!(changed_at.is_some());
+        assert!(changed_at >= started_at);
+
+        cli_sessions.update(&mut app, |_: &mut CLIAgentSessionsModel, ctx| {
+            ctx.emit(CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            });
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.last_activity_at(terminal_view_id).is_none());
+        });
+    });
+}
+
+#[test]
+fn conversation_status_change_records_activity_but_restore_does_not() {
+    App::test((), |mut app| async move {
+        let (history, notifications) = setup_app(&mut app);
+
+        let conversation = AIConversation::new(false, false);
+        let conversation_id = conversation.id();
+        let terminal_view_id = EntityId::new();
+        history.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.last_activity_at(terminal_view_id).is_none());
+        });
+
+        history.update(&mut app, |model, ctx| {
+            let conv = model
+                .conversation_mut(&conversation_id)
+                .expect("conversation was just restored");
+            conv.update_status(ConversationStatus::InProgress, terminal_view_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.last_activity_at(terminal_view_id).is_some());
+        });
+    });
+}
+
+fn emit_cli_event(app: &mut App, event: CLIAgentSessionsModelEvent) {
+    let cli_sessions = CLIAgentSessionsModel::handle(&*app);
+    cli_sessions.update(app, |_: &mut CLIAgentSessionsModel, ctx| {
+        ctx.emit(event);
+    });
+}
+
+fn status_changed(
+    terminal_view_id: EntityId,
+    status: CLIAgentSessionStatus,
+    is_prompt_submit: bool,
+    session_id: Option<&str>,
+) -> CLIAgentSessionsModelEvent {
+    CLIAgentSessionsModelEvent::StatusChanged {
+        terminal_view_id,
+        agent: CLIAgent::Claude,
+        status,
+        is_prompt_submit,
+        session_context: Box::new(CLIAgentSessionContext {
+            session_id: session_id.map(str::to_owned),
+            ..Default::default()
+        }),
+    }
+}
+
+#[test]
+fn cli_session_awaits_first_prompt_until_a_prompt_is_submitted() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let awaiting = |app: &App, session_id: Option<&str>| {
+            notifications.read(app, |model, _| {
+                model.is_cli_session_awaiting_first_prompt(terminal_view_id, session_id)
+            })
+        };
+
+        emit_cli_event(
+            &mut app,
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            },
+        );
+        assert!(awaiting(&app, None));
+
+        // A status change that isn't a prompt (e.g. a permission request
+        // answered) doesn't count as the first prompt.
+        emit_cli_event(
+            &mut app,
+            status_changed(
+                terminal_view_id,
+                CLIAgentSessionStatus::InProgress,
+                false,
+                Some("abc"),
+            ),
+        );
+        assert!(awaiting(&app, Some("abc")));
+
+        emit_cli_event(
+            &mut app,
+            status_changed(
+                terminal_view_id,
+                CLIAgentSessionStatus::InProgress,
+                true,
+                Some("abc"),
+            ),
+        );
+        assert!(!awaiting(&app, Some("abc")));
+        // An id that is only reported later isn't a new session.
+        assert!(!awaiting(&app, None));
+        assert!(!awaiting(&app, Some("  abc  ")));
+
+        // A new agent session id (e.g. after `/clear`) awaits its own prompt.
+        assert!(awaiting(&app, Some("def")));
+
+        // Ending the session forgets the prompt; so does a replacement session.
+        emit_cli_event(
+            &mut app,
+            CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            },
+        );
+        assert!(awaiting(&app, Some("abc")));
+        emit_cli_event(
+            &mut app,
+            status_changed(
+                terminal_view_id,
+                CLIAgentSessionStatus::InProgress,
+                true,
+                None,
+            ),
+        );
+        assert!(!awaiting(&app, Some("abc")));
+        emit_cli_event(
+            &mut app,
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            },
+        );
+        assert!(awaiting(&app, None));
     });
 }

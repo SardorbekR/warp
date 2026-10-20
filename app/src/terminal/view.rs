@@ -5,6 +5,8 @@ mod block_banner;
 pub mod block_onboarding;
 pub(crate) mod blocklist_filter;
 mod bookmarks;
+pub(crate) mod cli_agent_session_restore;
+pub(crate) mod cli_agent_session_restore_banner;
 mod context_menu;
 pub mod init;
 pub mod inline_banner;
@@ -2633,6 +2635,8 @@ pub struct TerminalView {
     /// Commands that should run as separate blocks after the active pending
     /// command finishes successfully.
     pending_command_queue: VecDeque<String>,
+    /// Crash-recovery state for the CLI agent session (Claude Code, Codex) in this pane.
+    cli_agent_session_restore: cli_agent_session_restore::CLIAgentSessionRestoreState,
     /// When true, enter agent view after pending setup commands complete
     /// (i.e. after `PendingCommandCompleted` is emitted). Set by
     /// `pane_tree_from_template_recursive` when a tab config has both
@@ -4417,6 +4421,7 @@ impl TerminalView {
             is_login_shell_bootstrapped: false,
             awaiting_pending_command_completion: false,
             pending_command_queue: Default::default(),
+            cli_agent_session_restore: Default::default(),
             enter_agent_view_after_pending_commands: false,
             slow_bootstrap_banner,
             is_slow_bootstrap_banner_open: false,
@@ -13151,6 +13156,9 @@ impl TerminalView {
                     | BlockType::Background(_)
                     | BlockType::Static => None,
                 };
+                if let Some(block_succeeded) = pending_command_succeeded {
+                    self.on_user_block_completed_for_cli_agent_restore(block_succeeded, ctx);
+                }
 
                 // Emit PendingCommandCompleted when a pending command's block
                 // finishes (e.g. tab config setup commands like `git worktree add`).
@@ -13166,6 +13174,7 @@ impl TerminalView {
                             self.pending_command_queue.clear();
                         }
                         ctx.emit(Event::PendingCommandCompleted);
+                        self.on_pending_command_completed_for_cli_agent_restore(ctx);
 
                         // If agent view entry was deferred until setup commands
                         // finished, enter it now (unless suppressed by onboarding).
@@ -13727,6 +13736,7 @@ impl TerminalView {
                 ctx.notify();
             }
             ModelEvent::BootstrapPrecmdDone => {
+                self.on_bootstrap_precmd_done_for_cli_agent_restore(ctx);
                 self.execute_pending_command((), ctx);
             }
             ModelEvent::AgentTaggedInChanged {
@@ -14313,6 +14323,7 @@ impl TerminalView {
         event: &CLIAgentSessionsModelEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.track_cli_agent_session_for_restore(event, ctx);
         match event {
             CLIAgentSessionsModelEvent::Started {
                 terminal_view_id, ..

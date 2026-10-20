@@ -848,6 +848,10 @@ pub enum FeatureFlag {
     /// instead of individual pane rows.
     VerticalTabsSummaryMode,
 
+    /// Fork: enables status-ordered vertical tabs (sort by attention status,
+    /// group by project) with manual read/unread state.
+    VerticalTabsStatusOrder,
+
     CloudModeInputV2,
 
     /// Enables continuing cloud mode conversations in the cloud after an execution ends.

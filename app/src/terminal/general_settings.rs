@@ -37,6 +37,16 @@ define_settings_group!(GeneralSettings, settings: [
         toml_path: "general.restore_session",
         description: "Whether to restore the previous session when Warp starts up.",
     },
+    auto_resume_cli_agent_sessions: AutoResumeCLIAgentSessions {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "general.auto_resume_cli_agent_sessions",
+        description: "Whether restored panes automatically resume the Claude Code or Codex session that was running in them when Warp quit or crashed.",
+    },
     add_app_as_login_item: LoginItem {
         type: bool,
         default: true,

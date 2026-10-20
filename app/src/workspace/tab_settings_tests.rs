@@ -87,6 +87,58 @@ fn hide_title_bar_search_bar_in_vertical_tabs_uses_vertical_tabs_path() {
 }
 
 #[test]
+fn use_vertical_tabs_defaults_to_true_in_fork() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(*settings.use_vertical_tabs);
+        });
+    });
+}
+
+#[test]
+fn vertical_tabs_sort_mode_defaults_to_status() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert_eq!(
+                *settings.vertical_tabs_sort_mode.value(),
+                VerticalTabsSortMode::Status
+            );
+        });
+    });
+}
+
+#[test]
+fn vertical_tabs_sort_mode_uses_vertical_tabs_path() {
+    assert_eq!(
+        VerticalTabsSortMode::toml_path(),
+        Some("appearance.vertical_tabs.sort_mode")
+    );
+    assert_eq!(
+        VerticalTabsSortMode::hierarchy(),
+        Some("appearance.vertical_tabs")
+    );
+    assert_eq!(VerticalTabsSortMode::toml_key(), "sort_mode");
+}
+
+#[test]
+fn fork_vertical_tabs_settings_are_never_synced_to_cloud() {
+    // The fork must not push its defaults or toggles into the user's Warp
+    // account, where official Warp would pick them up.
+    assert!(matches!(
+        VerticalTabsSortMode::sync_to_cloud(),
+        SyncToCloud::Never
+    ));
+    assert!(matches!(
+        UseVerticalTabs::sync_to_cloud(),
+        SyncToCloud::Never
+    ));
+}
+
+#[test]
 fn header_toolbar_chip_selection_default_contains_code_review() {
     let config = HeaderToolbarChipSelection::Default;
     assert!(config.contains_item(&HeaderToolbarItemKind::CodeReview));

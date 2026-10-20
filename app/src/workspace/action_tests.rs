@@ -3,6 +3,7 @@ use warpui::EntityId;
 use super::WorkspaceAction;
 use crate::pane_group::TerminalPaneId;
 use crate::workspace::PaneViewLocator;
+use crate::workspace::tab_settings::VerticalTabsSortMode;
 use crate::workspace::tab_settings::{
     VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo, VerticalTabsTabItemMode,
     VerticalTabsViewMode,
@@ -79,4 +80,31 @@ fn pane_name_actions_save_workspace_state() {
     // same conditions as the locator-based one, since both ultimately drive
     // `rename_pane` which mutates `pane_configuration`.
     assert!(WorkspaceAction::RenameActivePane.should_save_app_state_on_action());
+}
+
+#[test]
+fn sort_mode_change_does_not_save_workspace_state() {
+    for mode in [
+        VerticalTabsSortMode::Status,
+        VerticalTabsSortMode::GroupByProject,
+        VerticalTabsSortMode::Manual,
+    ] {
+        assert!(
+            !WorkspaceAction::SetVerticalTabsSortMode(mode).should_save_app_state_on_action(),
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn read_state_changes_do_not_save_workspace_state() {
+    let terminal_view_id = EntityId::new();
+    assert!(
+        !WorkspaceAction::MarkTerminalViewUnread { terminal_view_id }
+            .should_save_app_state_on_action()
+    );
+    assert!(
+        !WorkspaceAction::MarkTerminalViewRead { terminal_view_id }
+            .should_save_app_state_on_action()
+    );
 }

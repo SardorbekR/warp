@@ -89,13 +89,15 @@ fn create_handler(agent: &CLIAgent) -> Option<Box<dyn CLIAgentSessionHandler>> {
 }
 
 /// Default handler shared by agents whose events need no special filtering
-/// beyond skipping the initial `SessionStart`.
+/// beyond skipping `SessionStart` events that carry no session id.
 struct DefaultSessionListener;
 
 impl CLIAgentSessionHandler for DefaultSessionListener {
     fn handle_event(&mut self, event: CLIAgentEvent) -> Option<CLIAgentEvent> {
-        // Skip session_start events (handled during listener construction)
-        if event.event == CLIAgentEventType::SessionStart {
+        // The `SessionStart` that creates the session is handled during listener construction.
+        // Later ones that carry a session id (`/clear`, an in-session `/resume`) are forwarded so
+        // the model tracks the agent's current session id; re-applying the initial one is a no-op.
+        if event.event == CLIAgentEventType::SessionStart && event.session_id.is_none() {
             return None;
         }
 

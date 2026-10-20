@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use instant::Instant;
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
 
@@ -28,6 +29,19 @@ pub struct AgentNotificationsModel {
     /// Artifacts accumulated during the current turn for each conversation.
     /// Drained into the notification when a terminal state fires, cleared on InProgress.
     pub(crate) pending_artifacts: HashMap<AIConversationId, Vec<Artifact>>,
+    /// When each terminal view's agent session last changed status. Feeds the
+    /// age labels and ordering of the status-ordered vertical tabs panel.
+    session_activity: HashMap<EntityId, Instant>,
+    /// Terminal views the user explicitly marked as unread.
+    manually_unread: HashSet<EntityId>,
+    /// The terminal view last focused in each window, so that manual unread
+    /// state is cleared only when focus actually moves.
+    last_focused_terminal_by_window: HashMap<WindowId, EntityId>,
+    /// Terminal views whose current CLI agent session has had a prompt
+    /// submitted, with the agent session id reported at that prompt. A
+    /// session is registered as in progress before its first prompt, so
+    /// this tells a session that is working apart from one that is waiting.
+    prompted_cli_sessions: HashMap<EntityId, Option<String>>,
 }
 
 impl Entity for AgentNotificationsModel {
@@ -56,6 +70,113 @@ impl AgentNotificationsModel {
         Self {
             notifications: NotificationItems::default(),
             pending_artifacts: HashMap::new(),
+            session_activity: HashMap::new(),
+            manually_unread: HashSet::new(),
+            last_focused_terminal_by_window: HashMap::new(),
+            prompted_cli_sessions: HashMap::new(),
+        }
+    }
+
+    /// When the agent session in `terminal_view_id` last changed status, if
+    /// a change has been observed since launch.
+    pub(crate) fn last_activity_at(&self, terminal_view_id: EntityId) -> Option<Instant> {
+        self.session_activity.get(&terminal_view_id).copied()
+    }
+
+    fn record_session_activity(&mut self, terminal_view_id: EntityId) {
+        self.session_activity
+            .insert(terminal_view_id, Instant::now());
+    }
+
+    /// Whether the terminal view has unread activity: either an unread
+    /// notification or an explicit "Mark as unread".
+    pub(crate) fn is_terminal_view_unread(&self, terminal_view_id: EntityId) -> bool {
+        self.manually_unread.contains(&terminal_view_id)
+            || self
+                .notifications
+                .has_unread_for_terminal_view(terminal_view_id)
+    }
+
+    pub(crate) fn is_terminal_view_manually_unread(&self, terminal_view_id: EntityId) -> bool {
+        self.manually_unread.contains(&terminal_view_id)
+    }
+
+    /// Marks the terminal view as unread until the user focuses it again.
+    pub(crate) fn mark_terminal_view_unread(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.manually_unread.insert(terminal_view_id) {
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// Clears both the manual unread mark and any unread notifications for
+    /// the terminal view.
+    pub(crate) fn mark_terminal_view_read(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let cleared_manual = self.manually_unread.remove(&terminal_view_id);
+        let cleared_notifications = self
+            .notifications
+            .mark_all_terminal_view_items_as_read(terminal_view_id);
+        if cleared_manual || cleared_notifications {
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// Records that `focused_terminal_view_id` is now focused in `window_id`
+    /// and clears its manual unread mark if focus actually moved to it. Focus
+    /// returning to the same view (e.g. after a context menu closes, or the
+    /// window regaining focus) keeps the mark. Focus that moves while the
+    /// window is inactive is recorded but never clears a mark, since the user
+    /// isn't looking at it.
+    pub(crate) fn handle_terminal_focus_for_read_state(
+        &mut self,
+        window_id: WindowId,
+        focused_terminal_view_id: Option<EntityId>,
+        is_active_window: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
+            return;
+        }
+        let previous = match focused_terminal_view_id {
+            Some(id) => self.last_focused_terminal_by_window.insert(window_id, id),
+            None => self.last_focused_terminal_by_window.remove(&window_id),
+        };
+        let Some(focused) = focused_terminal_view_id else {
+            return;
+        };
+        if is_active_window && previous != Some(focused) && self.manually_unread.remove(&focused) {
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// Whether the CLI agent session in `terminal_view_id` hasn't had a
+    /// prompt submitted yet. `current_session_id` is the session's current
+    /// agent session id: when it differs from the one seen at the last prompt
+    /// (e.g. after `/clear`), the new session hasn't been prompted either.
+    pub(crate) fn is_cli_session_awaiting_first_prompt(
+        &self,
+        terminal_view_id: EntityId,
+        current_session_id: Option<&str>,
+    ) -> bool {
+        fn normalized(session_id: Option<&str>) -> Option<&str> {
+            session_id.map(str::trim).filter(|id| !id.is_empty())
+        }
+        match self.prompted_cli_sessions.get(&terminal_view_id) {
+            None => true,
+            Some(prompted_session_id) => matches!(
+                (
+                    normalized(prompted_session_id.as_deref()),
+                    normalized(current_session_id),
+                ),
+                (Some(prompted), Some(current)) if prompted != current
+            ),
         }
     }
 
@@ -124,6 +245,38 @@ impl AgentNotificationsModel {
         event: &CLIAgentSessionsModelEvent,
         ctx: &mut ModelContext<Self>,
     ) {
+        // Track session activity independently of notifications so the
+        // vertical tabs panel can order and age rows.
+        match event {
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id, ..
+            } => {
+                // A new session starts out waiting for its first prompt.
+                self.prompted_cli_sessions.remove(terminal_view_id);
+                self.record_session_activity(*terminal_view_id);
+            }
+            CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                is_prompt_submit,
+                session_context,
+                ..
+            } => {
+                if *is_prompt_submit {
+                    self.prompted_cli_sessions
+                        .insert(*terminal_view_id, session_context.session_id.clone());
+                }
+                self.record_session_activity(*terminal_view_id);
+            }
+            CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id, ..
+            } => {
+                self.session_activity.remove(terminal_view_id);
+                self.prompted_cli_sessions.remove(terminal_view_id);
+            }
+            CLIAgentSessionsModelEvent::InputSessionChanged { .. }
+            | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
+        }
+
         if !FeatureFlag::HOANotifications.is_enabled() {
             return;
         }
@@ -311,6 +464,8 @@ impl AgentNotificationsModel {
         if updated_conversation.should_exclude_from_navigation() {
             return;
         }
+
+        self.record_session_activity(*terminal_surface_id);
 
         let status = updated_conversation.status().clone();
         let latest_query = updated_conversation.latest_user_query();

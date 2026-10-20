@@ -10,6 +10,7 @@ use super::event::{
 use super::{
     BlockedSource, CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession,
     CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
+    CLIAgentSessionsModelEvent,
 };
 use crate::ai::blocklist::{InputConfig, InputType};
 use crate::terminal::CLIAgent;
@@ -1454,5 +1455,308 @@ fn second_ctrl_c_while_armed_reuses_the_existing_window() {
                 "a second Ctrl-C while armed must reuse the existing window, not reset it"
             );
         });
+    });
+}
+
+fn session_event(
+    event: CLIAgentEventType,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    payload: CLIAgentEventPayload,
+) -> CLIAgentEvent {
+    CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event,
+        session_id: session_id.map(str::to_owned),
+        cwd: cwd.map(str::to_owned),
+        project: None,
+        payload,
+    }
+}
+
+#[test]
+fn parse_treats_empty_strings_as_missing() {
+    let body = r#"{"v":1,"agent":"claude","event":"stop","session_id":"","cwd":"","project":"","transcript_path":""}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+
+    assert_eq!(notif.session_id, None);
+    assert_eq!(notif.cwd, None);
+    assert_eq!(notif.project, None);
+    assert_eq!(notif.payload.transcript_path, None);
+}
+
+#[test]
+fn empty_session_id_does_not_erase_known_session_id() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    let body = r#"{"v":1,"agent":"claude","event":"stop","session_id":"","cwd":""}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+    session.apply_event(&notif);
+
+    assert_eq!(session.session_context.session_id.as_deref(), Some("abc"));
+    assert_eq!(session.session_context.cwd.as_deref(), Some("/repo"));
+    assert_eq!(session.session_context.launch_cwd.as_deref(), Some("/repo"));
+}
+
+#[test]
+fn launch_cwd_is_first_cwd_seen_for_the_session_id() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("abc"),
+        Some("/repo/sub dir"),
+        CLIAgentEventPayload {
+            query: Some("fix the build".to_owned()),
+            ..Default::default()
+        },
+    ));
+
+    assert_eq!(
+        session.session_context.cwd.as_deref(),
+        Some("/repo/sub dir")
+    );
+    assert_eq!(session.session_context.launch_cwd.as_deref(), Some("/repo"));
+}
+
+#[test]
+fn launch_cwd_waits_for_the_first_reported_cwd() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        None,
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(session.session_context.launch_cwd, None);
+
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(session.session_context.launch_cwd.as_deref(), Some("/repo"));
+}
+
+#[test]
+fn transcript_path_is_captured_from_events() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            transcript_path: Some("/home/me/.claude/projects/repo/abc.jsonl".to_owned()),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        session.session_context.transcript_path.as_deref(),
+        Some("/home/me/.claude/projects/repo/abc.jsonl")
+    );
+
+    // Events without a transcript path keep the known one.
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(
+        session.session_context.transcript_path.as_deref(),
+        Some("/home/me/.claude/projects/repo/abc.jsonl")
+    );
+}
+
+#[test]
+fn new_session_id_resets_launch_cwd_and_transcript_path() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            transcript_path: Some("/t/abc.jsonl".to_owned()),
+            ..Default::default()
+        },
+    ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("abc"),
+        Some("/repo/sub"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    // e.g. `/resume` of another session from a subdirectory.
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("def"),
+        Some("/repo/sub"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    assert_eq!(session.session_context.session_id.as_deref(), Some("def"));
+    assert_eq!(
+        session.session_context.launch_cwd.as_deref(),
+        Some("/repo/sub")
+    );
+    assert_eq!(session.session_context.transcript_path, None);
+}
+
+#[test]
+fn repeated_session_start_updates_session_id() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::Success, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    let status = session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("def"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    assert_eq!(status, None);
+    assert_eq!(session.status, CLIAgentSessionStatus::Success);
+    assert_eq!(session.session_context.session_id.as_deref(), Some("def"));
+}
+
+#[test]
+fn repeated_session_start_without_plugin_version_keeps_version() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            plugin_version: Some("1.5.0".to_owned()),
+            ..Default::default()
+        },
+    ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("def"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    assert_eq!(session.plugin_version.as_deref(), Some("1.5.0"));
+}
+
+#[test]
+fn new_session_id_resets_prompt_and_tool_state() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::PermissionRequest,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            summary: Some("Wants to run Bash".to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            ..Default::default()
+        },
+    ));
+    session.session_context.query = Some("old prompt".to_owned());
+
+    // `/clear` starts a new session: the old prompt no longer describes it.
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("def"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(session.session_context.query, None);
+    assert_eq!(session.session_context.summary, None);
+    assert_eq!(session.session_context.tool_name, None);
+}
+
+#[test]
+fn first_reported_session_id_keeps_prompt_state() {
+    // A session detected from its command gets its id from the first plugin event.
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, false);
+    session.session_context.query = Some("Agent turn complete".to_owned());
+    session.apply_event(&session_event(
+        CLIAgentEventType::IdlePrompt,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(session.session_context.session_id.as_deref(), Some("abc"));
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("Agent turn complete")
+    );
+}
+
+#[test]
+fn parse_trims_session_id() {
+    let body = r#"{"v":1,"agent":"claude","event":"stop","session_id":"  abc \n"}"#;
+    let notif = parse_event(Some("warp://cli-agent"), body).unwrap();
+    assert_eq!(notif.session_id.as_deref(), Some("abc"));
+}
+
+#[test]
+fn identity_change_on_any_event_emits_session_updated() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(
+                view_id,
+                cli_agent_session(CLIAgentSessionStatus::Success, true),
+                ctx,
+            );
+        });
+        let updates = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = updates.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&model, move |_, event, _| {
+                if matches!(event, CLIAgentSessionsModelEvent::SessionUpdated { .. }) {
+                    counter.set(counter.get().saturating_add(1));
+                }
+            });
+        });
+
+        // `IdlePrompt` changes neither status nor (normally) anything else, but here it is the
+        // first event to report the session id.
+        let idle = |session_id: &str| {
+            session_event(
+                CLIAgentEventType::IdlePrompt,
+                Some(session_id),
+                Some("/repo"),
+                CLIAgentEventPayload::default(),
+            )
+        };
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &idle("abc"), ctx);
+        });
+        assert_eq!(updates.get(), 1);
+
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &idle("abc"), ctx);
+        });
+        assert_eq!(updates.get(), 1, "an unchanged identity emits nothing");
+
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &idle("def"), ctx);
+        });
+        assert_eq!(updates.get(), 2);
     });
 }

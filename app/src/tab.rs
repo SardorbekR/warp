@@ -29,6 +29,7 @@ use warpui::{AppContext, Entity, ModelContext, SingletonEntity, ViewHandle};
 
 use crate::BlocklistAIHistoryModel;
 use crate::ai::agent::conversation::ConversationStatus;
+use crate::ai::agent_management::AgentNotificationsModel;
 use crate::ai::conversation_status_ui::{STATUS_ELEMENT_PADDING, render_status_element};
 use crate::appearance::Appearance;
 /// Tab module contains structures related to Tabs (such as TabData or TabComponent) that simplify
@@ -54,7 +55,7 @@ use crate::window_settings::WindowSettings;
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
-    TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity,
+    TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity, VerticalTabsSortMode,
 };
 use crate::workspace::{
     PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, WorkspaceAction,
@@ -256,6 +257,21 @@ pub fn uses_vertical_tabs(ctx: &AppContext) -> bool {
     FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs
 }
 
+/// The effective vertical tabs ordering. Falls back to `Manual` (upstream
+/// behavior) when the status-order feature is off or vertical tabs aren't used.
+pub fn vertical_tabs_sort_mode(ctx: &AppContext) -> VerticalTabsSortMode {
+    if !FeatureFlag::VerticalTabsStatusOrder.is_enabled() || !uses_vertical_tabs(ctx) {
+        return VerticalTabsSortMode::Manual;
+    }
+    *TabSettings::as_ref(ctx).vertical_tabs_sort_mode.value()
+}
+
+/// True when the vertical tabs panel orders rows by status (Status or
+/// Group-by-project mode) instead of the manual tab order.
+pub fn is_vertical_tabs_status_order_active(ctx: &AppContext) -> bool {
+    !matches!(vertical_tabs_sort_mode(ctx), VerticalTabsSortMode::Manual)
+}
+
 const WARP_2_TAB_COLOR_OPACITY: Opacity = 25;
 const WARP_2_HOVERED_TAB_COLOR_OPACITY: Opacity = 50;
 const TAB_CLOSE_BUTTON_OPACITY: Opacity = 60;
@@ -403,6 +419,11 @@ impl TabData {
     /// owns the container and only individual pane names are displayed, so
     /// tab-level rename/reset should not be possible.
     pub fn tab_name_hidden_in_grouped_pane_view(&self, ctx: &AppContext) -> bool {
+        // Fork: rows ordered by status show the tab's name only for a tab with
+        // a single visible pane; otherwise each pane row shows its own name.
+        if is_vertical_tabs_status_order_active(ctx) {
+            return self.pane_group.as_ref(ctx).visible_pane_ids().len() != 1;
+        }
         self.group_id.is_some()
             && uses_vertical_tabs(ctx)
             && matches!(
@@ -454,6 +475,7 @@ impl TabData {
         let mut menu_items = vec![];
 
         for section_items in [
+            self.read_state_menu_items(pane_name_target, ctx),
             self.pin_menu_items(index),
             self.tab_group_menu_items(index, tab_groups, is_only_member_of_group),
             self.session_sharing_menu_items(index, ctx),
@@ -580,6 +602,48 @@ impl TabData {
         })
     }
 
+    /// "Mark as read" / "Mark as unread" for the clicked terminal pane. Only
+    /// shown while the vertical tabs panel orders rows by status.
+    fn read_state_menu_items(
+        &self,
+        pane_name_target: Option<PaneNameMenuTarget>,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        if !is_vertical_tabs_status_order_active(ctx) {
+            return vec![];
+        }
+        let Some(target) =
+            pane_name_target.filter(|target| self.pane_group.id() == target.locator.pane_group_id)
+        else {
+            return vec![];
+        };
+        let Some(terminal_view) = self
+            .pane_group
+            .as_ref(ctx)
+            .terminal_view_from_pane_id(target.locator.pane_id, ctx)
+        else {
+            return vec![];
+        };
+        let terminal_view_id = terminal_view.id();
+        let (label, action) =
+            if AgentNotificationsModel::as_ref(ctx).is_terminal_view_unread(terminal_view_id) {
+                (
+                    "Mark as read",
+                    WorkspaceAction::MarkTerminalViewRead { terminal_view_id },
+                )
+            } else {
+                (
+                    "Mark as unread",
+                    WorkspaceAction::MarkTerminalViewUnread { terminal_view_id },
+                )
+            };
+        vec![
+            MenuItemFields::new(label)
+                .with_on_select_action(action)
+                .into_item(),
+        ]
+    }
+
     fn copy_metadata_menu_items(
         &self,
         pane_name_target: Option<PaneNameMenuTarget>,
@@ -596,10 +660,12 @@ impl TabData {
         let vertical_tabs_display_granularity = *TabSettings::as_ref(ctx)
             .vertical_tabs_display_granularity
             .value();
-        let (title_label, title, terminal_view) = if matches!(
-            vertical_tabs_display_granularity,
-            VerticalTabsDisplayGranularity::Panes
-        ) {
+        // Status-ordered rows are always individual panes.
+        let (title_label, title, terminal_view) = if is_vertical_tabs_status_order_active(ctx)
+            || matches!(
+                vertical_tabs_display_granularity,
+                VerticalTabsDisplayGranularity::Panes
+            ) {
             let pane_id = pane_name_target
                 .filter(|target| self.pane_group.id() == target.locator.pane_group_id)
                 .and_then(|target| {
@@ -709,6 +775,12 @@ impl TabData {
         // `can_move_left` / `can_move_right` come from `Workspace::can_move_tab`
         // and gate the "Move Tab Up/Down" entries so they disappear when the
         // move would cross the pinned/unpinned boundary, group boundary or tab list bounds.
+        // Moving tabs has no visible effect while rows are ordered by status.
+        let (can_move_left, can_move_right) = if is_vertical_tabs_status_order_active(ctx) {
+            (false, false)
+        } else {
+            (can_move_left, can_move_right)
+        };
         if can_move_right {
             menu_items.push(
                 MenuItemFields::new(if uses_vertical_tabs {
@@ -791,7 +863,8 @@ impl TabData {
             );
         }
         let not_last_tab = index != tabs_len - 1;
-        if not_last_tab {
+        // "Below" refers to the tab order, which rows ordered by status don't show.
+        if not_last_tab && !is_vertical_tabs_status_order_active(ctx) {
             menu_items.push(
                 MenuItemFields::new(if uses_vertical_tabs {
                     "Close Tabs Below"

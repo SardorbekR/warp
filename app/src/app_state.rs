@@ -19,6 +19,7 @@ use crate::settings_view::SettingsSection;
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
+use crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
@@ -216,6 +217,9 @@ pub struct TerminalPaneSnapshot {
     /// The active conversation ID if the agent view was open in fullscreen mode.
     /// When `Some`, the agent view should be restored to fullscreen for this conversation.
     pub active_conversation_id: Option<AIConversationId>,
+    /// The CLI agent session (Claude Code, Codex) running in this pane, or restored into it and
+    /// not yet resumed or dismissed, so it can be offered for resumption after a restart.
+    pub cli_agent_session: Option<PersistedCLIAgentSession>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

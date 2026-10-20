@@ -422,3 +422,64 @@ fn antigravity_notifications_are_supported() {
     assert_eq!(parsed_prompt_req.event, CLIAgentEventType::NeedsInput);
     assert!(handler.handle_event(parsed_prompt_req).is_some());
 }
+
+fn claude_session_start(session_id: Option<&str>) -> CLIAgentEvent {
+    CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::SessionStart,
+        session_id: session_id.map(str::to_owned),
+        cwd: Some("/tmp/proj".to_owned()),
+        project: Some("proj".to_owned()),
+        payload: CLIAgentEventPayload::default(),
+    }
+}
+
+#[test]
+fn default_handler_forwards_session_start_with_session_id() {
+    // An in-session `/resume` or `/clear` re-sends `SessionStart` with the new session id; the
+    // model must see it so a restored pane resumes the session that was actually running.
+    let mut handler = DefaultSessionListener;
+    let forwarded = handler
+        .handle_event(claude_session_start(Some("new-session")))
+        .expect("SessionStart with a session id should be forwarded");
+    assert_eq!(forwarded.event, CLIAgentEventType::SessionStart);
+    assert_eq!(forwarded.session_id.as_deref(), Some("new-session"));
+}
+
+#[test]
+fn default_handler_skips_session_start_without_session_id() {
+    let mut handler = DefaultSessionListener;
+    assert!(handler.handle_event(claude_session_start(None)).is_none());
+}
+
+#[test]
+fn default_handler_skips_session_start_with_empty_session_id() {
+    // Plugins send `""` for unknown fields; the parser normalizes it to `None`, so such an event
+    // carries no new identity and is skipped like before.
+    let body = r#"{"v":1,"agent":"claude","event":"session_start","session_id":"","cwd":"/tmp"}"#;
+    let event = parse_event(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body)
+        .expect("valid session_start notification");
+    assert_eq!(event.session_id, None);
+
+    let mut handler = DefaultSessionListener;
+    assert!(handler.handle_event(event).is_none());
+}
+
+#[test]
+fn osc9_handler_forwards_codex_session_start() {
+    let _guard = FeatureFlag::CodexPlugin.override_enabled(true);
+    let mut handler = Osc9FallbackSessionHandler {
+        agent: CLIAgent::Codex,
+    };
+    let body =
+        r#"{"v":1,"agent":"codex","event":"session_start","session_id":"0199a2b1","cwd":"/tmp"}"#;
+    let event = handler
+        .try_parse(Some(CLI_AGENT_NOTIFICATION_SENTINEL), body, true)
+        .expect("structured codex event should parse");
+    let forwarded = handler
+        .handle_event(event)
+        .expect("codex SessionStart should be forwarded");
+    assert_eq!(forwarded.session_id.as_deref(), Some("0199a2b1"));
+}

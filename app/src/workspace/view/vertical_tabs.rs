@@ -1,10 +1,14 @@
+mod status_list;
+mod status_order;
 pub mod telemetry;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use instant::Instant;
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -17,6 +21,7 @@ use warp_core::ui::color::blend::Blend;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
+use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::elements::{
     Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DragAxis, DragBarSide,
@@ -33,8 +38,9 @@ use warpui::prelude::Align;
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
-use warpui::{AppContext, EntityId, SingletonEntity, ViewHandle, WindowId};
+use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle, WindowId};
 
+use self::status_order::StatusRowKey;
 use super::{render_group_member_icon_collage, select_unique_pane_kinds};
 use crate::ai::agent::conversation::{ConversationStatus, StatusColorStyle};
 use crate::ai::agent_management::AgentNotificationsModel;
@@ -56,8 +62,9 @@ use crate::pane_group::{
 };
 use crate::safe_triangle::SafeTriangle;
 use crate::tab::{
-    SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
-    tab_activate_binding_name, tab_position_id,
+    SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, is_vertical_tabs_status_order_active,
+    reveals_tab_shortcut_hints, tab_activate_binding_name, tab_position_id,
+    vertical_tabs_sort_mode,
 };
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -77,7 +84,7 @@ use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
-    VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
+    VerticalTabsPrimaryInfo, VerticalTabsSortMode, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
@@ -412,6 +419,7 @@ fn render_pane_row_element(
         is_pinned,
         container_is_hovered,
         shortcut_hint_binding_name: _,
+        status_row_click,
     } = props;
     let is_selected = is_active_tab && is_focused;
     let show_pin = FeatureFlag::PinnedTabs.is_enabled() && is_pinned && !container_is_hovered;
@@ -477,6 +485,21 @@ fn render_pane_row_element(
             pane_group_id,
             pane_id,
         };
+        if let Some(status_row_click) = status_row_click {
+            // Range selection follows the manual tab order, which the status
+            // order doesn't show, so shift-click toggles like cmd-click.
+            if (modifiers.shift || modifiers.cmd) && FeatureFlag::GroupedTabs.is_enabled() {
+                ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
+            } else {
+                if let Some(terminal_view_id) = status_row_click.mark_read_terminal_view_id {
+                    ctx.dispatch_typed_action(WorkspaceAction::MarkTerminalViewRead {
+                        terminal_view_id,
+                    });
+                }
+                ctx.dispatch_typed_action(WorkspaceAction::FocusPane(locator));
+            }
+            return;
+        }
         // Shift-click extends the range selection; cmd/ctrl-click toggles a
         // single tab in/out of the selection; plain click focuses the pane.
         if modifiers.shift && FeatureFlag::GroupedTabs.is_enabled() {
@@ -730,6 +753,21 @@ pub(super) struct VerticalTabsPanelState {
     show_details_on_hover_mouse_state: MouseStateHandle,
     panel_right_click_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
+    /// Status order: tracks whether the mouse is over the row list, which
+    /// freezes the row order until the mouse leaves.
+    status_list_hover_state: MouseStateHandle,
+    /// Status order: the row order displayed last frame, reused while frozen.
+    status_list_last_order: RefCell<Vec<StatusRowKey>>,
+    status_sort_option_mouse_state: MouseStateHandle,
+    group_by_project_sort_option_mouse_state: MouseStateHandle,
+    manual_sort_option_mouse_state: MouseStateHandle,
+    /// Status order: pending re-render that keeps the age labels current.
+    age_tick: Option<SpawnedFutureHandle>,
+    /// Status order: keyboard navigation keeps the row order frozen until
+    /// this instant, so stepping through rows doesn't reshuffle them.
+    status_list_keyboard_freeze_until: Option<Instant>,
+    /// Status order: re-renders once the keyboard freeze ends.
+    status_list_keyboard_freeze_timer: Option<SpawnedFutureHandle>,
 }
 
 impl Default for VerticalTabsPanelState {
@@ -768,6 +806,14 @@ impl Default for VerticalTabsPanelState {
             show_details_on_hover_mouse_state: Default::default(),
             panel_right_click_mouse_state: Default::default(),
             show_settings_popup: false,
+            status_list_hover_state: Default::default(),
+            status_list_last_order: RefCell::default(),
+            status_sort_option_mouse_state: Default::default(),
+            group_by_project_sort_option_mouse_state: Default::default(),
+            manual_sort_option_mouse_state: Default::default(),
+            age_tick: None,
+            status_list_keyboard_freeze_until: None,
+            status_list_keyboard_freeze_timer: None,
         }
     }
 }
@@ -781,6 +827,19 @@ impl VerticalTabsPanelState {
             sidecar_mouse_state: self.detail_sidecar_mouse_state.clone(),
             window_id,
         }
+    }
+
+    /// Clears the status list's hover state so a mouse that left the window
+    /// from inside the list doesn't keep the row order frozen.
+    pub(super) fn reset_status_list_hover(&self) {
+        if let Ok(mut mouse_state) = self.status_list_hover_state.lock() {
+            mouse_state.reset_interaction_state();
+        }
+    }
+
+    fn is_status_list_keyboard_frozen(&self) -> bool {
+        self.status_list_keyboard_freeze_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     pub(super) fn has_active_detail_target(&self) -> bool {
@@ -858,6 +917,15 @@ struct PaneProps<'a> {
     /// The pin icon is hidden when a tab is hovered.
     container_is_hovered: bool,
     shortcut_hint_binding_name: Option<&'static str>,
+    /// Set for rows in the status-ordered list, which handle clicks differently.
+    status_row_click: Option<StatusRowClick>,
+}
+
+/// Click behavior for a row in the status-ordered list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StatusRowClick {
+    /// Marks this terminal view as read on a plain click (set while unread).
+    mark_read_terminal_view_id: Option<EntityId>,
 }
 
 struct PaneRowState {
@@ -1687,6 +1755,16 @@ fn render_vertical_tabs_panel(
     )
     .with_overlayed_scrollbar()
     .finish();
+    // Status order: track whether the mouse is over the list so rows don't
+    // reorder under the cursor. Hovering notifies on enter/leave, which
+    // re-renders and applies the latest order once the mouse leaves.
+    let scrollable_groups = if is_vertical_tabs_status_order_active(app) {
+        Hoverable::new(state.status_list_hover_state.clone(), |_| scrollable_groups)
+            .with_propagate_drag()
+            .finish()
+    } else {
+        scrollable_groups
+    };
 
     let panel_content = Flex::column()
         .with_main_axis_size(MainAxisSize::Max)
@@ -1779,6 +1857,17 @@ fn render_groups(
         )
         .with_padding(Padding::uniform(12.))
         .finish();
+    }
+
+    let sort_mode = vertical_tabs_sort_mode(app);
+    if !matches!(sort_mode, VerticalTabsSortMode::Manual) {
+        let list = status_list::render_status_ordered_list(state, workspace, sort_mode, app);
+        prune_stale_pane_row_states(state, workspace, app);
+        return list;
+    }
+    // Forget the status order so re-entering a status mode starts fresh.
+    if let Ok(mut last_order) = state.status_list_last_order.try_borrow_mut() {
+        last_order.clear();
     }
 
     let resolved_mode = resolve_vertical_tabs_mode(app);
@@ -2024,7 +2113,24 @@ fn render_groups(
         groups.add_child(render_vertical_tab_insertion_target(None, theme));
     }
 
-    // Prune stale badge mouse states for panes that no longer exist.
+    prune_stale_pane_row_states(state, workspace, app);
+
+    let groups = groups.finish();
+    if uses_outer_group_container {
+        groups
+    } else {
+        Container::new(groups)
+            .with_padding(Padding::uniform(8.).with_top(0.))
+            .finish()
+    }
+}
+
+/// Prunes stale badge mouse states for panes that no longer exist.
+fn prune_stale_pane_row_states(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    app: &AppContext,
+) {
     let all_pane_ids: std::collections::HashSet<PaneId> = workspace
         .tabs
         .iter()
@@ -2046,15 +2152,6 @@ fn render_groups(
         .detail_pane_badge_mouse_states
         .borrow_mut()
         .retain(|id, _| all_pane_ids.contains(id));
-
-    let groups = groups.finish();
-    if uses_outer_group_container {
-        groups
-    } else {
-        Container::new(groups)
-            .with_padding(Padding::uniform(8.).with_top(0.))
-            .finish()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3415,9 +3512,8 @@ fn has_unread_activity(typed: &TypedPane<'_>, app: &AppContext) -> bool {
 }
 
 fn has_unread_activity_for_terminal_view(terminal_view_id: EntityId, app: &AppContext) -> bool {
-    AgentNotificationsModel::as_ref(app)
-        .notifications()
-        .has_unread_for_terminal_view(terminal_view_id)
+    // Includes views the user explicitly marked as unread.
+    AgentNotificationsModel::as_ref(app).is_terminal_view_unread(terminal_view_id)
 }
 
 const INDICATOR_DOT_SIZE: f32 = 8.;
@@ -3992,6 +4088,7 @@ impl<'a> PaneProps<'a> {
             is_pinned,
             container_is_hovered,
             shortcut_hint_binding_name,
+            status_row_click: None,
         })
     }
 
@@ -6155,9 +6252,20 @@ pub(super) fn render_settings_popup(
     let mut popup_col = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-    popup_col.add_child(view_as_header);
-    popup_col.add_child(view_as_segmented_control_row);
-    if show_tab_item_section {
+    // Fork: the "Order" section comes first. While rows are ordered by status
+    // the layout options below don't apply, so they're hidden.
+    let status_order_active = is_vertical_tabs_status_order_active(app);
+    if FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
+        popup_col.add_child(status_list::render_sort_mode_section(state, app));
+        if !status_order_active {
+            popup_col.add_child(make_divider(theme));
+        }
+    }
+    if !status_order_active {
+        popup_col.add_child(view_as_header);
+        popup_col.add_child(view_as_segmented_control_row);
+    }
+    if show_tab_item_section && !status_order_active {
         popup_col.add_child(make_divider(theme));
         popup_col.add_child(tab_item_header);
         popup_col.add_child(focused_session_option);
@@ -6166,7 +6274,7 @@ pub(super) fn render_settings_popup(
         }
     }
 
-    if show_focused_session_controls {
+    if show_focused_session_controls && !status_order_active {
         popup_col.add_child(make_divider(theme));
         popup_col.add_child(density_header);
         popup_col.add_child(segmented_control_row);
@@ -7563,6 +7671,22 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
     render_pane_row_element(props, Padding::uniform(8.), true, content, theme)
 }
 
+/// How often the status-ordered list re-renders so age labels stay current.
+const STATUS_AGE_TICK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the status-ordered list keeps its order after a keyboard step.
+const STATUS_KEYBOARD_FREEZE: Duration = Duration::from_millis(1500);
+
+/// A keyboard tab-navigation request, applied to the status-ordered rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StatusRowNavigation {
+    Next,
+    Previous,
+    /// The 1-based row number (tab shortcut number).
+    Number(usize),
+    Last,
+}
+
 impl Workspace {
     pub(super) fn render_vertical_tabs_panel(
         &self,
@@ -7570,6 +7694,106 @@ impl Workspace {
         app: &AppContext,
     ) -> Box<dyn Element> {
         render_vertical_tabs_panel(&self.vertical_tabs_panel, self, side, app)
+    }
+
+    fn should_tick_vertical_tabs_status_ages(&self, app: &AppContext) -> bool {
+        self.vertical_tabs_panel_open && is_vertical_tabs_status_order_active(app)
+    }
+
+    /// Starts the age-label re-render tick while the panel is open in a
+    /// status mode, and stops it otherwise. Safe to call any number of times.
+    pub(super) fn sync_vertical_tabs_status_age_tick(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.should_tick_vertical_tabs_status_ages(ctx) {
+            if let Some(handle) = self.vertical_tabs_panel.age_tick.take() {
+                handle.abort();
+            }
+            return;
+        }
+        if self.vertical_tabs_panel.age_tick.is_some() {
+            return;
+        }
+        let handle = ctx.spawn_abortable(
+            Timer::after(STATUS_AGE_TICK_INTERVAL),
+            |me, _, ctx| {
+                me.vertical_tabs_panel.age_tick = None;
+                if me.should_tick_vertical_tabs_status_ages(ctx) {
+                    ctx.notify();
+                }
+                me.sync_vertical_tabs_status_age_tick(ctx);
+            },
+            |_, _| {},
+        );
+        self.vertical_tabs_panel.age_tick = Some(handle);
+    }
+
+    /// Releases a stuck status-order freeze when the window loses focus.
+    pub(super) fn reset_vertical_tabs_status_list_hover(&self) {
+        self.vertical_tabs_panel.reset_status_list_hover();
+    }
+
+    /// Applies a tab-navigation keybinding to the rows of the status-ordered
+    /// list, in the order they're shown (which is not the tab order). Returns
+    /// `false` when status order isn't active, so the caller falls back to
+    /// tab-order navigation.
+    pub(super) fn navigate_status_ordered_rows(
+        &mut self,
+        navigation: StatusRowNavigation,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let mode = vertical_tabs_sort_mode(ctx);
+        if matches!(mode, VerticalTabsSortMode::Manual) {
+            return false;
+        }
+        let rows = status_list::displayed_row_locators(&self.vertical_tabs_panel, self, mode, ctx);
+        let current = self.tabs.get(self.active_tab_index).map(|tab| {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            PaneViewLocator {
+                pane_group_id: tab.pane_group.id(),
+                pane_id: pane_group.focused_pane_id(ctx),
+            }
+        });
+        let current_position =
+            current.and_then(|current| rows.iter().position(|row| *row == current));
+        let target_position = match navigation {
+            StatusRowNavigation::Next => match current_position {
+                Some(position) if position + 1 < rows.len() => Some(position + 1),
+                _ => (!rows.is_empty()).then_some(0),
+            },
+            StatusRowNavigation::Previous => match current_position {
+                Some(position) if position > 0 => Some(position - 1),
+                _ => rows.len().checked_sub(1),
+            },
+            StatusRowNavigation::Number(number) => number.checked_sub(1),
+            StatusRowNavigation::Last => rows.len().checked_sub(1),
+        };
+        // Keep the order the user is stepping through, even if focusing the
+        // row changes its status (e.g. it's no longer unread).
+        self.freeze_status_list_for_keyboard(ctx);
+        if let Some(target) = target_position.and_then(|position| rows.get(position).copied())
+            && Some(target) != current
+        {
+            self.focus_pane(target, ctx);
+        }
+        true
+    }
+
+    fn freeze_status_list_for_keyboard(&mut self, ctx: &mut ViewContext<Self>) {
+        let panel = &mut self.vertical_tabs_panel;
+        panel.status_list_keyboard_freeze_until =
+            Instant::now().checked_add(STATUS_KEYBOARD_FREEZE);
+        if let Some(timer) = panel.status_list_keyboard_freeze_timer.take() {
+            timer.abort();
+        }
+        panel.status_list_keyboard_freeze_timer = Some(ctx.spawn_abortable(
+            Timer::after(STATUS_KEYBOARD_FREEZE),
+            |me, _, ctx| {
+                let panel = &mut me.vertical_tabs_panel;
+                panel.status_list_keyboard_freeze_timer = None;
+                panel.status_list_keyboard_freeze_until = None;
+                ctx.notify();
+            },
+            |_, _| {},
+        ));
     }
 }
 

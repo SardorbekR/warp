@@ -13,6 +13,7 @@ use warpui::platform::keyboard::KeyCode;
 use warpui::{EntityId, WeakViewHandle, WindowId};
 
 use super::global_actions::{ForkFromExchange, ForkedConversationDestination};
+use super::tab_settings::VerticalTabsSortMode;
 use super::tab_settings::{
     VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo,
     VerticalTabsTabItemMode, VerticalTabsViewMode,
@@ -395,6 +396,16 @@ pub enum WorkspaceAction {
     ToggleVerticalTabsShowPrLink,
     ToggleVerticalTabsShowDiffStats,
     ToggleVerticalTabsShowDetailsOnHover,
+    /// Fork: sets how rows are ordered in the vertical tabs panel.
+    SetVerticalTabsSortMode(VerticalTabsSortMode),
+    /// Fork: marks a terminal view as unread until the user focuses it.
+    MarkTerminalViewUnread {
+        terminal_view_id: EntityId,
+    },
+    /// Fork: marks a terminal view (and its notifications) as read.
+    MarkTerminalViewRead {
+        terminal_view_id: EntityId,
+    },
     /// Closes the focused panel. This happens as an explicit action from the user.
     ClosePanel,
     CopyTextToClipboard(String),
@@ -446,6 +457,9 @@ pub enum WorkspaceAction {
     #[cfg(target_family = "wasm")]
     OpenLinkOnDesktop(url::Url),
     ReopenClosedSession,
+    /// Resumes the CLI agent session (Claude Code, Codex) restored into each pane of this window.
+    ResumeAllCLIAgentSessions,
+    ToggleAutoResumeCLIAgentSessions,
     OpenShareSessionModal(usize),
     StopSharingSessionFromTabMenu {
         terminal_view_id: EntityId,
@@ -1100,6 +1114,9 @@ impl WorkspaceAction {
             | ToggleVerticalTabsShowPrLink
             | ToggleVerticalTabsShowDiffStats
             | ToggleVerticalTabsShowDetailsOnHover
+            | SetVerticalTabsSortMode(_)
+            | MarkTerminalViewUnread { .. }
+            | MarkTerminalViewRead { .. }
             | ToggleWelcomeTips
             | CopyTextToClipboard(_)
             | CopyCurrentPath
@@ -1137,6 +1154,8 @@ impl WorkspaceAction {
             | CopySharedSessionLinkFromTab { .. }
             | OpenSharedSessionQrCode { .. }
             | ReopenClosedSession
+            | ResumeAllCLIAgentSessions
+            | ToggleAutoResumeCLIAgentSessions
             | FocusLeftPanel
             | FocusRightPanel
             | DumpDebugInfo

@@ -2,6 +2,8 @@ pub mod event;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
+pub mod restore;
+pub mod restore_save;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -76,6 +78,11 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
+    /// The first `cwd` reported for the current `session_id`. Unlike `cwd`, it doesn't follow the
+    /// agent around, so it identifies where the session can be resumed from.
+    pub launch_cwd: Option<String>,
+    /// Transcript file for the current `session_id`, when the plugin has reported it.
+    pub transcript_path: Option<String>,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -122,6 +129,15 @@ pub enum CLIAgentInputEntrypoint {
 }
 
 impl CLIAgentSessionContext {
+    /// The fields that identify which agent session this is and where it can be resumed from.
+    fn identity(&self) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            self.session_id.clone(),
+            self.launch_cwd.clone(),
+            self.transcript_path.clone(),
+        )
+    }
+
     pub(crate) fn display_title(&self) -> Option<String> {
         self.latest_user_prompt().or_else(|| self.title_like_text())
     }
@@ -141,6 +157,35 @@ impl CLIAgentSessionContext {
             .map(str::trim)
             .filter(|summary| !summary.is_empty())
             .map(str::to_owned)
+    }
+
+    /// Keeps session-scoped state tied to `session_id` after it may have changed from
+    /// `previous_session_id` (e.g. after `/clear` or an in-session `/resume`).
+    fn sync_session_identity(
+        &mut self,
+        previous_session_id: Option<&str>,
+        transcript_path: Option<&str>,
+    ) {
+        if self.session_id.as_deref() != previous_session_id {
+            self.launch_cwd = None;
+            self.transcript_path = None;
+            // Prompts and tool state from the previous session don't describe the new one. The
+            // first id reported for a session that was detected from its command is the same
+            // session, so its state is kept.
+            if previous_session_id.is_some() {
+                self.query = None;
+                self.response = None;
+                self.summary = None;
+                self.tool_name = None;
+                self.tool_input_preview = None;
+            }
+        }
+        if self.launch_cwd.is_none() {
+            self.launch_cwd = self.cwd.clone();
+        }
+        if let Some(transcript_path) = transcript_path {
+            self.transcript_path = Some(transcript_path.to_owned());
+        }
     }
 }
 
@@ -221,6 +266,7 @@ impl CLIAgentSession {
     /// Applies an event to this session, updating context and status.
     /// Returns the new status if it changed, or `None` if the event was irrelevant.
     fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
+        let previous_session_id = self.session_context.session_id.clone();
         self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
         self.session_context.project = event
             .project
@@ -230,6 +276,10 @@ impl CLIAgentSession {
             .session_id
             .clone()
             .or(self.session_context.session_id.take());
+        self.session_context.sync_session_identity(
+            previous_session_id.as_deref(),
+            event.payload.transcript_path.as_deref(),
+        );
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
@@ -301,7 +351,11 @@ impl CLIAgentSession {
             // This should not affect status — otherwise it would override Success after a Stop event.
             CLIAgentEventType::IdlePrompt => return None,
             CLIAgentEventType::SessionStart => {
-                self.plugin_version = event.payload.plugin_version.clone();
+                // A repeated `SessionStart` (e.g. after `/clear`) that omits the version must not
+                // erase the one reported when the session started.
+                if let Some(plugin_version) = &event.payload.plugin_version {
+                    self.plugin_version = Some(plugin_version.clone());
+                }
                 return None;
             }
             CLIAgentEventType::Unknown(_) => return None,
@@ -466,10 +520,14 @@ impl CLIAgentSessionsModel {
             session.plugin_version = plugin_version;
             session.remote_host = remote_host;
             session.should_auto_toggle_input = should_auto_toggle_input;
+            let previous_session_id = session.session_context.session_id.clone();
             session.session_context.cwd = cwd.or(session.session_context.cwd.take());
             session.session_context.project = project.or(session.session_context.project.take());
             session.session_context.session_id =
                 session_id.or(session.session_context.session_id.take());
+            session
+                .session_context
+                .sync_session_identity(previous_session_id.as_deref(), None);
             return;
         }
 
@@ -479,6 +537,7 @@ impl CLIAgentSessionsModel {
                 agent,
                 status: CLIAgentSessionStatus::InProgress,
                 session_context: CLIAgentSessionContext {
+                    launch_cwd: cwd.clone(),
                     cwd,
                     project,
                     session_id,
@@ -552,6 +611,7 @@ impl CLIAgentSessionsModel {
         }
 
         let event_type = &event.event;
+        let identity_before = session.session_context.identity();
         // Interactive clients keep ignoring this event: only an unattended run has no one to
         // answer the prompt.
         let new_status = if matches!(event.event, CLIAgentEventType::NeedsInput)
@@ -572,12 +632,17 @@ impl CLIAgentSessionsModel {
             });
         }
 
-        if matches!(
-            event_type,
-            CLIAgentEventType::SessionStart
-                | CLIAgentEventType::PromptSubmit
-                | CLIAgentEventType::ToolComplete
-        ) {
+        // Identity changes (a new session id, launch directory or transcript) can arrive on any
+        // event; subscribers that persist the session need to hear about them.
+        let identity_changed = session.session_context.identity() != identity_before;
+        if identity_changed
+            || matches!(
+                event_type,
+                CLIAgentEventType::SessionStart
+                    | CLIAgentEventType::PromptSubmit
+                    | CLIAgentEventType::ToolComplete
+            )
+        {
             ctx.emit(CLIAgentSessionsModelEvent::SessionUpdated {
                 terminal_view_id,
                 agent: session.agent,

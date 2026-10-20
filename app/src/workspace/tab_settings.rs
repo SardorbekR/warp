@@ -390,6 +390,46 @@ settings::macros::implement_setting_for_enum!(
     description: "Tab item display mode in vertical tabs.",
 );
 
+/// How rows are ordered in the vertical tabs panel (fork feature).
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How sessions are ordered in the vertical tabs panel.",
+    rename_all = "snake_case"
+)]
+pub enum VerticalTabsSortMode {
+    /// A flat list of every session, sorted by how urgently it needs attention.
+    #[default]
+    Status,
+    /// Sessions grouped by project, groups ordered by their most urgent session.
+    GroupByProject,
+    /// The manual tab order (upstream behavior).
+    Manual,
+}
+
+settings::macros::implement_setting_for_enum!(
+    VerticalTabsSortMode,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    // Fork-only setting: never synced to the user's Warp account.
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.vertical_tabs.sort_mode",
+    description: "How sessions are ordered in the vertical tabs panel.",
+    feature_flag: warp_core::features::FeatureFlag::VerticalTabsStatusOrder,
+);
+
 #[derive(
     Default,
     Debug,
@@ -499,9 +539,12 @@ define_settings_group!(TabSettings, settings: [
     },
     use_vertical_tabs: UseVerticalTabs {
         type: bool,
-        default: false,
+        // Fork default: vertical tabs are on unless the user turns them off.
+        default: true,
         supported_platforms: SupportedPlatforms::ALL,
-        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        // Fork: never synced, so this fork's default and toggles can't reach
+        // (or be overwritten by) official Warp through settings sync.
+        sync_to_cloud: SyncToCloud::Never,
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "appearance.vertical_tabs.enabled",
@@ -539,6 +582,7 @@ define_settings_group!(TabSettings, settings: [
     },
     vertical_tabs_display_granularity: VerticalTabsDisplayGranularity,
     vertical_tabs_tab_item_mode: VerticalTabsTabItemMode,
+    vertical_tabs_sort_mode: VerticalTabsSortMode,
     vertical_tabs_view_mode: VerticalTabsViewMode,
     vertical_tabs_primary_info: VerticalTabsPrimaryInfo,
     vertical_tabs_compact_subtitle: VerticalTabsCompactSubtitle,

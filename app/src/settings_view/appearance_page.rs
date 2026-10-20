@@ -95,7 +95,7 @@ use crate::workspace::tab_settings::{
     DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
     ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
     TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
-    UseVerticalTabs, WorkspaceDecorationVisibility, canonical_directory_key,
+    UseVerticalTabs, VerticalTabsSortMode, WorkspaceDecorationVisibility, canonical_directory_key,
 };
 use crate::{send_telemetry_from_ctx, themes};
 
@@ -404,6 +404,32 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         ));
     }
 
+    if FeatureFlag::VerticalTabs.is_enabled() && FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
+        app.register_fixed_bindings(
+            [
+                (
+                    "Vertical tabs: Sort by status",
+                    VerticalTabsSortMode::Status,
+                ),
+                (
+                    "Vertical tabs: Group by project",
+                    VerticalTabsSortMode::GroupByProject,
+                ),
+                ("Vertical tabs: Manual order", VerticalTabsSortMode::Manual),
+            ]
+            .map(|(label, mode)| {
+                FixedBinding::empty(
+                    label.to_string(),
+                    builder(SettingsAction::AppearancePageToggle(
+                        AppearancePageAction::SetVerticalTabsSortMode(mode),
+                    )),
+                    context.to_owned(),
+                )
+                .with_group(bindings::BindingGroup::Settings.as_str())
+            }),
+        );
+    }
+
     if FeatureFlag::Ligatures.is_enabled() {
         toggle_binding_pairs.push(ToggleSettingActionPair::new(
             "ligature rendering",
@@ -509,6 +535,7 @@ pub enum AppearancePageAction {
     ToggleAltScreenPadding,
     UpdateAltScreenPaddingMode(AltScreenPaddingMode),
     SetTabCloseButtonPosition(TabCloseButtonPosition),
+    SetVerticalTabsSortMode(VerticalTabsSortMode),
     SetZoomLevel(u16),
     ResetZoomLevel,
     SetDefaultDirectoryTabColor {
@@ -545,6 +572,7 @@ pub struct AppearanceSettingsPageView {
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     tab_close_button_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    vertical_tabs_sort_mode_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_level_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_reset_button_mouse_state: MouseStateHandle,
     available_families: HashMap<String, (Option<FamilyId>, FontType)>,
@@ -740,6 +768,12 @@ impl TypedActionView for AppearanceSettingsPageView {
             }
             SetTabCloseButtonPosition(position) => {
                 self.update_tab_close_button_position(*position, ctx);
+            }
+            SetVerticalTabsSortMode(mode) => {
+                TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+                    report_if_error!(tab_settings.vertical_tabs_sort_mode.set_value(*mode, ctx));
+                });
+                ctx.notify();
             }
             SetZoomLevel(zoom_level) => {
                 WindowSettings::handle(ctx).update(ctx, |window_settings, ctx| {
@@ -1333,6 +1367,7 @@ impl AppearanceSettingsPageView {
                 ctx,
             ),
             tab_close_button_position_dropdown: Self::build_tab_close_button_position_dropdown(ctx),
+            vertical_tabs_sort_mode_dropdown: Self::build_vertical_tabs_sort_mode_dropdown(ctx),
             zoom_level_dropdown: Self::build_zoom_level_dropdown(ctx),
             zoom_reset_button_mouse_state: MouseStateHandle::default(),
             available_families: Default::default(),
@@ -1516,6 +1551,9 @@ impl AppearanceSettingsPageView {
 
         if FeatureFlag::VerticalTabs.is_enabled() {
             tab_settings_widgets.push(Box::new(VerticalTabsWidget::default()));
+            if FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
+                tab_settings_widgets.push(Box::new(VerticalTabsSortModeWidget {}));
+            }
             tab_settings_widgets.push(Box::new(
                 ShowVerticalTabPanelInRestoredWindowsWidget::default(),
             ));
@@ -1716,6 +1754,14 @@ impl AppearanceSettingsPageView {
         match value {
             TabCloseButtonPosition::Right => "Right",
             TabCloseButtonPosition::Left => "Left",
+        }
+    }
+
+    fn vertical_tabs_sort_mode_dropdown_item_label(value: VerticalTabsSortMode) -> &'static str {
+        match value {
+            VerticalTabsSortMode::Status => "By status",
+            VerticalTabsSortMode::GroupByProject => "Grouped by project",
+            VerticalTabsSortMode::Manual => "Manual",
         }
     }
 
@@ -2659,6 +2705,36 @@ impl AppearanceSettingsPageView {
         })
     }
 
+    fn build_vertical_tabs_sort_mode_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_items(
+                [
+                    VerticalTabsSortMode::Status,
+                    VerticalTabsSortMode::GroupByProject,
+                    VerticalTabsSortMode::Manual,
+                ]
+                .into_iter()
+                .map(|value| {
+                    DropdownItem::new(
+                        Self::vertical_tabs_sort_mode_dropdown_item_label(value),
+                        AppearancePageAction::SetVerticalTabsSortMode(value),
+                    )
+                })
+                .collect(),
+                ctx,
+            );
+            let current_value = *TabSettings::as_ref(ctx).vertical_tabs_sort_mode.value();
+            dropdown.set_selected_by_name(
+                Self::vertical_tabs_sort_mode_dropdown_item_label(current_value),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
     fn build_zoom_level_dropdown(
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<Dropdown<AppearancePageAction>> {
@@ -2709,6 +2785,14 @@ impl AppearanceSettingsPageView {
             let value = TabSettings::as_ref(ctx).workspace_decoration_visibility;
             let name = Self::workspace_decoration_visibility_dropdown_item_label(value);
             self.workspace_decorations_dropdown
+                .update(ctx, |dropdown, ctx| {
+                    dropdown.set_selected_by_name(name, ctx);
+                });
+        }
+        if let TabSettingsChangedEvent::VerticalTabsSortMode { .. } = event {
+            let value = *TabSettings::as_ref(ctx).vertical_tabs_sort_mode.value();
+            let name = Self::vertical_tabs_sort_mode_dropdown_item_label(value);
+            self.vertical_tabs_sort_mode_dropdown
                 .update(ctx, |dropdown, ctx| {
                     dropdown.set_selected_by_name(name, ctx);
                 });
@@ -4800,6 +4884,38 @@ impl SettingsWidget for BlinkingCursorWidget {
                 })
                 .finish(),
             None,
+        )
+    }
+}
+
+struct VerticalTabsSortModeWidget {}
+
+impl SettingsWidget for VerticalTabsSortModeWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "vertical tabs sort order status group project manual unread"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Vertical tabs order",
+            None,
+            None,
+            LocalOnlyIconState::for_setting(
+                VerticalTabsSortMode::storage_key(),
+                VerticalTabsSortMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.vertical_tabs_sort_mode_dropdown,
         )
     }
 }

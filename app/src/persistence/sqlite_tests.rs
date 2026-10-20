@@ -31,6 +31,9 @@ use crate::persistence::{
 use crate::server::ids::{ClientId, ServerId};
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
+use crate::terminal::cli_agent_sessions::restore::{
+    PersistedCLIAgentSession, PersistedCLIAgentStatus,
+};
 use crate::terminal::model::block::SerializedBlock;
 use crate::terminal::model::session::SessionId;
 use crate::themes::theme::AnsiColorIdentifier;
@@ -394,6 +397,7 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
                     active_profile_id: None,
                     conversation_ids_to_restore: vec![],
                     active_conversation_id: None,
+                    cli_agent_session: None,
                 }),
             }),
             default_directory_color: None,
@@ -509,6 +513,7 @@ fn test_sqlite_round_trips_custom_vertical_tabs_title() {
                         active_profile_id: None,
                         conversation_ids_to_restore: vec![],
                         active_conversation_id: None,
+                        cli_agent_session: None,
                     }),
                 }),
                 default_directory_color: None,
@@ -675,6 +680,7 @@ fn test_sqlite_round_trips_tab_groups() {
                 active_profile_id: None,
                 conversation_ids_to_restore: vec![],
                 active_conversation_id: None,
+                cli_agent_session: None,
             }),
         }),
         default_directory_color: None,
@@ -703,6 +709,7 @@ fn test_sqlite_round_trips_tab_groups() {
                 active_profile_id: None,
                 conversation_ids_to_restore: vec![],
                 active_conversation_id: None,
+                cli_agent_session: None,
             }),
         }),
         default_directory_color: None,
@@ -799,6 +806,7 @@ fn test_sqlite_round_trips_pinned_state() {
                 active_profile_id: None,
                 conversation_ids_to_restore: vec![],
                 active_conversation_id: None,
+                cli_agent_session: None,
             }),
         }),
         default_directory_color: None,
@@ -827,6 +835,7 @@ fn test_sqlite_round_trips_pinned_state() {
                 active_profile_id: None,
                 conversation_ids_to_restore: vec![],
                 active_conversation_id: None,
+                cli_agent_session: None,
             }),
         }),
         default_directory_color: None,
@@ -855,6 +864,7 @@ fn test_sqlite_round_trips_pinned_state() {
                 active_profile_id: None,
                 conversation_ids_to_restore: vec![],
                 active_conversation_id: None,
+                cli_agent_session: None,
             }),
         }),
         default_directory_color: None,
@@ -1158,4 +1168,151 @@ fn team_member_is_disabled_round_trips_through_sqlite_cache() {
         .expect("disabled member should be present");
     assert!(!active_member.is_disabled);
     assert!(disabled_member.is_disabled);
+}
+
+fn test_cli_agent_session_record() -> PersistedCLIAgentSession {
+    PersistedCLIAgentSession {
+        agent: crate::terminal::CLIAgent::Claude,
+        session_id: Some("0f8f2c1e-5d7a-4b8e-9a51-2f0b3c4d5e6f".to_owned()),
+        launch_cwd: Some("/Users/me/my repo".to_owned()),
+        title: Some("fix the \"flaky\" test".to_owned()),
+        transcript_path: Some("/Users/me/.claude/projects/repo/0f8f2c1e.jsonl".to_owned()),
+        status: Some(PersistedCLIAgentStatus::Blocked),
+        remote_host: None,
+        updated_at_unix_ms: 1_760_000_000_000,
+    }
+}
+
+fn test_window_with_cli_agent_session(
+    cli_agent_session: Option<PersistedCLIAgentSession>,
+) -> WindowSnapshot {
+    let mut window = test_terminal_window_snapshot(false);
+    for tab in &mut window.tabs {
+        if let PaneNodeSnapshot::Leaf(LeafSnapshot {
+            contents: LeafContents::Terminal(terminal),
+            ..
+        }) = &mut tab.root
+        {
+            terminal.cli_agent_session = cli_agent_session.clone();
+        }
+    }
+    window
+}
+
+/// Saves `window`, optionally corrupts the stored column with `corrupting_sql`, and returns the
+/// restored terminal panes' CLI agent sessions.
+fn round_trip_cli_agent_sessions(
+    window: WindowSnapshot,
+    corrupting_sql: Option<&str>,
+) -> Vec<Option<PersistedCLIAgentSession>> {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let mut conn = setup_database(&database_path).expect("database should initialize");
+
+    let app_state = AppState {
+        windows: vec![window],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+    if let Some(corrupting_sql) = corrupting_sql {
+        conn.batch_execute(corrupting_sql)
+            .expect("corrupting update should succeed");
+    }
+
+    let restored = read_sqlite_data(&mut conn, None, PersistedDataScope::Full)
+        .expect("app state should load")
+        .app_state
+        .expect("app state should be present for the full scope");
+
+    restored
+        .windows
+        .iter()
+        .flat_map(|window| window.tabs.iter())
+        .filter_map(|tab| match &tab.root {
+            PaneNodeSnapshot::Leaf(LeafSnapshot {
+                contents: LeafContents::Terminal(terminal),
+                ..
+            }) => Some(terminal.cli_agent_session.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn test_sqlite_round_trips_cli_agent_session() {
+    let record = test_cli_agent_session_record();
+    let restored = round_trip_cli_agent_sessions(
+        test_window_with_cli_agent_session(Some(record.clone())),
+        None,
+    );
+    assert_eq!(restored, vec![Some(record)]);
+}
+
+#[test]
+fn test_sqlite_round_trips_missing_cli_agent_session() {
+    let restored = round_trip_cli_agent_sessions(test_window_with_cli_agent_session(None), None);
+    assert_eq!(restored, vec![None]);
+}
+
+#[test]
+fn test_sqlite_null_cli_agent_session_restores_pane_without_session() {
+    // Rows written before the column existed read back as NULL.
+    let restored = round_trip_cli_agent_sessions(
+        test_window_with_cli_agent_session(Some(test_cli_agent_session_record())),
+        Some("UPDATE terminal_panes SET cli_agent_session = NULL"),
+    );
+    assert_eq!(restored, vec![None]);
+}
+
+#[test]
+fn test_sqlite_malformed_cli_agent_session_keeps_the_tab() {
+    for corrupting_sql in [
+        "UPDATE terminal_panes SET cli_agent_session = '{bad'",
+        "UPDATE terminal_panes SET cli_agent_session = ''",
+        "UPDATE terminal_panes SET cli_agent_session = '[]'",
+        r#"UPDATE terminal_panes SET cli_agent_session = '{"agent":"not-an-agent"}'"#,
+        // Unknown (e.g. newer) format version.
+        r#"UPDATE terminal_panes SET cli_agent_session = '{"v":99,"agent":"Claude","session_id":"abc"}'"#,
+        // No usable session id: resuming would have to guess.
+        r#"UPDATE terminal_panes SET cli_agent_session = '{"v":1,"agent":"Claude"}'"#,
+        r#"UPDATE terminal_panes SET cli_agent_session = '{"v":1,"agent":"Claude","session_id":"; rm -rf ~"}'"#,
+    ] {
+        let restored = round_trip_cli_agent_sessions(
+            test_window_with_cli_agent_session(Some(test_cli_agent_session_record())),
+            Some(corrupting_sql),
+        );
+        // The pane is still restored; only the unusable session is dropped.
+        assert_eq!(restored, vec![None], "{corrupting_sql}");
+    }
+}
+
+#[test]
+fn test_sqlite_stores_versioned_cli_agent_session_json() {
+    use diesel::prelude::*;
+
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let database_path = tempdir.path().join("warp.sqlite");
+    let mut conn = setup_database(&database_path).expect("database should initialize");
+    let app_state = AppState {
+        windows: vec![test_window_with_cli_agent_session(Some(
+            test_cli_agent_session_record(),
+        ))],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+
+    let stored: Vec<Option<String>> = crate::persistence::schema::terminal_panes::table
+        .select(crate::persistence::schema::terminal_panes::cli_agent_session)
+        .load(&mut conn)
+        .expect("terminal panes should load");
+    let [Some(json)] = stored.as_slice() else {
+        panic!("expected one stored session, got {stored:?}");
+    };
+    let value: serde_json::Value = serde_json::from_str(json).expect("stored JSON is valid");
+    assert_eq!(value.get("v"), Some(&serde_json::json!(1)));
+    assert_eq!(value.get("agent"), Some(&serde_json::json!("Claude")));
 }

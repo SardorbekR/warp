@@ -2756,6 +2756,10 @@ pub(crate) fn app_callbacks(
                 manager.close_notebooks(ctx);
             });
 
+            // Fork: a debounced save of CLI agent session records must reach the writer before
+            // it shuts down.
+            terminal::cli_agent_sessions::restore_save::flush_pending_save(ctx);
+
             PersistenceWriter::handle(ctx).update(ctx, |writer, _ctx| {
                 writer.terminate();
             });

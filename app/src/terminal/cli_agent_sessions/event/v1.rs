@@ -9,6 +9,16 @@ fn resolve_agent(agent: &str) -> Option<CLIAgent> {
     enum_iterator::all::<CLIAgent>().find(|candidate| candidate.command_prefixes().contains(&agent))
 }
 
+/// Plugins send `""` for fields they don't know, which must not overwrite known values.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Session ids are compared to tell sessions apart, so surrounding whitespace is dropped too.
+fn normalized_session_id(value: Option<String>) -> Option<String> {
+    non_empty(value).map(|value| value.trim().to_owned())
+}
+
 pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
     let raw: CLIAgentNotification = serde_json::from_str(body).ok()?;
 
@@ -48,13 +58,13 @@ pub(super) fn parse(body: &str) -> Option<CLIAgentEvent> {
         v: raw.v.unwrap_or(1),
         agent,
         event,
-        session_id: raw.session_id,
-        cwd: raw.cwd,
-        project: raw.project,
+        session_id: normalized_session_id(raw.session_id),
+        cwd: non_empty(raw.cwd),
+        project: non_empty(raw.project),
         payload: CLIAgentEventPayload {
             query: raw.query,
             response: raw.response,
-            transcript_path: raw.transcript_path,
+            transcript_path: non_empty(raw.transcript_path),
             summary: raw.summary,
             tool_name: raw.tool_name,
             tool_input_preview,

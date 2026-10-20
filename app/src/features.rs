@@ -455,6 +455,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::VerticalTabs,
         #[cfg(feature = "vertical_tabs_summary_mode")]
         FeatureFlag::VerticalTabsSummaryMode,
+        #[cfg(feature = "vertical_tabs_status_order")]
+        FeatureFlag::VerticalTabsStatusOrder,
         #[cfg(feature = "tab_configs")]
         FeatureFlag::TabConfigs,
         #[cfg(feature = "grouped_tabs")]

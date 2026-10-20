@@ -3747,6 +3747,8 @@ impl Workspace {
             event,
             BlocklistAIHistoryEvent::UpdatedConversationStatus { .. }
         ) {
+            // Fork: status changes add age labels; keep them ticking.
+            self.sync_vertical_tabs_status_age_tick(ctx);
             ctx.notify();
         }
 
@@ -3802,6 +3804,8 @@ impl Workspace {
                 | CLIAgentSessionsModelEvent::SessionUpdated { .. }
         ) && self.workspace_contains_terminal_view(event.terminal_view_id(), ctx)
         {
+            // Fork: status changes add age labels; keep them ticking.
+            self.sync_vertical_tabs_status_age_tick(ctx);
             ctx.notify();
         }
     }
@@ -3871,6 +3875,7 @@ impl Workspace {
                 }
                 self.sync_panel_positions_from_config(ctx);
                 self.sync_window_button_visibility(ctx);
+                self.sync_vertical_tabs_status_age_tick(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowVerticalTabPanelInRestoredWindows { .. } => {
@@ -3880,6 +3885,11 @@ impl Workspace {
                 {
                     self.vertical_tabs_panel_open = true;
                 }
+                self.sync_vertical_tabs_status_age_tick(ctx);
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::VerticalTabsSortMode { .. } => {
+                self.sync_vertical_tabs_status_age_tick(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowCodeReviewButton { .. } => {
@@ -4085,6 +4095,7 @@ impl Workspace {
     ) {
         self.vertical_tabs_panel_open =
             Self::initial_vertical_tabs_panel_open(&workspace_setting, ctx);
+        self.sync_vertical_tabs_status_age_tick(ctx);
         match workspace_setting {
             NewWorkspaceSource::Empty {
                 previous_active_window,
@@ -5576,6 +5587,16 @@ impl Workspace {
                 window_id,
                 focused_terminal_view_id,
                 ambient_agent_task_id,
+                ctx,
+            );
+        });
+        // Fork: clears "Mark as unread" once focus actually moves to that view.
+        let is_active_window_for_read_state = ctx.windows().active_window() == Some(window_id);
+        AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(
+                window_id,
+                focused_terminal_view_id,
+                is_active_window_for_read_state,
                 ctx,
             );
         });
@@ -9615,6 +9636,7 @@ impl Workspace {
             self.vertical_tabs_panel.clear_detail_sidecar();
         }
         self.sync_window_button_visibility(ctx);
+        self.sync_vertical_tabs_status_age_tick(ctx);
         ctx.notify();
     }
 
@@ -12188,6 +12210,10 @@ impl Workspace {
     }
 
     pub fn activate_prev_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        // Fork: in status order, step through rows in the order shown.
+        if self.navigate_status_ordered_rows(vertical_tabs::StatusRowNavigation::Previous, ctx) {
+            return;
+        }
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
             if self.active_tab_index > 0 {
                 self.active_tab_index - 1
@@ -12213,6 +12239,10 @@ impl Workspace {
     }
 
     pub fn activate_next_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        // Fork: in status order, step through rows in the order shown.
+        if self.navigate_status_ordered_rows(vertical_tabs::StatusRowNavigation::Next, ctx) {
+            return;
+        }
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
             if self.active_tab_index + 1 < self.tabs.len() {
                 self.active_tab_index + 1
@@ -12237,6 +12267,10 @@ impl Workspace {
     }
 
     pub fn activate_last_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        // Fork: in status order, the last row shown.
+        if self.navigate_status_ordered_rows(vertical_tabs::StatusRowNavigation::Last, ctx) {
+            return;
+        }
         if self.tabs.len() > 1 {
             let target_index = self.tabs.len() - 1;
             self.activate_tab(target_index, ctx);
@@ -19273,6 +19307,7 @@ impl Workspace {
                             ctx.notify();
                         }
                     });
+                    self.reset_vertical_tabs_status_list_hover();
                 }
                 let cached_window_is_active = current.active_window == Some(self.window_id);
                 let app_became_active = previous.stage != ApplicationStage::Active
@@ -23286,6 +23321,13 @@ impl Workspace {
             context.set.insert(flags::RESTORE_SESSION_CONTEXT_FLAG);
         }
 
+        if *general_settings.auto_resume_cli_agent_sessions {
+            use crate::undo_close::agent_sessions::AUTO_RESUME_CLI_AGENT_SESSIONS_CONTEXT_FLAG;
+            context
+                .set
+                .insert(AUTO_RESUME_CLI_AGENT_SESSIONS_CONTEXT_FLAG);
+        }
+
         if *session_settings.honor_ps1 {
             context.set.insert(flags::HONOR_PS1_CONTEXT_FLAG);
         }
@@ -24176,7 +24218,15 @@ impl TypedActionView for Workspace {
 
         match action {
             ActivateTab(index) => self.activate_tab(*index, ctx),
-            ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
+            ActivateTabByNumber(num) => {
+                // Fork: in status order, the n-th row shown.
+                if !self.navigate_status_ordered_rows(
+                    vertical_tabs::StatusRowNavigation::Number(*num),
+                    ctx,
+                ) {
+                    self.activate_tab(num.saturating_sub(1), ctx);
+                }
+            }
             SetTabShortcutModifierKey { key_code, pressed } => {
                 TabShortcutModifierState::handle(ctx).update(ctx, |state, ctx| {
                     state.set_key_held(*key_code, *pressed, ctx);
@@ -25105,6 +25155,43 @@ impl TypedActionView for Workspace {
                 );
                 ctx.notify();
             }
+            SetVerticalTabsSortMode(mode) => {
+                let mode = *mode;
+                TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    let _ = settings.vertical_tabs_sort_mode.set_value(mode, ctx);
+                });
+                ctx.notify();
+            }
+            MarkTerminalViewUnread { terminal_view_id } => {
+                let terminal_view_id = *terminal_view_id;
+                let window_id = ctx.window_id();
+                let is_active_window = ctx.windows().active_window() == Some(window_id);
+                let focused_terminal_view_id = self
+                    .active_tab_pane_group()
+                    .as_ref(ctx)
+                    .focused_session_view(ctx)
+                    .map(|view| view.id());
+                AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                    // Record the current focus first, so focus returning to this
+                    // pane when the menu closes isn't treated as the user moving
+                    // to it (which would clear the mark right away).
+                    model.handle_terminal_focus_for_read_state(
+                        window_id,
+                        focused_terminal_view_id,
+                        is_active_window,
+                        ctx,
+                    );
+                    model.mark_terminal_view_unread(terminal_view_id, ctx);
+                });
+                ctx.notify();
+            }
+            MarkTerminalViewRead { terminal_view_id } => {
+                let terminal_view_id = *terminal_view_id;
+                AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.mark_terminal_view_read(terminal_view_id, ctx);
+                });
+                ctx.notify();
+            }
             SetVerticalTabsViewMode(mode) => {
                 let mode = *mode;
                 TabSettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -25546,6 +25633,12 @@ impl TypedActionView for Workspace {
                 // Instead, we use a global action to ensure we don't try to
                 // perform nested updates on the workspace.
                 ctx.dispatch_global_action("app:undo_close", ());
+            }
+            ResumeAllCLIAgentSessions => {
+                crate::undo_close::agent_sessions::resume_all_cli_agent_sessions(self, ctx);
+            }
+            ToggleAutoResumeCLIAgentSessions => {
+                crate::undo_close::agent_sessions::toggle_auto_resume_cli_agent_sessions(ctx);
             }
             OpenShareSessionModal(index) => {
                 self.open_share_session_modal(*index, ctx);
@@ -28421,8 +28514,13 @@ impl Workspace {
         cursor_position_on_screen: Vector2F,
         ctx: &AppContext,
     ) -> usize {
-        let raw_index =
-            self.raw_tab_insertion_index_for_cursor(window_id, cursor_position_on_screen, ctx);
+        // Fork: rows ordered by status have no tab-order slots to drop
+        // between, so an attached tab goes to the end of the tab order.
+        let raw_index = if crate::tab::is_vertical_tabs_status_order_active(ctx) {
+            self.tabs.len()
+        } else {
+            self.raw_tab_insertion_index_for_cursor(window_id, cursor_position_on_screen, ctx)
+        };
         let index = self.clamp_to_unpinned_region(&self.tabs, raw_index);
         // Keep the ghost slot and the eventual drop out of the middle of a
         // group so neither splits it.
