@@ -15,8 +15,9 @@ fn record(
         launch_cwd: launch_cwd.map(str::to_owned),
         title: Some("fix the login bug".to_owned()),
         transcript_path: None,
-        status: Some(PersistedCLIAgentStatus::InProgress),
+        status: None,
         remote_host: None,
+        launched_locally: true,
         updated_at_unix_ms: 1_000,
     }
 }
@@ -44,6 +45,7 @@ fn context(
 ) -> CLIAgentSessionContext {
     CLIAgentSessionContext {
         session_id: session_id.map(str::to_owned),
+        resume_session_id: session_id.map(str::to_owned),
         cwd: launch_cwd.map(str::to_owned),
         launch_cwd: launch_cwd.map(str::to_owned),
         query: query.map(str::to_owned),
@@ -207,14 +209,18 @@ fn live_session_record() {
             ..context(Some(CLAUDE_ID), Some("/proj"), Some("  add tests  "))
         },
     );
-    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/elsewhere"), None, 5)
-        .expect("Claude sessions are persisted");
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, Some("/elsewhere"), None, true, 5)
+            .expect("Claude sessions are persisted");
     assert_eq!(live.agent, CLIAgent::Claude);
     assert_eq!(live.session_id.as_deref(), Some(CLAUDE_ID));
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj"));
     assert_eq!(live.title.as_deref(), Some("add tests"));
     assert_eq!(live.transcript_path.as_deref(), Some("/t.jsonl"));
-    assert_eq!(live.status, Some(PersistedCLIAgentStatus::InProgress));
+    // Status flips are frequent and nothing reads them back, so they aren't persisted.
+    assert_eq!(live.status, None);
+    assert!(live.launched_locally);
+    assert!(live.can_resume_here());
     assert_eq!(live.updated_at_unix_ms, 5);
 }
 
@@ -222,7 +228,7 @@ fn live_session_record() {
 fn live_session_of_unsupported_agent_is_not_persisted() {
     let session = live_session(CLIAgent::Gemini, context(Some("abc"), Some("/proj"), None));
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
         None
     );
 }
@@ -233,11 +239,12 @@ fn live_session_falls_back_to_pane_cwd() {
         CLIAgent::Codex,
         CLIAgentSessionContext {
             session_id: Some(CODEX_ID.to_owned()),
+            resume_session_id: Some(CODEX_ID.to_owned()),
             query: Some("refactor".to_owned()),
             ..Default::default()
         },
     );
-    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, 5)
+    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, true, 5)
         .expect("Codex sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some(CODEX_ID));
     assert_eq!(live.launch_cwd.as_deref(), Some("/pane"));
@@ -250,7 +257,7 @@ fn live_session_without_session_id_is_not_persisted() {
         context(None, Some("/proj"), Some("a prompt")),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
         None
     );
 }
@@ -263,7 +270,7 @@ fn fresh_session_without_activity_is_not_persisted() {
         context(Some(CLAUDE_ID), Some("/proj"), None),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
         None
     );
 }
@@ -278,17 +285,16 @@ fn status_or_summary_counts_as_activity() {
         message: None,
         source: crate::terminal::cli_agent_sessions::BlockedSource::PermissionRequest,
     };
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, 5)
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
         .expect("a blocked session has done something");
     assert_eq!(live.title, None);
-    assert_eq!(live.status, Some(PersistedCLIAgentStatus::Blocked));
 
     let mut session = live_session(
         CLIAgent::Claude,
         context(Some(CLAUDE_ID), Some("/proj"), None),
     );
     session.session_context.summary = Some("Wants to run Bash".to_owned());
-    assert!(PersistedCLIAgentSession::from_live_session(&session, None, None, 5).is_some());
+    assert!(PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5).is_some());
 }
 
 #[test]
@@ -296,9 +302,14 @@ fn resumed_session_inherits_restored_record_until_plugin_reports() {
     let restored = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
     // Command detection creates the session before the plugin reports anything.
     let session = live_session(CLIAgent::Claude, CLIAgentSessionContext::default());
-    let live =
-        PersistedCLIAgentSession::from_live_session(&session, Some("/other"), Some(&restored), 9)
-            .expect("Claude sessions are persisted");
+    let live = PersistedCLIAgentSession::from_live_session(
+        &session,
+        Some("/other"),
+        Some(&restored),
+        true,
+        9,
+    )
+    .expect("Claude sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some(CLAUDE_ID));
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj"));
     assert_eq!(live.title.as_deref(), Some("fix the login bug"));
@@ -313,8 +324,9 @@ fn launch_cwd_stays_pinned_for_the_same_session_id() {
         CLIAgent::Claude,
         context(Some(CLAUDE_ID), Some("/proj/subdir"), Some("next prompt")),
     );
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), 9)
-        .expect("Claude sessions are persisted");
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
+            .expect("Claude sessions are persisted");
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj"));
     assert_eq!(live.title.as_deref(), Some("next prompt"));
     assert_eq!(live.updated_at_unix_ms, 9);
@@ -332,8 +344,9 @@ fn new_session_id_replaces_previous_session_fields() {
             Some("first prompt"),
         ),
     );
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), 9)
-        .expect("Claude sessions are persisted");
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
+            .expect("Claude sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some("new-session"));
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj/subdir"));
     assert_eq!(live.title.as_deref(), Some("first prompt"));
@@ -345,7 +358,7 @@ fn new_session_id_replaces_previous_session_fields() {
         context(Some("new-session"), Some("/proj/subdir"), None),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), 9),
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9),
         None
     );
 }
@@ -356,21 +369,147 @@ fn different_agent_does_not_inherit_previous_record() {
     let session = live_session(CLIAgent::Codex, CLIAgentSessionContext::default());
     // Without its own session id the Codex session can't be persisted.
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), Some(&previous), 9),
+        PersistedCLIAgentSession::from_live_session(
+            &session,
+            Some("/pane"),
+            Some(&previous),
+            true,
+            9
+        ),
         None
     );
 }
 
 #[test]
-fn status_change_is_a_content_change() {
+fn status_change_alone_is_not_a_content_change() {
     let previous = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
     let mut session = live_session(CLIAgent::Claude, CLIAgentSessionContext::default());
-    session.status = CLIAgentSessionStatus::Success;
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), 9)
+    for status in [
+        CLIAgentSessionStatus::Success,
+        CLIAgentSessionStatus::InProgress,
+        CLIAgentSessionStatus::Cancelled,
+    ] {
+        session.status = status;
+        let live =
+            PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
+                .expect("Claude sessions are persisted");
+        assert!(live.has_same_content(&previous));
+        assert_eq!(live.updated_at_unix_ms, previous.updated_at_unix_ms);
+    }
+}
+
+#[test]
+fn nested_agent_prompt_keeps_the_title() {
+    let mut session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/repo"), Some("fix the build")),
+    );
+    let record = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
         .expect("Claude sessions are persisted");
-    assert!(!live.has_same_content(&previous));
-    assert_eq!(live.status, Some(PersistedCLIAgentStatus::Success));
-    assert_eq!(live.updated_at_unix_ms, 9);
+    assert_eq!(record.title.as_deref(), Some("fix the build"));
+
+    // e.g. a `claude -p` run by the agent's shell tool reported its own session and prompt.
+    session.session_context.session_id = Some("nested".to_owned());
+    session.session_context.query = Some("summarize the logs".to_owned());
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), true, 9)
+        .expect("Claude sessions are persisted");
+    assert!(live.has_same_content(&record));
+
+    // The agent's own next prompt retitles the record.
+    session.session_context.session_id = Some(CLAUDE_ID.to_owned());
+    session.session_context.query = Some("now add tests".to_owned());
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), true, 9)
+        .expect("Claude sessions are persisted");
+    assert_eq!(live.session_id.as_deref(), Some(CLAUDE_ID));
+    assert_eq!(live.title.as_deref(), Some("now add tests"));
+}
+
+#[test]
+fn sessions_not_started_from_the_local_command_line_are_copy_only() {
+    let session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/srv/app"), Some("deploy")),
+    );
+    // e.g. the plugin reported from an SSH session Warp didn't take over, or from tmux.
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, false, 5)
+        .expect("the session is still persisted, to show and copy");
+    assert!(!live.launched_locally);
+    assert!(!live.is_remote());
+    assert!(!live.can_resume_here());
+
+    // Once seen running locally, the session stays resumable while it's tracked.
+    let local = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
+        .expect("Claude sessions are persisted");
+    let later = PersistedCLIAgentSession::from_live_session(&session, None, Some(&local), false, 6)
+        .expect("Claude sessions are persisted");
+    assert!(later.can_resume_here());
+
+    // A remote host always makes it copy-only.
+    let mut remote = local.clone();
+    remote.remote_host = Some("me@devbox".to_owned());
+    assert!(!remote.can_resume_here());
+
+    // Records from before this field existed are copy-only.
+    let json = format!(r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}"}}"#);
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
+    assert!(!restored.can_resume_here());
+}
+
+#[test]
+fn paths_with_control_characters_are_dropped() {
+    let json = serde_json::json!({
+        "agent": "Claude",
+        "session_id": CLAUDE_ID,
+        "launch_cwd": "/tmp/x\n; rm -rf ~",
+        "transcript_path": "/t/\u{1b}[2J.jsonl",
+        "remote_host": "me@host\u{7}",
+        "launched_locally": true,
+    })
+    .to_string();
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
+    assert_eq!(restored.launch_cwd, None);
+    assert_eq!(restored.transcript_path, None);
+    assert_eq!(restored.remote_host, None);
+    assert_eq!(
+        restored.resume_command_steps(ShellType::Zsh, Some("/home/me")),
+        Some(vec![format!("claude --resume {CLAUDE_ID}")])
+    );
+
+    let session = live_session(
+        CLIAgent::Claude,
+        CLIAgentSessionContext {
+            launch_cwd: Some("/repo\r\u{1b}]0;x\u{7}".to_owned()),
+            ..context(Some(CLAUDE_ID), None, Some("a prompt"))
+        },
+    );
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, Some("/pane\u{0}"), None, true, 5)
+            .expect("Claude sessions are persisted");
+    assert_eq!(live.launch_cwd, None);
+    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, true, 5)
+        .expect("Claude sessions are persisted");
+    assert_eq!(live.launch_cwd.as_deref(), Some("/pane"));
+}
+
+#[test]
+fn display_title_drops_control_and_bidi_characters() {
+    let mut restored = record(CLIAgent::Claude, Some(CLAUDE_ID), None);
+    restored.title = Some("fix \u{1b}[31mthe\u{7} \u{202E}bug\u{2066}".to_owned());
+    assert_eq!(restored.display_title().as_deref(), Some("fix [31mthe bug"));
+    restored.title = Some("\u{1b}\u{7}".to_owned());
+    assert_eq!(restored.display_title(), None);
+}
+
+#[test]
+fn json_omits_unset_status() {
+    let original = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    let json = original.to_json().expect("record should serialize");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(value.get("status"), None);
+    assert_eq!(
+        value.get("launched_locally"),
+        Some(&serde_json::json!(true))
+    );
 }
 
 #[test]

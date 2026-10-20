@@ -34,9 +34,13 @@ pub struct AgentNotificationsModel {
     session_activity: HashMap<EntityId, Instant>,
     /// Terminal views the user explicitly marked as unread.
     manually_unread: HashSet<EntityId>,
-    /// The terminal view last focused in each window, so that manual unread
-    /// state is cleared only when focus actually moves.
-    last_focused_terminal_by_window: HashMap<WindowId, EntityId>,
+    /// The terminal view focused in each window, whether or not the window
+    /// is active.
+    focused_terminal_by_window: HashMap<WindowId, EntityId>,
+    /// The terminal view focused in each window when it was last active,
+    /// i.e. the one the user last saw focused there. Manual unread state is
+    /// cleared only when this changes to the marked view.
+    seen_terminal_by_window: HashMap<WindowId, EntityId>,
     /// Terminal views whose current CLI agent session has had a prompt
     /// submitted, with the agent session id reported at that prompt. A
     /// session is registered as in progress before its first prompt, so
@@ -72,7 +76,8 @@ impl AgentNotificationsModel {
             pending_artifacts: HashMap::new(),
             session_activity: HashMap::new(),
             manually_unread: HashSet::new(),
-            last_focused_terminal_by_window: HashMap::new(),
+            focused_terminal_by_window: HashMap::new(),
+            seen_terminal_by_window: HashMap::new(),
             prompted_cli_sessions: HashMap::new(),
         }
     }
@@ -128,12 +133,22 @@ impl AgentNotificationsModel {
         }
     }
 
-    /// Records that `focused_terminal_view_id` is now focused in `window_id`
-    /// and clears its manual unread mark if focus actually moved to it. Focus
-    /// returning to the same view (e.g. after a context menu closes, or the
-    /// window regaining focus) keeps the mark. Focus that moves while the
-    /// window is inactive is recorded but never clears a mark, since the user
-    /// isn't looking at it.
+    /// Drops every "Mark as unread" mark, e.g. when the sidebar stops
+    /// ordering rows by status (the only place the marks are shown).
+    pub(crate) fn clear_manual_unread_marks(&mut self, ctx: &mut ModelContext<Self>) {
+        if !self.manually_unread.is_empty() {
+            self.manually_unread.clear();
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// Records that `focused_terminal_view_id` is now focused in `window_id`.
+    /// When the window is active, the user sees that focus: if it moved to a
+    /// view marked as unread, the mark is cleared. Focus returning to the
+    /// view the user already saw focused (e.g. after a context menu closes)
+    /// keeps the mark. Focus that moves while the window is inactive is
+    /// seen once the window is activated; see
+    /// [`Self::handle_window_activated_for_read_state`].
     pub(crate) fn handle_terminal_focus_for_read_state(
         &mut self,
         window_id: WindowId,
@@ -144,16 +159,83 @@ impl AgentNotificationsModel {
         if !FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
             return;
         }
-        let previous = match focused_terminal_view_id {
-            Some(id) => self.last_focused_terminal_by_window.insert(window_id, id),
-            None => self.last_focused_terminal_by_window.remove(&window_id),
+        match focused_terminal_view_id {
+            Some(id) => self.focused_terminal_by_window.insert(window_id, id),
+            None => self.focused_terminal_by_window.remove(&window_id),
         };
-        let Some(focused) = focused_terminal_view_id else {
+        if is_active_window {
+            self.see_focused_terminal(window_id, ctx);
+        }
+    }
+
+    /// The window became active: the user now sees whatever is focused in it,
+    /// including a view focused while it was inactive (e.g. by clicking a
+    /// notification), which clears that view's manual unread mark.
+    pub(crate) fn handle_window_activated_for_read_state(
+        &mut self,
+        window_id: WindowId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
             return;
+        }
+        self.see_focused_terminal(window_id, ctx);
+    }
+
+    fn see_focused_terminal(&mut self, window_id: WindowId, ctx: &mut ModelContext<Self>) {
+        let focused = self.focused_terminal_by_window.get(&window_id).copied();
+        let previously_seen = match focused {
+            Some(id) => self.seen_terminal_by_window.insert(window_id, id),
+            None => self.seen_terminal_by_window.remove(&window_id),
         };
-        if is_active_window && previous != Some(focused) && self.manually_unread.remove(&focused) {
+        if let Some(focused) = focused
+            && previously_seen != Some(focused)
+            && self.manually_unread.remove(&focused)
+        {
             ctx.emit(AgentManagementEvent::NotificationUpdated);
         }
+    }
+
+    /// Forgets the read state and activity of terminal views that no longer
+    /// exist, and the focus of windows that no longer exist. A closed pane
+    /// that can still be restored (undo close) keeps its state until it's
+    /// gone for good.
+    pub(crate) fn prune_closed_terminal_views(&mut self, ctx: &mut ModelContext<Self>) {
+        let live_windows: HashSet<WindowId> = ctx.window_ids().collect();
+        let is_view_alive = |view_id: EntityId| {
+            live_windows
+                .iter()
+                .any(|window_id| ctx.view_name(*window_id, view_id).is_some())
+        };
+        let is_window_alive = |window_id: WindowId| live_windows.contains(&window_id);
+        if self.retain_read_state(is_view_alive, is_window_alive) {
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
+    }
+
+    /// Keeps only the entries of live views and windows. Returns whether a
+    /// manual unread mark was dropped.
+    fn retain_read_state(
+        &mut self,
+        is_view_alive: impl Fn(EntityId) -> bool,
+        is_window_alive: impl Fn(WindowId) -> bool,
+    ) -> bool {
+        let unread_count = self.manually_unread.len();
+        self.manually_unread
+            .retain(|view_id| is_view_alive(*view_id));
+        self.session_activity
+            .retain(|view_id, _| is_view_alive(*view_id));
+        self.prompted_cli_sessions
+            .retain(|view_id, _| is_view_alive(*view_id));
+        for focus_by_window in [
+            &mut self.focused_terminal_by_window,
+            &mut self.seen_terminal_by_window,
+        ] {
+            focus_by_window.retain(|window_id, view_id| {
+                is_window_alive(*window_id) && is_view_alive(*view_id)
+            });
+        }
+        self.manually_unread.len() != unread_count
     }
 
     /// Whether the CLI agent session in `terminal_view_id` hasn't had a
@@ -218,6 +300,13 @@ impl AgentNotificationsModel {
         event: &ActiveAgentViewsEvent,
         ctx: &mut ModelContext<Self>,
     ) {
+        // A pane or window went away; forget the state of views that are gone.
+        if matches!(
+            event,
+            ActiveAgentViewsEvent::ConversationClosed { .. } | ActiveAgentViewsEvent::WindowClosed
+        ) {
+            self.prune_closed_terminal_views(ctx);
+        }
         if !FeatureFlag::HOANotifications.is_enabled() {
             return;
         }
@@ -272,6 +361,9 @@ impl AgentNotificationsModel {
             } => {
                 self.session_activity.remove(terminal_view_id);
                 self.prompted_cli_sessions.remove(terminal_view_id);
+                // Sessions end when their pane closes, so also forget views
+                // that are gone.
+                self.prune_closed_terminal_views(ctx);
             }
             CLIAgentSessionsModelEvent::InputSessionChanged { .. }
             | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}

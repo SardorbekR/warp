@@ -13174,7 +13174,6 @@ impl TerminalView {
                             self.pending_command_queue.clear();
                         }
                         ctx.emit(Event::PendingCommandCompleted);
-                        self.on_pending_command_completed_for_cli_agent_restore(ctx);
 
                         // If agent view entry was deferred until setup commands
                         // finished, enter it now (unless suppressed by onboarding).
@@ -13214,6 +13213,7 @@ impl TerminalView {
                         },
                         Self::execute_pending_command,
                     );
+                    self.on_block_completed_for_cli_agent_restore(ctx);
                 }
 
                 // When a block completes, we need to update the prompt for the next
@@ -13736,7 +13736,7 @@ impl TerminalView {
                 ctx.notify();
             }
             ModelEvent::BootstrapPrecmdDone => {
-                self.on_bootstrap_precmd_done_for_cli_agent_restore(ctx);
+                self.on_shell_prompt_for_cli_agent_restore(ctx);
                 self.execute_pending_command((), ctx);
             }
             ModelEvent::AgentTaggedInChanged {
@@ -14675,6 +14675,7 @@ impl TerminalView {
         }
 
         self.refresh_warp_prompt(ctx);
+        self.on_login_shell_bootstrapped_for_cli_agent_restore(ctx);
         ctx.emit(Event::SessionBootstrapped);
     }
 

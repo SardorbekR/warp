@@ -1179,6 +1179,7 @@ fn test_cli_agent_session_record() -> PersistedCLIAgentSession {
         transcript_path: Some("/Users/me/.claude/projects/repo/0f8f2c1e.jsonl".to_owned()),
         status: Some(PersistedCLIAgentStatus::Blocked),
         remote_host: None,
+        launched_locally: true,
         updated_at_unix_ms: 1_760_000_000_000,
     }
 }

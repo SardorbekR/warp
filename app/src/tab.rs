@@ -603,15 +603,13 @@ impl TabData {
     }
 
     /// "Mark as read" / "Mark as unread" for the clicked terminal pane. Only
-    /// shown while the vertical tabs panel orders rows by status.
+    /// shown while the vertical tabs panel orders rows by status, except that
+    /// a pane still marked as unread can always be marked read.
     fn read_state_menu_items(
         &self,
         pane_name_target: Option<PaneNameMenuTarget>,
         ctx: &AppContext,
     ) -> Vec<MenuItem<WorkspaceAction>> {
-        if !is_vertical_tabs_status_order_active(ctx) {
-            return vec![];
-        }
         let Some(target) =
             pane_name_target.filter(|target| self.pane_group.id() == target.locator.pane_group_id)
         else {
@@ -625,18 +623,23 @@ impl TabData {
             return vec![];
         };
         let terminal_view_id = terminal_view.id();
-        let (label, action) =
-            if AgentNotificationsModel::as_ref(ctx).is_terminal_view_unread(terminal_view_id) {
-                (
-                    "Mark as read",
-                    WorkspaceAction::MarkTerminalViewRead { terminal_view_id },
-                )
-            } else {
-                (
-                    "Mark as unread",
-                    WorkspaceAction::MarkTerminalViewUnread { terminal_view_id },
-                )
-            };
+        let notifications = AgentNotificationsModel::as_ref(ctx);
+        if !is_vertical_tabs_status_order_active(ctx)
+            && !notifications.is_terminal_view_manually_unread(terminal_view_id)
+        {
+            return vec![];
+        }
+        let (label, action) = if notifications.is_terminal_view_unread(terminal_view_id) {
+            (
+                "Mark as read",
+                WorkspaceAction::MarkTerminalViewRead { terminal_view_id },
+            )
+        } else {
+            (
+                "Mark as unread",
+                WorkspaceAction::MarkTerminalViewUnread { terminal_view_id },
+            )
+        };
         vec![
             MenuItemFields::new(label)
                 .with_on_select_action(action)

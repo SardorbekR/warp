@@ -21,7 +21,7 @@ const MAX_SESSION_ID_LEN: usize = 128;
 const FORMAT_VERSION: u64 = 1;
 const VERSION_KEY: &str = "v";
 
-/// Status of a CLI agent session when it was last persisted.
+/// Status of a CLI agent session, as written by earlier builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PersistedCLIAgentStatus {
@@ -30,18 +30,6 @@ pub enum PersistedCLIAgentStatus {
     Success,
     Failed,
     Cancelled,
-}
-
-impl From<&CLIAgentSessionStatus> for PersistedCLIAgentStatus {
-    fn from(status: &CLIAgentSessionStatus) -> Self {
-        match status {
-            CLIAgentSessionStatus::InProgress => Self::InProgress,
-            CLIAgentSessionStatus::Blocked { .. } => Self::Blocked,
-            CLIAgentSessionStatus::Success => Self::Success,
-            CLIAgentSessionStatus::Failed { .. } => Self::Failed,
-            CLIAgentSessionStatus::Cancelled => Self::Cancelled,
-        }
-    }
 }
 
 /// The latest CLI agent session seen in a terminal pane, persisted so it can be resumed later.
@@ -60,12 +48,25 @@ pub struct PersistedCLIAgentSession {
     pub title: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_lenient_status")]
+    /// Not kept current: status flips are frequent and must not trigger saves, so live
+    /// sessions don't fill it in. Kept so records that have it still parse.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lenient_status",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub status: Option<PersistedCLIAgentStatus>,
     /// `user@host` when the agent ran over SSH. Such sessions can't be resumed from the fresh
     /// local shell of a restored pane, so only the command is offered.
     #[serde(default)]
     pub remote_host: Option<String>,
+    /// Whether Warp saw the agent start from this pane's own local shell: the running command
+    /// was the agent (directly or through an alias Warp resolved). Only such sessions are resumed
+    /// by typing a command into the restored pane. Others, e.g. an agent in an SSH session Warp
+    /// didn't take over, in mosh or in tmux, are copy-only. Missing in older records, which are
+    /// treated as copy-only.
+    #[serde(default)]
+    pub launched_locally: bool,
     #[serde(default)]
     pub updated_at_unix_ms: i64,
 }
@@ -107,11 +108,12 @@ pub fn is_resumable_agent(agent: CLIAgent) -> bool {
     }
 }
 
-/// The valid session id the live session's agent has reported, if any.
+/// The valid session id the live session's agent instance would be resumed with, if any. See
+/// [`super::CLIAgentSessionContext::resume_session_id`].
 pub(crate) fn reported_session_id(session: &CLIAgentSession) -> Option<&str> {
     session
         .session_context
-        .session_id
+        .resume_session_id
         .as_deref()
         .and_then(valid_session_id)
 }
@@ -136,6 +138,18 @@ pub(crate) fn valid_session_id(session_id: &str) -> Option<&str> {
 
 fn truncate_title(title: &str) -> String {
     title.chars().take(MAX_TITLE_CHARS).collect()
+}
+
+/// Returns the trimmed value if it's non-empty and has no control characters. Used for paths
+/// and host names, which are typed into a shell or shown verbatim, so a value with control
+/// characters is dropped rather than repaired.
+pub(crate) fn non_empty_without_control_chars(value: Option<&str>) -> Option<&str> {
+    non_empty(value).filter(|value| !value.chars().any(char::is_control))
+}
+
+/// Characters that could reorder or hide displayed text.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 impl PersistedCLIAgentSession {
@@ -188,7 +202,9 @@ impl PersistedCLIAgentSession {
             log::warn!("Ignoring persisted CLI agent session without a usable session id");
             return None;
         };
-        let owned = |value: Option<String>| non_empty(value.as_deref()).map(str::to_owned);
+        let owned = |value: Option<String>| {
+            non_empty_without_control_chars(value.as_deref()).map(str::to_owned)
+        };
         Some(Self {
             agent: self.agent,
             session_id: Some(session_id.to_owned()),
@@ -197,6 +213,7 @@ impl PersistedCLIAgentSession {
             transcript_path: owned(self.transcript_path),
             status: self.status,
             remote_host: owned(self.remote_host),
+            launched_locally: self.launched_locally,
             updated_at_unix_ms: self.updated_at_unix_ms,
         })
     }
@@ -211,12 +228,15 @@ impl PersistedCLIAgentSession {
     /// Fields the live session hasn't reported yet are carried over from `previous` when it
     /// describes the same agent session (e.g. a restored record that is being resumed), and the
     /// launch directory stays pinned to the first one seen for a session id. `pane_cwd` is the
-    /// fallback launch directory for agents that don't report one. `updated_at_unix_ms` only
-    /// advances when the content changes.
+    /// fallback launch directory for agents that don't report one. `launched_from_local_command`
+    /// says whether the pane's running command is the agent in its local shell (see
+    /// [`Self::launched_locally`]); once seen, it sticks for the session. `updated_at_unix_ms`
+    /// only advances when the content changes.
     pub fn from_live_session(
         session: &CLIAgentSession,
         pane_cwd: Option<&str>,
         previous: Option<&Self>,
+        launched_from_local_command: bool,
         now_unix_ms: i64,
     ) -> Option<Self> {
         let agent = session.agent;
@@ -232,14 +252,20 @@ impl PersistedCLIAgentSession {
             .filter(|previous| previous.session_id.as_deref() == Some(session_id.as_str()));
 
         let launch_cwd = previous_same_session
-            .and_then(|previous| previous.launch_cwd.clone())
-            .or_else(|| non_empty(context.launch_cwd.as_deref()).map(str::to_owned))
-            .or_else(|| non_empty(pane_cwd).map(str::to_owned));
+            .and_then(|previous| previous.launch_cwd.as_deref())
+            .or_else(|| non_empty_without_control_chars(context.launch_cwd.as_deref()))
+            .or_else(|| non_empty_without_control_chars(pane_cwd))
+            .map(str::to_owned);
+        // After an event from a nested agent (e.g. a `claude -p` run by the agent's shell tool),
+        // the prompt describes that run rather than the session this record resumes.
+        let prompt_is_from_resumed_session =
+            context.resume_session_id.is_none() || context.session_id == context.resume_session_id;
         let title = context
             .latest_user_prompt()
+            .filter(|_| prompt_is_from_resumed_session)
             .map(|title| truncate_title(&title))
             .or_else(|| previous_same_session.and_then(|previous| previous.title.clone()));
-        let transcript_path = non_empty(context.transcript_path.as_deref())
+        let transcript_path = non_empty_without_control_chars(context.transcript_path.as_deref())
             .map(str::to_owned)
             .or_else(|| {
                 previous_same_session.and_then(|previous| previous.transcript_path.clone())
@@ -253,14 +279,18 @@ impl PersistedCLIAgentSession {
             return None;
         }
 
+        let launched_locally = launched_from_local_command
+            || previous_same_session.is_some_and(|previous| previous.launched_locally);
         let mut record = Self {
             agent,
             session_id: Some(session_id),
             launch_cwd,
             title,
             transcript_path,
-            status: Some(PersistedCLIAgentStatus::from(&session.status)),
-            remote_host: non_empty(session.remote_host.as_deref()).map(str::to_owned),
+            status: None,
+            remote_host: non_empty_without_control_chars(session.remote_host.as_deref())
+                .map(str::to_owned),
+            launched_locally,
             updated_at_unix_ms: now_unix_ms,
         };
         if let Some(previous) = previous
@@ -271,25 +301,40 @@ impl PersistedCLIAgentSession {
         Some(record)
     }
 
-    /// Whether both records describe the same session state, ignoring when they were updated.
+    /// Whether both records describe the same session, ignoring when they were updated and the
+    /// (unread) status, so status flips don't cause saves.
     pub fn has_same_content(&self, other: &Self) -> bool {
         self.agent == other.agent
             && self.session_id == other.session_id
             && self.launch_cwd == other.launch_cwd
             && self.title == other.title
             && self.transcript_path == other.transcript_path
-            && self.status == other.status
             && self.remote_host == other.remote_host
+            && self.launched_locally == other.launched_locally
     }
 
     pub fn is_remote(&self) -> bool {
         self.remote_host.is_some()
     }
 
-    /// Single-line title for display, if the session has one.
+    /// Whether the session can be resumed by typing its command into the restored pane's local
+    /// shell. Other sessions are informational: the banner and the sidebar only offer to copy
+    /// the command.
+    pub fn can_resume_here(&self) -> bool {
+        !self.is_remote() && self.launched_locally
+    }
+
+    /// Single-line title for display, if the session has one, without control characters.
     pub fn display_title(&self) -> Option<String> {
         let title = non_empty(self.title.as_deref())?;
-        Some(title.split_whitespace().collect::<Vec<_>>().join(" "))
+        let title = title
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .filter(|&c| !c.is_control() && !is_bidi_control(c))
+            .collect::<String>();
+        non_empty(Some(title.as_str())).map(str::to_owned)
     }
 
     /// The agent command that resumes this session, without changing directories.

@@ -2,9 +2,10 @@ mod status_list;
 mod status_order;
 pub mod telemetry;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ use warpui::prelude::Align;
 use warpui::text_layout::ClipConfig;
 use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ui_components::text_input::TextInput;
+use warpui::windowing::state::ApplicationStage;
 use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle, WindowId};
 
 use self::status_order::StatusRowKey;
@@ -488,15 +490,14 @@ fn render_pane_row_element(
         if let Some(status_row_click) = status_row_click {
             // Range selection follows the manual tab order, which the status
             // order doesn't show, so shift-click toggles like cmd-click.
-            if (modifiers.shift || modifiers.cmd) && FeatureFlag::GroupedTabs.is_enabled() {
-                ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
-            } else {
-                if let Some(terminal_view_id) = status_row_click.mark_read_terminal_view_id {
-                    ctx.dispatch_typed_action(WorkspaceAction::MarkTerminalViewRead {
-                        terminal_view_id,
-                    });
-                }
-                ctx.dispatch_typed_action(WorkspaceAction::FocusPane(locator));
+            let toggles_selection =
+                (modifiers.shift || modifiers.cmd) && FeatureFlag::GroupedTabs.is_enabled();
+            for action in status_row_click_actions(
+                status_row_click.mark_read_terminal_view_id,
+                locator,
+                toggles_selection,
+            ) {
+                ctx.dispatch_typed_action(action);
             }
             return;
         }
@@ -754,8 +755,11 @@ pub(super) struct VerticalTabsPanelState {
     panel_right_click_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
     /// Status order: tracks whether the mouse is over the row list, which
-    /// freezes the row order until the mouse leaves.
+    /// freezes the row order until the mouse leaves (or rests).
     status_list_hover_state: MouseStateHandle,
+    /// Status order: real pointer moves over the row list and the detail
+    /// sidecar, so a pointer that stopped moving stops freezing the order.
+    status_list_pointer: Rc<status_list::StatusListPointerActivity>,
     /// Status order: the row order displayed last frame, reused while frozen.
     status_list_last_order: RefCell<Vec<StatusRowKey>>,
     status_sort_option_mouse_state: MouseStateHandle,
@@ -763,10 +767,14 @@ pub(super) struct VerticalTabsPanelState {
     manual_sort_option_mouse_state: MouseStateHandle,
     /// Status order: pending re-render that keeps the age labels current.
     age_tick: Option<SpawnedFutureHandle>,
-    /// Status order: keyboard navigation keeps the row order frozen until
-    /// this instant, so stepping through rows doesn't reshuffle them.
-    status_list_keyboard_freeze_until: Option<Instant>,
-    /// Status order: re-renders once the keyboard freeze ends.
+    /// Status order: the last keyboard navigation step. Stepping through rows
+    /// keeps the row order frozen until another interaction ends it (or it
+    /// times out), so rows don't move between steps.
+    status_list_keyboard_step_at: Cell<Option<Instant>>,
+    /// Status order: set by a keyboard navigation step, so that the
+    /// interaction that dispatched the step doesn't count as the next one.
+    status_list_keyboard_step_interaction_pending: Cell<Option<Instant>>,
+    /// Status order: re-renders once keyboard navigation times out.
     status_list_keyboard_freeze_timer: Option<SpawnedFutureHandle>,
 }
 
@@ -807,12 +815,14 @@ impl Default for VerticalTabsPanelState {
             panel_right_click_mouse_state: Default::default(),
             show_settings_popup: false,
             status_list_hover_state: Default::default(),
+            status_list_pointer: Rc::default(),
             status_list_last_order: RefCell::default(),
             status_sort_option_mouse_state: Default::default(),
             group_by_project_sort_option_mouse_state: Default::default(),
             manual_sort_option_mouse_state: Default::default(),
             age_tick: None,
-            status_list_keyboard_freeze_until: None,
+            status_list_keyboard_step_at: Cell::new(None),
+            status_list_keyboard_step_interaction_pending: Cell::new(None),
             status_list_keyboard_freeze_timer: None,
         }
     }
@@ -835,11 +845,6 @@ impl VerticalTabsPanelState {
         if let Ok(mut mouse_state) = self.status_list_hover_state.lock() {
             mouse_state.reset_interaction_state();
         }
-    }
-
-    fn is_status_list_keyboard_frozen(&self) -> bool {
-        self.status_list_keyboard_freeze_until
-            .is_some_and(|until| Instant::now() < until)
     }
 
     pub(super) fn has_active_detail_target(&self) -> bool {
@@ -926,6 +931,25 @@ struct PaneProps<'a> {
 struct StatusRowClick {
     /// Marks this terminal view as read on a plain click (set while unread).
     mark_read_terminal_view_id: Option<EntityId>,
+}
+
+/// The actions a click on a status-ordered row dispatches: toggling the
+/// row's tab in the multi-selection, or marking the row read (when
+/// `mark_read_terminal_view_id` is set) and focusing it. Marking read
+/// matters for the focused row, which focusing doesn't change.
+pub(super) fn status_row_click_actions(
+    mark_read_terminal_view_id: Option<EntityId>,
+    locator: PaneViewLocator,
+    toggles_selection: bool,
+) -> Vec<WorkspaceAction> {
+    if toggles_selection {
+        return vec![WorkspaceAction::ToggleTabMultiSelection { locator }];
+    }
+    mark_read_terminal_view_id
+        .map(|terminal_view_id| WorkspaceAction::MarkTerminalViewRead { terminal_view_id })
+        .into_iter()
+        .chain(std::iter::once(WorkspaceAction::FocusPane(locator)))
+        .collect()
 }
 
 struct PaneRowState {
@@ -1757,11 +1781,15 @@ fn render_vertical_tabs_panel(
     .finish();
     // Status order: track whether the mouse is over the list so rows don't
     // reorder under the cursor. Hovering notifies on enter/leave, which
-    // re-renders and applies the latest order once the mouse leaves.
+    // re-renders and applies the latest order once the mouse leaves; real
+    // moves are recorded so a resting pointer releases the order too.
     let scrollable_groups = if is_vertical_tabs_status_order_active(app) {
-        Hoverable::new(state.status_list_hover_state.clone(), |_| scrollable_groups)
-            .with_propagate_drag()
-            .finish()
+        status_list::track_real_pointer_moves(
+            Hoverable::new(state.status_list_hover_state.clone(), |_| scrollable_groups)
+                .with_propagate_drag()
+                .finish(),
+            state.status_list_pointer.clone(),
+        )
     } else {
         scrollable_groups
     };
@@ -3512,8 +3540,16 @@ fn has_unread_activity(typed: &TypedPane<'_>, app: &AppContext) -> bool {
 }
 
 fn has_unread_activity_for_terminal_view(terminal_view_id: EntityId, app: &AppContext) -> bool {
-    // Includes views the user explicitly marked as unread.
-    AgentNotificationsModel::as_ref(app).is_terminal_view_unread(terminal_view_id)
+    let notifications = AgentNotificationsModel::as_ref(app);
+    if is_vertical_tabs_status_order_active(app) {
+        // Includes views the user explicitly marked as unread.
+        notifications.is_terminal_view_unread(terminal_view_id)
+    } else {
+        // "Mark as unread" belongs to status order; manual order is upstream's.
+        notifications
+            .notifications()
+            .has_unread_for_terminal_view(terminal_view_id)
+    }
 }
 
 const INDICATOR_DOT_SIZE: f32 = 8.;
@@ -7471,6 +7507,13 @@ pub(super) fn render_detail_sidecar(
     })
     .finish();
 
+    // Status order: pointing at the sidecar keeps the row order frozen too.
+    let sidecar = if is_vertical_tabs_status_order_active(app) {
+        status_list::track_real_pointer_moves(sidecar, state.status_list_pointer.clone())
+    } else {
+        sidecar
+    };
+
     Some(DetailSidecarOverlay {
         anchor_position_id,
         offset,
@@ -7674,8 +7717,9 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
 /// How often the status-ordered list re-renders so age labels stay current.
 const STATUS_AGE_TICK_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long the status-ordered list keeps its order after a keyboard step.
-const STATUS_KEYBOARD_FREEZE: Duration = Duration::from_millis(1500);
+/// How soon after a keyboard navigation step the interaction that
+/// dispatched it is reported; a later interaction is a new one.
+const STATUS_KEYBOARD_STEP_INTERACTION_WINDOW: Duration = Duration::from_secs(1);
 
 /// A keyboard tab-navigation request, applied to the status-ordered rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7716,14 +7760,44 @@ impl Workspace {
             Timer::after(STATUS_AGE_TICK_INTERVAL),
             |me, _, ctx| {
                 me.vertical_tabs_panel.age_tick = None;
-                if me.should_tick_vertical_tabs_status_ages(ctx) {
+                // Only re-render when there's an age label to update and the
+                // app is in front; returning to the app re-renders anyway.
+                if me.should_tick_vertical_tabs_status_ages(ctx)
+                    && matches!(
+                        ctx.windows().stage(),
+                        ApplicationStage::Active | ApplicationStage::Starting
+                    )
+                    && status_list::any_row_shows_age(me, ctx)
+                {
                     ctx.notify();
                 }
+                AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.prune_closed_terminal_views(ctx);
+                });
                 me.sync_vertical_tabs_status_age_tick(ctx);
             },
             |_, _| {},
         );
         self.vertical_tabs_panel.age_tick = Some(handle);
+    }
+
+    /// Applies a change of the sort mode (or of anything else that decides
+    /// whether status order is active): keeps the age tick in sync, and
+    /// drops "Mark as unread" marks once status order is off, since only
+    /// status order shows them.
+    pub(super) fn handle_vertical_tabs_status_order_setting_changed(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !is_vertical_tabs_status_order_active(ctx) {
+            AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                model.clear_manual_unread_marks(ctx);
+            });
+            self.vertical_tabs_panel
+                .status_list_keyboard_step_at
+                .set(None);
+        }
+        self.sync_vertical_tabs_status_age_tick(ctx);
     }
 
     /// Releases a stuck status-order freeze when the window loses focus.
@@ -7754,18 +7828,8 @@ impl Workspace {
         });
         let current_position =
             current.and_then(|current| rows.iter().position(|row| *row == current));
-        let target_position = match navigation {
-            StatusRowNavigation::Next => match current_position {
-                Some(position) if position + 1 < rows.len() => Some(position + 1),
-                _ => (!rows.is_empty()).then_some(0),
-            },
-            StatusRowNavigation::Previous => match current_position {
-                Some(position) if position > 0 => Some(position - 1),
-                _ => rows.len().checked_sub(1),
-            },
-            StatusRowNavigation::Number(number) => number.checked_sub(1),
-            StatusRowNavigation::Last => rows.len().checked_sub(1),
-        };
+        let target_position =
+            status_order::navigation_target(navigation, current_position, rows.len());
         // Keep the order the user is stepping through, even if focusing the
         // row changes its status (e.g. it's no longer unread).
         self.freeze_status_list_for_keyboard(ctx);
@@ -7778,22 +7842,55 @@ impl Workspace {
     }
 
     fn freeze_status_list_for_keyboard(&mut self, ctx: &mut ViewContext<Self>) {
+        let now = Instant::now();
         let panel = &mut self.vertical_tabs_panel;
-        panel.status_list_keyboard_freeze_until =
-            Instant::now().checked_add(STATUS_KEYBOARD_FREEZE);
+        panel.status_list_keyboard_step_at.set(Some(now));
+        panel
+            .status_list_keyboard_step_interaction_pending
+            .set(Some(now));
+        // A safety net: the freeze ends after a while even without another
+        // interaction, and the list re-renders in its fresh order then.
         if let Some(timer) = panel.status_list_keyboard_freeze_timer.take() {
             timer.abort();
         }
         panel.status_list_keyboard_freeze_timer = Some(ctx.spawn_abortable(
-            Timer::after(STATUS_KEYBOARD_FREEZE),
+            Timer::after(status_order::KEYBOARD_NAVIGATION_FREEZE_TIMEOUT),
             |me, _, ctx| {
-                let panel = &mut me.vertical_tabs_panel;
-                panel.status_list_keyboard_freeze_timer = None;
-                panel.status_list_keyboard_freeze_until = None;
-                ctx.notify();
+                me.vertical_tabs_panel.status_list_keyboard_freeze_timer = None;
+                me.end_status_list_keyboard_navigation(ctx);
             },
             |_, _| {},
         ));
+    }
+
+    /// Ends keyboard navigation's freeze of the status-ordered list, so the
+    /// list shows its fresh order.
+    pub(super) fn end_status_list_keyboard_navigation(&self, ctx: &mut ViewContext<Self>) {
+        let panel = &self.vertical_tabs_panel;
+        panel
+            .status_list_keyboard_step_interaction_pending
+            .set(None);
+        if panel.status_list_keyboard_step_at.take().is_some() {
+            ctx.notify();
+        }
+    }
+
+    /// Called for every interaction with the window (keystrokes, clicks,
+    /// actions; not pointer moves). The interaction that dispatched a
+    /// keyboard navigation step is reported right after the step and keeps
+    /// the freeze; any other one ends it.
+    pub(super) fn handle_interaction_for_status_list(&self, ctx: &mut ViewContext<Self>) {
+        let panel = &self.vertical_tabs_panel;
+        let is_navigation_step = panel
+            .status_list_keyboard_step_interaction_pending
+            .take()
+            .is_some_and(|step_at| {
+                Instant::now().saturating_duration_since(step_at)
+                    < STATUS_KEYBOARD_STEP_INTERACTION_WINDOW
+            });
+        if !is_navigation_step {
+            self.end_status_list_keyboard_navigation(ctx);
+        }
     }
 }
 

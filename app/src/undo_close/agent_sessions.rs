@@ -55,7 +55,7 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
             CLIAgentResumeOutcome::Resumed => resumed = resumed.saturating_add(1),
             CLIAgentResumeOutcome::Busy
             | CLIAgentResumeOutcome::HasDraft
-            | CLIAgentResumeOutcome::RemoteOnly => skipped = skipped.saturating_add(1),
+            | CLIAgentResumeOutcome::CopyOnly => skipped = skipped.saturating_add(1),
             CLIAgentResumeOutcome::NothingToResume => {}
         }
     }
@@ -71,11 +71,11 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
         (0, 0) => "No agent sessions to resume".to_owned(),
         (resumed, 0) => format!("Resuming {}", sessions(resumed)),
         (0, skipped) => format!(
-            "Couldn't resume {}: busy, unsent input, or ran over SSH",
+            "Couldn't resume {}: busy, unsent input, or not started from the pane's shell",
             sessions(skipped)
         ),
         (resumed, skipped) => format!(
-            "Resuming {}; skipped {} (busy, unsent input, or ran over SSH)",
+            "Resuming {}; skipped {} (busy, unsent input, or not started from the pane's shell)",
             sessions(resumed),
             sessions(skipped)
         ),
@@ -95,3 +95,7 @@ pub fn toggle_auto_resume_cli_agent_sessions(ctx: &mut ViewContext<Workspace>) {
         );
     });
 }
+
+#[cfg(test)]
+#[path = "agent_sessions_tests.rs"]
+mod tests;

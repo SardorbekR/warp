@@ -78,10 +78,16 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
-    /// The first `cwd` reported for the current `session_id`. Unlike `cwd`, it doesn't follow the
+    /// The session id this agent instance would be resumed with: the first id reported, replaced
+    /// only by a later `SessionStart` (the same agent switching sessions, e.g. after `/clear` or
+    /// an in-session `/resume`). Unlike `session_id`, it ignores ids reported on other events,
+    /// which can come from a nested headless run (e.g. `claude -p` inside Claude Code) writing to
+    /// the same terminal.
+    pub resume_session_id: Option<String>,
+    /// The first `cwd` reported for `resume_session_id`. Unlike `cwd`, it doesn't follow the
     /// agent around, so it identifies where the session can be resumed from.
     pub launch_cwd: Option<String>,
-    /// Transcript file for the current `session_id`, when the plugin has reported it.
+    /// Transcript file for `resume_session_id`, when the plugin has reported it.
     pub transcript_path: Option<String>,
 }
 
@@ -132,7 +138,7 @@ impl CLIAgentSessionContext {
     /// The fields that identify which agent session this is and where it can be resumed from.
     fn identity(&self) -> (Option<String>, Option<String>, Option<String>) {
         (
-            self.session_id.clone(),
+            self.resume_session_id.clone(),
             self.launch_cwd.clone(),
             self.transcript_path.clone(),
         )
@@ -159,14 +165,22 @@ impl CLIAgentSessionContext {
             .map(str::to_owned)
     }
 
-    /// Keeps session-scoped state tied to `session_id` after it may have changed from
-    /// `previous_session_id` (e.g. after `/clear` or an in-session `/resume`).
-    fn sync_session_identity(
+    /// Updates the resume identity from an event that reported `session_id` (after `cwd` was
+    /// updated from it). `replaces_session` is set for `SessionStart`, the only event that may
+    /// switch an agent instance to another session once it has one.
+    fn sync_resume_identity(
         &mut self,
-        previous_session_id: Option<&str>,
+        session_id: Option<&str>,
+        replaces_session: bool,
         transcript_path: Option<&str>,
     ) {
-        if self.session_id.as_deref() != previous_session_id {
+        let previous_session_id = self.resume_session_id.clone();
+        if let Some(session_id) = session_id
+            && (previous_session_id.is_none() || replaces_session)
+        {
+            self.resume_session_id = Some(session_id.to_owned());
+        }
+        if self.resume_session_id != previous_session_id {
             self.launch_cwd = None;
             self.transcript_path = None;
             // Prompts and tool state from the previous session don't describe the new one. The
@@ -179,6 +193,13 @@ impl CLIAgentSessionContext {
                 self.tool_name = None;
                 self.tool_input_preview = None;
             }
+        }
+        // A directory or transcript reported along with another session's id describes that
+        // session, not the one this instance resumes.
+        if session_id
+            .is_some_and(|session_id| self.resume_session_id.as_deref() != Some(session_id))
+        {
+            return;
         }
         if self.launch_cwd.is_none() {
             self.launch_cwd = self.cwd.clone();
@@ -266,7 +287,6 @@ impl CLIAgentSession {
     /// Applies an event to this session, updating context and status.
     /// Returns the new status if it changed, or `None` if the event was irrelevant.
     fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
-        let previous_session_id = self.session_context.session_id.clone();
         self.session_context.cwd = event.cwd.clone().or(self.session_context.cwd.take());
         self.session_context.project = event
             .project
@@ -276,8 +296,9 @@ impl CLIAgentSession {
             .session_id
             .clone()
             .or(self.session_context.session_id.take());
-        self.session_context.sync_session_identity(
-            previous_session_id.as_deref(),
+        self.session_context.sync_resume_identity(
+            event.session_id.as_deref(),
+            matches!(event.event, CLIAgentEventType::SessionStart),
             event.payload.transcript_path.as_deref(),
         );
 
@@ -520,14 +541,15 @@ impl CLIAgentSessionsModel {
             session.plugin_version = plugin_version;
             session.remote_host = remote_host;
             session.should_auto_toggle_input = should_auto_toggle_input;
-            let previous_session_id = session.session_context.session_id.clone();
             session.session_context.cwd = cwd.or(session.session_context.cwd.take());
             session.session_context.project = project.or(session.session_context.project.take());
-            session.session_context.session_id =
-                session_id.or(session.session_context.session_id.take());
+            // The event that caused registration is applied next, so a `SessionStart` with
+            // another id still switches the resume identity there.
             session
                 .session_context
-                .sync_session_identity(previous_session_id.as_deref(), None);
+                .sync_resume_identity(session_id.as_deref(), false, None);
+            session.session_context.session_id =
+                session_id.or(session.session_context.session_id.take());
             return;
         }
 
@@ -537,6 +559,7 @@ impl CLIAgentSessionsModel {
                 agent,
                 status: CLIAgentSessionStatus::InProgress,
                 session_context: CLIAgentSessionContext {
+                    resume_session_id: session_id.clone(),
                     launch_cwd: cwd.clone(),
                     cwd,
                     project,

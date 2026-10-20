@@ -2436,6 +2436,7 @@ impl Workspace {
         if FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs {
             self.vertical_tabs_panel_open = true;
             self.sync_window_button_visibility(ctx);
+            self.sync_vertical_tabs_status_age_tick(ctx);
             ctx.notify();
         }
     }
@@ -2451,6 +2452,7 @@ impl Workspace {
         });
         self.vertical_tabs_panel_open = true;
         self.sync_window_button_visibility(ctx);
+        self.sync_vertical_tabs_status_age_tick(ctx);
 
         // The pinned position is captured lazily on the first step change
         // (when the user advances past the welcome banner). At that point the
@@ -3875,7 +3877,7 @@ impl Workspace {
                 }
                 self.sync_panel_positions_from_config(ctx);
                 self.sync_window_button_visibility(ctx);
-                self.sync_vertical_tabs_status_age_tick(ctx);
+                self.handle_vertical_tabs_status_order_setting_changed(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowVerticalTabPanelInRestoredWindows { .. } => {
@@ -3889,7 +3891,7 @@ impl Workspace {
                 ctx.notify();
             }
             TabSettingsChangedEvent::VerticalTabsSortMode { .. } => {
-                self.sync_vertical_tabs_status_age_tick(ctx);
+                self.handle_vertical_tabs_status_order_setting_changed(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowCodeReviewButton { .. } => {
@@ -7266,6 +7268,7 @@ impl Workspace {
             if !self.vertical_tabs_panel_open {
                 self.vertical_tabs_panel_open = true;
                 self.sync_window_button_visibility(ctx);
+                self.sync_vertical_tabs_status_age_tick(ctx);
             }
             self.open_tab_configs_menu(
                 NewSessionMenuAnchor::AddTabButton(Vector2F::zero()),
@@ -19335,6 +19338,14 @@ impl Workspace {
                         ctx,
                     );
                 }
+                // Fork: a view focused while this window was inactive (e.g. by a
+                // notification click) has now been seen, which clears "Mark as unread".
+                if cached_window_is_active && (did_window_change_focus || app_became_active) {
+                    let window_id = self.window_id;
+                    AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.handle_window_activated_for_read_state(window_id, ctx);
+                    });
+                }
 
                 // Re-render if fullscreen state for active window has changed.
                 if current.is_active_window_fullscreen != previous.is_active_window_fullscreen {
@@ -26796,6 +26807,9 @@ impl View for Workspace {
 
     fn self_or_child_interacted_with(&self, ctx: &mut ViewContext<Self>) {
         self.sync_window_button_visibility(ctx);
+        // Fork: any interaction but a navigation step ends keyboard navigation
+        // of the status-ordered tabs list.
+        self.handle_interaction_for_status_list(ctx);
     }
 
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {

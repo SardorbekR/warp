@@ -90,6 +90,12 @@ impl CLIAgentSessionRestoreBanner {
             details.push(format!(
                 "Ran on {remote_host}; copy the command to resume it there"
             ));
+        } else if !self.record.can_resume_here() {
+            details.push(
+                "Didn't start from this pane's shell (e.g. over SSH or in tmux); copy the command \
+                 to resume it where it ran"
+                    .to_owned(),
+            );
         }
         if self.transcript_missing {
             details.push("Transcript not found; resuming may fail".to_owned());
@@ -202,7 +208,7 @@ impl View for CLIAgentSessionRestoreBanner {
             .finish()
         };
         let mut buttons = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        if !self.record.is_remote() {
+        if self.record.can_resume_here() {
             buttons.add_child(button(
                 ButtonVariant::Accent,
                 &self.resume_mouse_state,

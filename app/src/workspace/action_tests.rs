@@ -3,10 +3,9 @@ use warpui::EntityId;
 use super::WorkspaceAction;
 use crate::pane_group::TerminalPaneId;
 use crate::workspace::PaneViewLocator;
-use crate::workspace::tab_settings::VerticalTabsSortMode;
 use crate::workspace::tab_settings::{
-    VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo, VerticalTabsTabItemMode,
-    VerticalTabsViewMode,
+    VerticalTabsDisplayGranularity, VerticalTabsPrimaryInfo, VerticalTabsSortMode,
+    VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
 
 #[test]

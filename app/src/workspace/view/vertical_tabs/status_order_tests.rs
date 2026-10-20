@@ -3,10 +3,12 @@ use std::time::Duration;
 use warpui::EntityId;
 
 use super::{
-    AttentionBucket, GroupHeaderText, OTHER_PROJECT_LABEL, PROJECT_PALETTE, ProjectGroup,
-    StatusRowKey, StatusSortInput, attention_bucket, compact_age_label, group_by_project,
-    group_header_text, project_name, project_palette_color, project_palette_index,
-    reconcile_frozen_order, resolve_display_order, row_display_status, status_sorted_indices,
+    AttentionBucket, FreezeInputs, GroupHeaderText, KEYBOARD_NAVIGATION_FREEZE_TIMEOUT,
+    OTHER_PROJECT_LABEL, POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup, StatusRowKey,
+    StatusRowNavigation, StatusSortInput, attention_bucket, compact_age_label, group_by_project,
+    group_header_text, is_order_frozen, navigation_target, project_name, project_palette_color,
+    project_palette_index, reconcile_frozen_order, resolve_display_order, row_attention_bucket,
+    row_display_status, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -520,4 +522,259 @@ fn project_name_handles_root_and_missing_paths() {
     assert_eq!(project_name(None, Some("  ")), None);
     assert_eq!(project_name(None, None), None);
     assert_eq!(project_name(Some(""), None), None);
+}
+
+#[test]
+fn interrupted_session_needs_you_whatever_its_status() {
+    let statuses = [
+        None,
+        Some(blocked()),
+        Some(ConversationStatus::InProgress),
+        Some(ConversationStatus::WaitingForEvents),
+        Some(ConversationStatus::TransientError),
+        Some(ConversationStatus::Success),
+        Some(ConversationStatus::Error),
+        Some(ConversationStatus::Cancelled),
+    ];
+    for status in &statuses {
+        for is_unread in [false, true] {
+            assert_eq!(
+                row_attention_bucket(status.as_ref(), is_unread, true),
+                AttentionBucket::NeedsYou,
+                "interrupted, status {status:?}, unread {is_unread}"
+            );
+            assert_eq!(
+                row_attention_bucket(status.as_ref(), is_unread, false),
+                attention_bucket(status.as_ref(), is_unread),
+                "not interrupted, status {status:?}, unread {is_unread}"
+            );
+        }
+    }
+}
+
+#[test]
+fn interrupted_session_sorts_with_sessions_that_need_you() {
+    let rows = [
+        row(key(1), AttentionBucket::Running),
+        row(
+            key(2),
+            row_attention_bucket(None, false, /* is_interrupted */ true),
+        ),
+        row(key(3), AttentionBucket::Unread),
+        row(key(4), row_attention_bucket(None, false, false)),
+    ];
+    assert_eq!(status_sorted_indices(&rows), vec![1, 2, 0, 3]);
+}
+
+/// Freeze inputs for an open panel in the active window, with nothing
+/// freezing the order.
+fn idle_freeze_inputs() -> FreezeInputs {
+    FreezeInputs {
+        is_panel_open: true,
+        is_window_active: true,
+        ..FreezeInputs::default()
+    }
+}
+
+fn recently() -> Option<Duration> {
+    Some(Duration::from_millis(200))
+}
+
+#[test]
+fn order_is_not_frozen_without_a_reason() {
+    assert!(!is_order_frozen(&idle_freeze_inputs()));
+    assert!(!is_order_frozen(&FreezeInputs::default()));
+}
+
+#[test]
+fn pointer_over_the_list_freezes_while_it_moves_in_the_active_window() {
+    let pointing = FreezeInputs {
+        is_pointer_over_list: true,
+        since_real_pointer_move: recently(),
+        ..idle_freeze_inputs()
+    };
+    assert!(is_order_frozen(&pointing));
+
+    // Hover state alone (e.g. refreshed by synthetic moves) doesn't freeze.
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: None,
+        ..pointing
+    }));
+    // A pointer that rests stops freezing the list, so it never stays
+    // frozen (e.g. the pointer left the window without that being reported).
+    assert!(is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: POINTER_IDLE_RELEASE.checked_sub(Duration::from_millis(1)),
+        ..pointing
+    }));
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
+        ..pointing
+    }));
+    // Focus loss: the pointer of an inactive window doesn't freeze it.
+    assert!(!is_order_frozen(&FreezeInputs {
+        is_window_active: false,
+        ..pointing
+    }));
+    // A closed panel can't be pointed at, even if it closed under the pointer.
+    assert!(!is_order_frozen(&FreezeInputs {
+        is_panel_open: false,
+        ..pointing
+    }));
+    // Moving elsewhere doesn't freeze the list.
+    assert!(!is_order_frozen(&FreezeInputs {
+        is_pointer_over_list: false,
+        ..pointing
+    }));
+}
+
+#[test]
+fn detail_sidecar_freezes_while_shown_or_pointed_at() {
+    let moving = FreezeInputs {
+        since_real_pointer_move: recently(),
+        ..idle_freeze_inputs()
+    };
+    // On the sidecar, outside the list.
+    assert!(is_order_frozen(&FreezeInputs {
+        is_pointer_over_detail_sidecar: true,
+        ..moving
+    }));
+    // On the way from the row to the sidecar, while it's shown.
+    assert!(is_order_frozen(&FreezeInputs {
+        is_detail_sidecar_shown: true,
+        ..moving
+    }));
+    // The same limits as the list: an inactive window or a resting pointer
+    // doesn't keep it frozen.
+    for inputs in [
+        FreezeInputs {
+            is_detail_sidecar_shown: true,
+            is_pointer_over_detail_sidecar: true,
+            is_window_active: false,
+            ..moving
+        },
+        FreezeInputs {
+            is_detail_sidecar_shown: true,
+            is_pointer_over_detail_sidecar: true,
+            since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
+            ..moving
+        },
+    ] {
+        assert!(!is_order_frozen(&inputs), "{inputs:?}");
+    }
+}
+
+#[test]
+fn keyboard_navigation_freezes_until_another_interaction_or_timeout() {
+    let navigating = FreezeInputs {
+        since_keyboard_step: Some(Duration::from_secs(3)),
+        ..idle_freeze_inputs()
+    };
+    // Unlike pointing, it doesn't depend on the pointer or the window.
+    assert!(is_order_frozen(&navigating));
+    assert!(is_order_frozen(&FreezeInputs {
+        is_window_active: false,
+        ..navigating
+    }));
+    // A real pointer move after the step ends it.
+    assert!(!is_order_frozen(&FreezeInputs {
+        has_pointer_moved_since_keyboard_step: true,
+        ..navigating
+    }));
+    // So does the safety timeout.
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_keyboard_step: Some(KEYBOARD_NAVIGATION_FREEZE_TIMEOUT),
+        ..navigating
+    }));
+    // Other interactions end it by clearing the step.
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_keyboard_step: None,
+        ..navigating
+    }));
+}
+
+#[test]
+fn context_menu_and_pane_drag_freeze() {
+    assert!(is_order_frozen(&FreezeInputs {
+        is_context_menu_open: true,
+        ..idle_freeze_inputs()
+    }));
+    assert!(is_order_frozen(&FreezeInputs {
+        is_dragging_pane: true,
+        ..idle_freeze_inputs()
+    }));
+}
+
+#[test]
+fn navigation_target_steps_and_wraps() {
+    use StatusRowNavigation::{Last, Next, Number, Previous};
+    assert_eq!(navigation_target(Next, Some(0), 3), Some(1));
+    assert_eq!(navigation_target(Next, Some(2), 3), Some(0));
+    assert_eq!(navigation_target(Previous, Some(1), 3), Some(0));
+    assert_eq!(navigation_target(Previous, Some(0), 3), Some(2));
+    assert_eq!(navigation_target(Last, Some(0), 3), Some(2));
+    assert_eq!(navigation_target(Number(1), Some(2), 3), Some(0));
+    assert_eq!(navigation_target(Number(3), None, 3), Some(2));
+    // A number past the last row (or zero) lands nowhere.
+    assert_eq!(navigation_target(Number(4), Some(0), 3), None);
+    assert_eq!(navigation_target(Number(0), Some(0), 3), None);
+}
+
+#[test]
+fn navigation_target_handles_a_hidden_current_row_and_no_rows() {
+    use StatusRowNavigation::{Last, Next, Number, Previous};
+    // The focused row isn't shown (e.g. filtered out by the search).
+    assert_eq!(navigation_target(Next, None, 3), Some(0));
+    assert_eq!(navigation_target(Previous, None, 3), Some(2));
+    assert_eq!(navigation_target(Next, Some(7), 3), Some(0));
+    assert_eq!(navigation_target(Previous, Some(7), 3), Some(2));
+    for navigation in [Next, Previous, Last, Number(1)] {
+        assert_eq!(navigation_target(navigation, Some(0), 0), None);
+        assert_eq!(navigation_target(navigation, None, 0), None);
+    }
+}
+
+#[test]
+fn group_by_project_navigation_walks_each_group_in_turn() {
+    let rows = [
+        StatusSortInput {
+            project: Some("api"),
+            ..row(key(1), AttentionBucket::NeedsYou)
+        },
+        StatusSortInput {
+            project: Some("web"),
+            ..row(key(2), AttentionBucket::Unread)
+        },
+        StatusSortInput {
+            project: Some("api"),
+            fallback_rank: (2, 0),
+            ..row(key(3), AttentionBucket::Idle)
+        },
+        StatusSortInput {
+            project: Some("web"),
+            ..row(key(4), AttentionBucket::Running)
+        },
+        StatusSortInput {
+            project: None,
+            fallback_rank: (1, 0),
+            ..row(key(5), AttentionBucket::Idle)
+        },
+    ];
+    let status_order = status_sorted_indices(&rows);
+    assert_eq!(status_order, vec![0, 1, 3, 4, 2]);
+
+    // Navigation walks the rows as displayed: group by group, with groups
+    // ordered by their most urgent row, not in plain status order.
+    let displayed: Vec<usize> = group_by_project(&rows, &status_order)
+        .into_iter()
+        .flat_map(|group| group.row_indices)
+        .collect();
+    assert_eq!(displayed, vec![0, 2, 1, 3, 4]);
+
+    let mut visited = Vec::new();
+    let mut current = Some(displayed.len() - 1);
+    for _ in 0..displayed.len() {
+        current = navigation_target(StatusRowNavigation::Next, current, displayed.len());
+        visited.extend(current.and_then(|position| displayed.get(position).copied()));
+    }
+    assert_eq!(visited, displayed, "every row once, in display order");
 }

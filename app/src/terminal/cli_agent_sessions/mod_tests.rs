@@ -1611,10 +1611,57 @@ fn new_session_id_resets_launch_cwd_and_transcript_path() {
 
     assert_eq!(session.session_context.session_id.as_deref(), Some("def"));
     assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("def")
+    );
+    assert_eq!(
         session.session_context.launch_cwd.as_deref(),
         Some("/repo/sub")
     );
     assert_eq!(session.session_context.transcript_path, None);
+}
+
+#[test]
+fn nested_agent_ids_do_not_change_the_resume_identity() {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            transcript_path: Some("/t/abc.jsonl".to_owned()),
+            ..Default::default()
+        },
+    ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("abc"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("fix the build".to_owned()),
+            ..Default::default()
+        },
+    ));
+
+    // e.g. a `claude -p` run by the agent's own shell tool reports its own session.
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("nested"),
+        Some("/tmp/scratch"),
+        CLIAgentEventPayload {
+            transcript_path: Some("/t/nested.jsonl".to_owned()),
+            ..Default::default()
+        },
+    ));
+
+    let context = &session.session_context;
+    // The live id keeps following events, as before.
+    assert_eq!(context.session_id.as_deref(), Some("nested"));
+    assert_eq!(context.resume_session_id.as_deref(), Some("abc"));
+    assert_eq!(context.launch_cwd.as_deref(), Some("/repo"));
+    assert_eq!(context.transcript_path.as_deref(), Some("/t/abc.jsonl"));
+    // Prompt fields keep following events, as before; the persisted record ignores them while
+    // the live id is a nested one (see `restore::tests::nested_agent_prompt_keeps_the_title`).
 }
 
 #[test]
@@ -1636,6 +1683,10 @@ fn repeated_session_start_updates_session_id() {
     assert_eq!(status, None);
     assert_eq!(session.status, CLIAgentSessionStatus::Success);
     assert_eq!(session.session_context.session_id.as_deref(), Some("def"));
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("def")
+    );
 }
 
 #[test]
@@ -1754,8 +1805,22 @@ fn identity_change_on_any_event_emits_session_updated() {
         });
         assert_eq!(updates.get(), 1, "an unchanged identity emits nothing");
 
+        // Another id on a non-`SessionStart` event (e.g. a nested headless run) doesn't change
+        // the identity.
         model.update(&mut app, |m, ctx| {
-            m.update_from_event(view_id, &idle("def"), ctx);
+            m.update_from_event(view_id, &idle("nested"), ctx);
+        });
+        assert_eq!(updates.get(), 1);
+
+        // A `SessionStart` with another id (e.g. `/clear`) does.
+        let session_start = session_event(
+            CLIAgentEventType::SessionStart,
+            Some("def"),
+            Some("/repo"),
+            CLIAgentEventPayload::default(),
+        );
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &session_start, ctx);
         });
         assert_eq!(updates.get(), 2);
     });

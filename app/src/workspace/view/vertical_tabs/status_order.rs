@@ -12,6 +12,7 @@ use std::time::Duration;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::EntityId;
 
+use super::StatusRowNavigation;
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::PaneId;
 
@@ -59,6 +60,21 @@ pub(super) fn attention_bucket(
     }
 }
 
+/// The bucket of a row. An interrupted agent session (its agent died in a
+/// crash or restart and hasn't been resumed) needs the user to resume it, so
+/// it needs them whatever the pane is doing now.
+pub(super) fn row_attention_bucket(
+    status: Option<&ConversationStatus>,
+    is_unread: bool,
+    is_interrupted: bool,
+) -> AttentionBucket {
+    if is_interrupted {
+        AttentionBucket::NeedsYou
+    } else {
+        attention_bucket(status, is_unread)
+    }
+}
+
 /// The status a row shows and sorts by. A CLI agent session is registered as
 /// in progress before the user's first prompt, so until a prompt is
 /// submitted that status means "started", not "working": the row is shown as
@@ -90,7 +106,9 @@ pub(super) struct StatusSortInput<'a> {
     pub is_unread: bool,
     /// Time since the session's last status change, if one has been observed.
     pub age: Option<Duration>,
-    /// Tie-breaker for rows without a known age: (tab MRU position, pane position).
+    /// Tie-breaker for rows without a known age: (tab position, pane
+    /// position). Stable on purpose: focusing a row never moves it, so
+    /// stepping through rows can't bounce between two of them.
     pub fallback_rank: (usize, usize),
     pub project: Option<&'a str>,
 }
@@ -202,7 +220,7 @@ pub(super) fn reconcile_frozen_order<K: Copy + Eq + Hash>(previous: &[K], fresh:
 }
 
 /// Picks the order to display: the fresh order, or the reconciled previous
-/// order when the list is frozen (mouse over the list, menu open, dragging).
+/// order when the list is frozen (see [`is_order_frozen`]).
 pub(super) fn resolve_display_order<K: Copy + Eq + Hash>(
     previous: &[K],
     fresh: &[K],
@@ -212,6 +230,87 @@ pub(super) fn resolve_display_order<K: Copy + Eq + Hash>(
         reconcile_frozen_order(previous, fresh)
     } else {
         fresh.to_vec()
+    }
+}
+
+/// How long the pointer may rest without really moving before it stops
+/// freezing the order. The UI framework refreshes hover state with synthetic
+/// moves after every frame, and some platforms don't report the pointer
+/// leaving the window, so hover state alone could freeze the list forever.
+pub(super) const POINTER_IDLE_RELEASE: Duration = Duration::from_secs(5);
+
+/// The longest keyboard navigation keeps the order frozen after its last
+/// step, in case no other interaction ends it first.
+pub(super) const KEYBOARD_NAVIGATION_FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Everything the freeze rule depends on, gathered by the caller.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FreezeInputs {
+    pub is_panel_open: bool,
+    /// Whether this window is the active (key) window.
+    pub is_window_active: bool,
+    /// Whether the pointer was last over the row list.
+    pub is_pointer_over_list: bool,
+    /// Whether the pointer was last over the row detail sidecar.
+    pub is_pointer_over_detail_sidecar: bool,
+    /// Whether the detail sidecar is showing a row's details.
+    pub is_detail_sidecar_shown: bool,
+    /// Time since the pointer last really (not synthetically) moved over the
+    /// list or the sidecar.
+    pub since_real_pointer_move: Option<Duration>,
+    /// Time since the last keyboard navigation step, unless another
+    /// interaction (a click, typing, any other action) has ended it.
+    pub since_keyboard_step: Option<Duration>,
+    /// Whether the pointer really moved over the list or the sidecar after
+    /// the last keyboard navigation step, which also ends it.
+    pub has_pointer_moved_since_keyboard_step: bool,
+    pub is_context_menu_open: bool,
+    pub is_dragging_pane: bool,
+}
+
+/// Rows keep their positions while the user is pointing at the list or its
+/// detail sidecar in the active window, is stepping through rows with the
+/// keyboard, has a context menu open, or is dragging a pane, so nothing moves
+/// under them. Pointing and keyboard navigation always run out on their own.
+pub(super) fn is_order_frozen(inputs: &FreezeInputs) -> bool {
+    let is_pointer_live = inputs.is_panel_open
+        && inputs.is_window_active
+        && inputs
+            .since_real_pointer_move
+            .is_some_and(|idle| idle < POINTER_IDLE_RELEASE);
+    let is_pointing = is_pointer_live
+        && (inputs.is_pointer_over_list
+            || inputs.is_pointer_over_detail_sidecar
+            || inputs.is_detail_sidecar_shown);
+    let is_keyboard_navigating = !inputs.has_pointer_moved_since_keyboard_step
+        && inputs
+            .since_keyboard_step
+            .is_some_and(|since| since < KEYBOARD_NAVIGATION_FREEZE_TIMEOUT);
+    is_pointing || is_keyboard_navigating || inputs.is_context_menu_open || inputs.is_dragging_pane
+}
+
+/// The displayed row a navigation step lands on, as an index into
+/// `row_count` rows. `current` is the position of the focused row, if it is
+/// shown. Next and previous wrap around; a number past the last row lands
+/// nowhere.
+pub(super) fn navigation_target(
+    navigation: StatusRowNavigation,
+    current: Option<usize>,
+    row_count: usize,
+) -> Option<usize> {
+    let last = row_count.checked_sub(1)?;
+    let current = current.filter(|position| *position <= last);
+    match navigation {
+        StatusRowNavigation::Next => Some(match current {
+            Some(position) if position < last => position + 1,
+            _ => 0,
+        }),
+        StatusRowNavigation::Previous => Some(match current {
+            Some(position) if position > 0 => position - 1,
+            _ => last,
+        }),
+        StatusRowNavigation::Number(number) => number.checked_sub(1).filter(|index| *index <= last),
+        StatusRowNavigation::Last => Some(last),
     }
 }
 

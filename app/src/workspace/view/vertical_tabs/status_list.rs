@@ -8,7 +8,9 @@
 //! hover, selection, rename, context menus and the detail sidecar behave like
 //! the manual list.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use instant::Instant;
@@ -19,19 +21,20 @@ use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
 use warpui::elements::{
-    Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Empty, Expanded,
-    Flex, Hoverable, MainAxisSize, MouseStateHandle, Padding, ParentElement, Radius, SavePosition,
-    Shrinkable, Text,
+    Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult,
+    Element, Empty, EventHandler, Expanded, Flex, Hoverable, MainAxisSize, MouseInBehavior,
+    MouseStateHandle, Padding, ParentElement, Radius, SavePosition, Shrinkable, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
-use warpui::{AppContext, EntityId, SingletonEntity, ViewHandle};
+use warpui::{AppContext, EntityId, EventContext, SingletonEntity, TaskId, ViewHandle};
 
 use super::status_order::{
-    AttentionBucket, GroupHeaderText, StatusRowKey, StatusSortInput, attention_bucket,
-    compact_age_label, group_by_project, group_header_text, project_name, project_palette_color,
-    resolve_display_order, row_display_status, status_sorted_indices,
+    AttentionBucket, FreezeInputs, GroupHeaderText, POINTER_IDLE_RELEASE, StatusRowKey,
+    StatusSortInput, compact_age_label, group_by_project, group_header_text, is_order_frozen,
+    project_name, project_palette_color, resolve_display_order, row_attention_bucket,
+    row_display_status, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -83,6 +86,9 @@ struct StatusRow<'a> {
     terminal_view_id: Option<EntityId>,
     is_unread: bool,
     is_errored: bool,
+    /// Set when the pane holds an agent session that was interrupted (e.g.
+    /// by a crash or restart) and can be resumed from the pane.
+    interrupted: Option<InterruptedSession>,
     project: Option<String>,
     age: Option<Duration>,
     bucket: AttentionBucket,
@@ -104,6 +110,13 @@ impl StatusRow<'_> {
             project: self.project.as_deref(),
         }
     }
+}
+
+/// What a row shows for an interrupted agent session.
+#[derive(Clone, Copy)]
+struct InterruptedSession {
+    /// The session ran over SSH, so it can't be resumed from this machine.
+    is_remote: bool,
 }
 
 enum StatusRowTitle {
@@ -261,26 +274,123 @@ fn layout_sections(
     (sections, display_keys)
 }
 
-/// Rows keep their positions while the user is pointing at the list, has a
-/// context menu open, is dragging a pane, or is stepping through rows with
-/// the keyboard, so nothing moves under them.
+/// Whether the row order is frozen right now; see [`is_order_frozen`].
 fn is_status_list_frozen(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
     app: &AppContext,
 ) -> bool {
-    // The guard is dropped before the Hoverable for this handle is built. A
-    // closed panel can't be pointed at, even if it closed under the mouse.
-    let is_mouse_over_list = workspace.vertical_tabs_panel_open
-        && state
-            .status_list_hover_state
+    let now = Instant::now();
+    // Each guard is dropped before the next lock is taken, and before the
+    // Hoverables for these handles are built.
+    let is_mouse_over = |mouse_state: &MouseStateHandle| {
+        mouse_state
             .lock()
             .map(|mouse_state| mouse_state.is_mouse_over_element())
-            .unwrap_or(false);
-    is_mouse_over_list
-        || state.is_status_list_keyboard_frozen()
-        || workspace.show_tab_right_click_menu.is_some()
-        || any_workspace_pane_being_dragged(workspace, app)
+            .unwrap_or(false)
+    };
+    let keyboard_step_at = state.status_list_keyboard_step_at.get();
+    is_order_frozen(&FreezeInputs {
+        // A closed panel can't be pointed at, even if it closed under the mouse.
+        is_panel_open: workspace.vertical_tabs_panel_open,
+        is_window_active: app.windows().active_window() == Some(workspace.window_id),
+        is_pointer_over_list: is_mouse_over(&state.status_list_hover_state),
+        is_pointer_over_detail_sidecar: is_mouse_over(&state.detail_sidecar_mouse_state),
+        is_detail_sidecar_shown: state.has_active_detail_target(),
+        since_real_pointer_move: state.status_list_pointer.since_last_real_move(now),
+        since_keyboard_step: keyboard_step_at.map(|step_at| now.saturating_duration_since(step_at)),
+        has_pointer_moved_since_keyboard_step: keyboard_step_at
+            .is_some_and(|step_at| state.status_list_pointer.moved_after(step_at)),
+        is_context_menu_open: workspace.show_tab_right_click_menu.is_some(),
+        is_dragging_pane: any_workspace_pane_being_dragged(workspace, app),
+    })
+}
+
+/// Extra time after [`POINTER_IDLE_RELEASE`] before the re-render that lets
+/// an idle pointer's freeze go. It also limits how often pointer moves
+/// reschedule that re-render.
+const POINTER_IDLE_RELEASE_SLACK: Duration = Duration::from_secs(1);
+
+/// Real (not synthetic) pointer moves over the status list and its detail
+/// sidecar. Hover state alone can't tell whether the pointer is still there,
+/// so the freeze also needs a recent real move.
+#[derive(Default)]
+pub(super) struct StatusListPointerActivity {
+    last_real_move_at: Cell<Option<Instant>>,
+    /// The pending re-render that releases the freeze once the pointer has
+    /// been idle long enough, and when it fires.
+    idle_release_notify: Cell<Option<(TaskId, Instant)>>,
+}
+
+impl StatusListPointerActivity {
+    fn since_last_real_move(&self, now: Instant) -> Option<Duration> {
+        self.last_real_move_at
+            .get()
+            .map(|moved_at| now.saturating_duration_since(moved_at))
+    }
+
+    fn moved_after(&self, instant: Instant) -> bool {
+        self.last_real_move_at
+            .get()
+            .is_some_and(|moved_at| moved_at > instant)
+    }
+
+    fn record_real_move(&self, ctx: &mut EventContext) {
+        let now = Instant::now();
+        self.last_real_move_at.set(Some(now));
+        let Some(release_at) = now.checked_add(POINTER_IDLE_RELEASE) else {
+            return;
+        };
+        // Keep one re-render scheduled for when this move stops freezing the
+        // list, so an idle pointer never keeps it frozen.
+        let is_scheduled = self
+            .idle_release_notify
+            .get()
+            .is_some_and(|(_, notify_at)| notify_at >= release_at);
+        if is_scheduled {
+            return;
+        }
+        if let Some((timer_id, _)) = self.idle_release_notify.take() {
+            ctx.clear_notify_timer(timer_id);
+        }
+        self.idle_release_notify.set(Some(
+            ctx.notify_after(POINTER_IDLE_RELEASE.saturating_add(POINTER_IDLE_RELEASE_SLACK)),
+        ));
+    }
+}
+
+/// Records real pointer moves over `child` (the status list or the detail
+/// sidecar) without otherwise handling them.
+pub(super) fn track_real_pointer_moves(
+    child: Box<dyn Element>,
+    activity: Rc<StatusListPointerActivity>,
+) -> Box<dyn Element> {
+    EventHandler::new(child)
+        .with_always_handle()
+        .on_mouse_in(
+            move |ctx, _, _| {
+                activity.record_real_move(ctx);
+                DispatchEventResult::PropagateToParent
+            },
+            Some(MouseInBehavior {
+                fire_on_synthetic_events: false,
+                fire_when_covered: true,
+            }),
+        )
+        .finish()
+}
+
+/// Whether any terminal row of the workspace shows an age label.
+pub(super) fn any_row_shows_age(workspace: &Workspace, app: &AppContext) -> bool {
+    let notifications = AgentNotificationsModel::as_ref(app);
+    workspace.tabs.iter().any(|tab| {
+        let pane_group = tab.pane_group.as_ref(app);
+        pane_group.visible_pane_ids().iter().any(|pane_id| {
+            pane_group
+                .terminal_view_from_pane_id(*pane_id, app)
+                .is_some_and(|view| notifications.last_activity_at(view.id()).is_some())
+        })
+    })
 }
 
 fn last_order(state: &VerticalTabsPanelState) -> Vec<StatusRowKey> {
@@ -359,12 +469,6 @@ fn collect_status_rows<'a>(
     let cli_sessions = CLIAgentSessionsModel::as_ref(app);
     let now = Instant::now();
     let query_lower = (!state.search_query.is_empty()).then(|| state.search_query.to_lowercase());
-    let mru_rank: HashMap<EntityId, usize> = workspace
-        .tab_mru_order
-        .iter()
-        .enumerate()
-        .map(|(rank, pane_group_id)| (*pane_group_id, rank))
-        .collect();
     let is_tab_being_renamed = workspace.current_workspace_state.is_tab_being_renamed();
 
     let mut rows = Vec::new();
@@ -379,7 +483,6 @@ fn collect_status_rows<'a>(
                 .is_agent_management_view_open;
         let is_in_multi_tab_selection = workspace.is_tab_in_multi_tab_selection(tab_index);
         let title_override = tab_title_override(pane_group, visible_pane_ids.len(), app);
-        let tab_rank = mru_rank.get(&pane_group_id).copied().unwrap_or(usize::MAX);
 
         for (pane_index, &pane_id) in visible_pane_ids.iter().enumerate() {
             let locator = PaneViewLocator {
@@ -434,19 +537,39 @@ fn collect_status_rows<'a>(
                 .as_ref()
                 .map(|handle| handle.as_ref(app));
             let project = terminal_view.and_then(terminal_project_name);
+            let interrupted_record =
+                terminal_view.and_then(TerminalView::restorable_cli_agent_session);
+            let interrupted_title = interrupted_record.map(|record| {
+                record
+                    .display_title()
+                    .unwrap_or_else(|| format!("{} session", record.agent.display_name()))
+            });
             if let Some(query_lower) = query_lower.as_deref()
                 && !row_matches_query(&props, project.as_deref(), query_lower, app)
+                && !interrupted_title
+                    .as_ref()
+                    .is_some_and(|title| title.to_lowercase().contains(query_lower))
             {
                 continue;
             }
 
             let terminal_view_id = terminal_view_handle.as_ref().map(|handle| handle.id());
-            let (icon, status) = split_status(resolve_icon_with_status_variant(
+            let (mut icon, status) = split_status(resolve_icon_with_status_variant(
                 &props.typed,
                 &props.title,
                 appearance,
                 app,
             ));
+            // An interrupted session has no live agent yet; show whose it was.
+            if let Some(record) = interrupted_record
+                && !matches!(icon, IconWithStatusVariant::CLIAgent { .. })
+            {
+                icon = IconWithStatusVariant::CLIAgent {
+                    agent: record.agent,
+                    status: None,
+                    is_ambient: false,
+                };
+            }
             // Only a CLI agent's own status can be the optimistic "in
             // progress" it is registered with before the first prompt.
             let is_awaiting_first_prompt = matches!(icon, IconWithStatusVariant::CLIAgent { .. })
@@ -466,7 +589,10 @@ fn collect_status_rows<'a>(
                 .map(|changed_at| now.saturating_duration_since(changed_at));
             let is_errored = terminal_view
                 .is_some_and(|view| view.current_state().state == TerminalViewState::Errored);
-            let title = status_row_title(&props, terminal_view, app);
+            let title = status_row_title(&props, terminal_view, interrupted_title, app);
+            let interrupted = interrupted_record.map(|record| InterruptedSession {
+                is_remote: record.is_remote(),
+            });
 
             rows.push(StatusRow {
                 key: StatusRowKey {
@@ -475,14 +601,15 @@ fn collect_status_rows<'a>(
                 },
                 tab_index,
                 icon,
-                bucket: attention_bucket(status.as_ref(), is_unread),
+                bucket: row_attention_bucket(status.as_ref(), is_unread, interrupted.is_some()),
                 status,
                 terminal_view_id,
                 is_unread,
                 is_errored,
+                interrupted,
                 project,
                 age,
-                fallback_rank: (tab_rank, pane_index),
+                fallback_rank: (tab_index, pane_index),
                 title,
                 saves_tab_position: pane_id == focused_pane_id,
                 props,
@@ -535,11 +662,13 @@ fn split_status(
 }
 
 /// The row's title, using the same precedence as the manual list: an active
-/// rename editor, then a custom pane or tab name, then the terminal's primary
-/// line (agent title, running command, ...), then the pane's own title.
+/// rename editor, then a custom pane or tab name, then (for an interrupted
+/// agent session) the session's title, then the terminal's primary line
+/// (agent title, running command, ...), then the pane's own title.
 fn status_row_title(
     props: &PaneProps<'_>,
     terminal_view: Option<&TerminalView>,
+    interrupted_title: Option<String>,
     app: &AppContext,
 ) -> StatusRowTitle {
     if props.is_tab_being_renamed
@@ -559,6 +688,12 @@ fn status_row_title(
     {
         return StatusRowTitle::Text {
             text: title.clone(),
+            font: TerminalPrimaryLineFont::Ui,
+        };
+    }
+    if let Some(text) = interrupted_title {
+        return StatusRowTitle::Text {
+            text,
             font: TerminalPrimaryLineFont::Ui,
         };
     }
@@ -608,6 +743,7 @@ fn render_status_row(
         terminal_view_id,
         is_unread,
         is_errored,
+        interrupted,
         project,
         age,
         title,
@@ -647,6 +783,19 @@ fn render_status_row(
         .with_spacing(6.);
     if show_project_tag && let Some(project) = project.as_deref() {
         trailing.add_child(render_project_tag(project, appearance));
+    }
+    if let Some(interrupted) = interrupted {
+        // Muted: the row already sorts with the sessions that need the user.
+        let label = if interrupted.is_remote {
+            "Interrupted (SSH)"
+        } else {
+            "Interrupted"
+        };
+        trailing.add_child(
+            Text::new_inline(label, appearance.ui_font_family(), ROW_META_FONT_SIZE)
+                .with_color(theme.sub_text_color(theme.background()).into())
+                .finish(),
+        );
     }
     if let Some(age) = age {
         trailing.add_child(

@@ -22,11 +22,19 @@ const SAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 const SAVE_APP_ACTION: &str = "workspace:save_app";
 
-#[derive(Default)]
 pub struct CLIAgentRestoreSaveScheduler {
     /// When the oldest unsaved change was requested, if any change is unsaved.
     dirty_since: Option<Instant>,
     timer: Option<SpawnedFutureHandle>,
+    quiet_period: Duration,
+    max_delay: Duration,
+    retry_delay: Duration,
+}
+
+impl Default for CLIAgentRestoreSaveScheduler {
+    fn default() -> Self {
+        Self::with_delays(SAVE_QUIET_PERIOD, SAVE_MAX_DELAY, SAVE_RETRY_DELAY)
+    }
 }
 
 impl Entity for CLIAgentRestoreSaveScheduler {
@@ -36,12 +44,22 @@ impl Entity for CLIAgentRestoreSaveScheduler {
 impl SingletonEntity for CLIAgentRestoreSaveScheduler {}
 
 impl CLIAgentRestoreSaveScheduler {
+    fn with_delays(quiet_period: Duration, max_delay: Duration, retry_delay: Duration) -> Self {
+        Self {
+            dirty_since: None,
+            timer: None,
+            quiet_period,
+            max_delay,
+            retry_delay,
+        }
+    }
+
     /// Schedules a save of the app state.
     pub fn request_save(&mut self, ctx: &mut ModelContext<Self>) {
         let now = Instant::now();
         let dirty_since = *self.dirty_since.get_or_insert(now);
         let waited = now.saturating_duration_since(dirty_since);
-        let delay = SAVE_QUIET_PERIOD.min(SAVE_MAX_DELAY.saturating_sub(waited));
+        let delay = self.quiet_period.min(self.max_delay.saturating_sub(waited));
         self.schedule(delay, ctx);
     }
 
@@ -66,7 +84,7 @@ impl CLIAgentRestoreSaveScheduler {
         }
         if is_save_deferred(ctx) {
             // `workspace:save_app` would silently skip this save; keep the change pending.
-            self.schedule(SAVE_RETRY_DELAY, ctx);
+            self.schedule(self.retry_delay, ctx);
             return;
         }
         self.dirty_since = None;
@@ -105,3 +123,7 @@ pub fn flush_pending_save(ctx: &mut AppContext) {
         ctx.dispatch_global_action(SAVE_APP_ACTION, &());
     }
 }
+
+#[cfg(test)]
+#[path = "restore_save_tests.rs"]
+mod tests;

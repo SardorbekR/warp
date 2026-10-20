@@ -535,38 +535,58 @@ fn focus_clears_manual_unread_only_when_focus_moves_to_the_view() {
             model.mark_terminal_view_unread(first_view, ctx);
             model.mark_terminal_view_unread(second_view, ctx);
             // Focus returning to the already-focused view (e.g. after the
-            // context menu closes, or the window regaining focus) keeps the mark.
+            // context menu closes) keeps the mark.
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
+            // So does the window being activated again with focus unchanged.
+            model.handle_window_activated_for_read_state(window_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(first_view));
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Focus that moves while the window is inactive (e.g. a notification
+        // click that focuses a pane in another window) isn't seen yet...
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), false, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+        // ...until the window is activated with focus there.
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_window_activated_for_read_state(window_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_manually_unread(second_view));
+            assert!(model.is_terminal_view_manually_unread(first_view));
+        });
+
+        // The same when the focus is reported active only after activation.
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), false, ctx);
             model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
         });
         notifications.read(&app, |model, _| {
-            assert!(model.is_terminal_view_manually_unread(first_view));
-            assert!(model.is_terminal_view_manually_unread(second_view));
+            assert!(!model.is_terminal_view_manually_unread(first_view));
         });
 
-        // Focus that moves while the window is inactive never clears a mark,
-        // even once the window is active again with focus still there.
+        // Focus that moves away and back while the window is inactive
+        // leaves the user looking at the view they saw last: marks stay.
         notifications.update(&mut app, |model, ctx| {
-            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), false, ctx);
-            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), true, ctx);
-        });
-        notifications.read(&app, |model, _| {
-            assert!(model.is_terminal_view_manually_unread(second_view));
-        });
-
-        // Moving focus to the first view and back to the second clears only
-        // the views focus moved to while the window was active.
-        notifications.update(&mut app, |model, ctx| {
-            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), false, ctx);
-            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), true, ctx);
-        });
-        notifications.read(&app, |model, _| {
-            assert!(model.is_terminal_view_manually_unread(first_view));
-            assert!(!model.is_terminal_view_manually_unread(second_view));
-        });
-
-        // Moving away to a non-terminal pane and back clears the first view.
-        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(first_view, ctx);
             model.mark_terminal_view_unread(second_view, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(second_view), false, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(first_view), false, ctx);
+            model.handle_window_activated_for_read_state(window_id, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(first_view));
+            assert!(model.is_terminal_view_manually_unread(second_view));
+        });
+
+        // Moving away to a non-terminal pane and back clears the view.
+        notifications.update(&mut app, |model, ctx| {
             model.handle_terminal_focus_for_read_state(window_id, None, true, ctx);
             model.handle_terminal_focus_for_read_state(window_id, Some(first_view), true, ctx);
         });
@@ -587,6 +607,90 @@ fn focus_clears_manual_unread_only_when_focus_moves_to_the_view() {
         });
         notifications.read(&app, |model, _| {
             assert!(!model.is_terminal_view_manually_unread(second_view));
+        });
+    });
+}
+
+#[test]
+fn clearing_manual_unread_marks_drops_every_mark() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let first_view = EntityId::new();
+        let second_view = EntityId::new();
+
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(first_view, ctx);
+            model.mark_terminal_view_unread(second_view, ctx);
+            model.clear_manual_unread_marks(ctx);
+            // Clearing with nothing marked is a no-op.
+            model.clear_manual_unread_marks(ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(first_view));
+            assert!(!model.is_terminal_view_unread(second_view));
+        });
+    });
+}
+
+#[test]
+fn pruning_forgets_terminal_views_and_windows_that_are_gone() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+        let (_history, notifications) = setup_app(&mut app);
+        let live_window = WindowId::new();
+        let closed_window = WindowId::new();
+        let live_view = EntityId::new();
+        let closed_view = EntityId::new();
+
+        emit_cli_event(
+            &mut app,
+            status_changed(live_view, CLIAgentSessionStatus::InProgress, true, None),
+        );
+        emit_cli_event(
+            &mut app,
+            status_changed(closed_view, CLIAgentSessionStatus::InProgress, true, None),
+        );
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(live_window, Some(closed_view), true, ctx);
+            model.handle_terminal_focus_for_read_state(closed_window, Some(live_view), true, ctx);
+            model.mark_terminal_view_unread(live_view, ctx);
+            model.mark_terminal_view_unread(closed_view, ctx);
+
+            let dropped_a_mark = model.retain_read_state(
+                |view_id| view_id == live_view,
+                |window_id| window_id == live_window,
+            );
+            assert!(dropped_a_mark);
+            assert!(!model.retain_read_state(
+                |view_id| view_id == live_view,
+                |window_id| window_id == live_window,
+            ));
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(live_view));
+            assert!(!model.is_terminal_view_manually_unread(closed_view));
+            assert!(model.last_activity_at(live_view).is_some());
+            assert!(model.last_activity_at(closed_view).is_none());
+            assert!(!model.is_cli_session_awaiting_first_prompt(live_view, None));
+            assert!(model.is_cli_session_awaiting_first_prompt(closed_view, None));
+            assert!(model.focused_terminal_by_window.is_empty());
+            assert!(model.seen_terminal_by_window.is_empty());
+        });
+    });
+}
+
+#[test]
+fn pruning_against_the_app_forgets_views_that_are_in_no_window() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        // Not a view in any window, so pruning against the app forgets it.
+        let unknown_view = EntityId::new();
+        notifications.update(&mut app, |model, ctx| {
+            model.mark_terminal_view_unread(unknown_view, ctx);
+            model.prune_closed_terminal_views(ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_manually_unread(unknown_view));
         });
     });
 }
