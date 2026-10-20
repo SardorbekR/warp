@@ -75,6 +75,12 @@ pub struct PersistedCLIAgentSession {
     pub evidently_interactive: bool,
     #[serde(default)]
     pub updated_at_unix_ms: i64,
+    /// When the session last changed status (unix ms), so the status-ordered vertical tabs panel
+    /// keeps its age and position after a restart. Filled in from the live activity when the app
+    /// state is saved, and not compared by [`Self::has_same_content`], so status flips don't
+    /// cause saves. Missing in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at_unix_ms: Option<i64>,
 }
 
 /// What a pane saw of how the agent session reporting through it was started.
@@ -233,6 +239,7 @@ impl PersistedCLIAgentSession {
             launched_locally: self.launched_locally,
             evidently_interactive: self.evidently_interactive,
             updated_at_unix_ms: self.updated_at_unix_ms,
+            last_activity_at_unix_ms: self.last_activity_at_unix_ms.filter(|at| *at > 0),
         })
     }
 
@@ -312,6 +319,9 @@ impl PersistedCLIAgentSession {
             launched_locally,
             evidently_interactive,
             updated_at_unix_ms: now_unix_ms,
+            // Taken from the live activity when the app state is saved.
+            last_activity_at_unix_ms: previous_same_session
+                .and_then(|previous| previous.last_activity_at_unix_ms),
         };
         if let Some(previous) = previous
             && previous.has_same_content(&record)

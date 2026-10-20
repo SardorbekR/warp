@@ -94,6 +94,7 @@ fn restored_record() -> PersistedCLIAgentSession {
         launched_locally: true,
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
+        last_activity_at_unix_ms: None,
     }
 }
 
@@ -355,6 +356,28 @@ fn restored_session_shows_banner_after_real_bootstrap() {
 }
 
 #[test]
+fn restored_session_keeps_its_last_activity_for_the_sidebar() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        let saved_at = chrono::Utc::now().timestamp_millis() - 2 * 60 * 60 * 1000;
+        let mut record = restored_record();
+        record.last_activity_at_unix_ms = Some(saved_at);
+        restore(&mut app, &terminal, record);
+
+        AgentNotificationsModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(model.last_activity_unix_ms(view_id), Some(saved_at));
+        });
+        // Saving the app state again keeps the same time.
+        let saved = terminal.read(&app, |view, ctx| view.cli_agent_session_for_app_state(ctx));
+        assert_eq!(
+            saved.and_then(|record| record.last_activity_at_unix_ms),
+            Some(saved_at)
+        );
+    })
+}
+
+#[test]
 fn queued_resume_is_sent_after_real_bootstrap() {
     App::test((), |mut app| async move {
         let terminal = terminal(&mut app);
@@ -532,6 +555,8 @@ fn entering_and_leaving_interrupted_notifies_the_workspace() {
     })
 }
 
+/// Status flips don't save right away. (Without a save scheduler there is no lazy save; see
+/// `status_flips_are_saved_lazily`.)
 #[test]
 fn status_flips_do_not_save() {
     App::test((), |mut app| async move {
@@ -549,6 +574,38 @@ fn status_flips_do_not_save() {
             flip_status(&mut app, view_id);
         }
         assert_eq!(saves.get(), 1);
+    })
+}
+
+#[test]
+fn status_flips_are_saved_lazily() {
+    App::test((), |mut app| async move {
+        let terminal = bootstrapped_terminal(&mut app).await;
+        let view_id = terminal.id();
+        let saves = count_saves(&mut app);
+        app.add_singleton_model(|_| {
+            CLIAgentRestoreSaveScheduler::with_delays(
+                Duration::from_millis(10),
+                Duration::from_millis(1_000),
+                Duration::from_millis(10),
+                Duration::from_millis(300),
+            )
+        });
+        let mut session = live_session(CLIAgent::Claude, true, Some(SESSION_ID), Some("fix it"));
+        session.session_context.showed_interactive_prompt = true;
+        start_live_session(&mut app, view_id, session);
+        Timer::after(Duration::from_millis(100)).await;
+        assert_eq!(saves.get(), 1, "the record is saved after the quiet period");
+
+        // The saved app state keeps when the status last changed, so status changes are saved
+        // too, but only lazily and together.
+        for _ in 0..5 {
+            flip_status(&mut app, view_id);
+        }
+        Timer::after(Duration::from_millis(100)).await;
+        assert_eq!(saves.get(), 1);
+        Timer::after(Duration::from_millis(400)).await;
+        assert_eq!(saves.get(), 2);
     })
 }
 

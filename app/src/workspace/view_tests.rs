@@ -3138,6 +3138,7 @@ fn interrupted_cli_agent_session(
         launched_locally: remote_host.is_none(),
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
+        last_activity_at_unix_ms: None,
     }
 }
 

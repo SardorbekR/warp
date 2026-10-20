@@ -4,6 +4,9 @@
 //! must not trigger one save per event. Requests are debounced, with a cap on how long a change
 //! can wait, and a save that would be skipped (e.g. during a cross-window tab drag) is retried
 //! instead of being forgotten.
+//!
+//! A change that only matters for display after a restart (fork: when a session last changed
+//! status) asks for a lazy save instead, which waits much longer and never delays a regular one.
 
 use std::time::Duration;
 
@@ -19,21 +22,31 @@ const SAVE_QUIET_PERIOD: Duration = Duration::from_millis(750);
 const SAVE_MAX_DELAY: Duration = Duration::from_secs(3);
 /// How long to wait before retrying a save that couldn't run.
 const SAVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How long a change that only asked for a lazy save waits to be saved.
+const LAZY_SAVE_DELAY: Duration = Duration::from_secs(30);
 
 const SAVE_APP_ACTION: &str = "workspace:save_app";
 
 pub struct CLIAgentRestoreSaveScheduler {
     /// When the oldest unsaved change was requested, if any change is unsaved.
     dirty_since: Option<Instant>,
+    /// Whether every unsaved change only asked for a lazy save.
+    only_lazy: bool,
     timer: Option<SpawnedFutureHandle>,
     quiet_period: Duration,
     max_delay: Duration,
     retry_delay: Duration,
+    lazy_delay: Duration,
 }
 
 impl Default for CLIAgentRestoreSaveScheduler {
     fn default() -> Self {
-        Self::with_delays(SAVE_QUIET_PERIOD, SAVE_MAX_DELAY, SAVE_RETRY_DELAY)
+        Self::with_delays(
+            SAVE_QUIET_PERIOD,
+            SAVE_MAX_DELAY,
+            SAVE_RETRY_DELAY,
+            LAZY_SAVE_DELAY,
+        )
     }
 }
 
@@ -44,23 +57,46 @@ impl Entity for CLIAgentRestoreSaveScheduler {
 impl SingletonEntity for CLIAgentRestoreSaveScheduler {}
 
 impl CLIAgentRestoreSaveScheduler {
-    fn with_delays(quiet_period: Duration, max_delay: Duration, retry_delay: Duration) -> Self {
+    pub(crate) fn with_delays(
+        quiet_period: Duration,
+        max_delay: Duration,
+        retry_delay: Duration,
+        lazy_delay: Duration,
+    ) -> Self {
         Self {
             dirty_since: None,
+            only_lazy: false,
             timer: None,
             quiet_period,
             max_delay,
             retry_delay,
+            lazy_delay,
         }
     }
 
     /// Schedules a save of the app state.
     pub fn request_save(&mut self, ctx: &mut ModelContext<Self>) {
         let now = Instant::now();
+        if self.only_lazy {
+            // Debounce from this change; the lazy one is saved along with it.
+            self.only_lazy = false;
+            self.dirty_since = None;
+        }
         let dirty_since = *self.dirty_since.get_or_insert(now);
         let waited = now.saturating_duration_since(dirty_since);
         let delay = self.quiet_period.min(self.max_delay.saturating_sub(waited));
         self.schedule(delay, ctx);
+    }
+
+    /// Schedules a save of the app state for a change that can wait: within the lazy delay, or
+    /// along with any save that is already pending.
+    pub fn request_lazy_save(&mut self, ctx: &mut ModelContext<Self>) {
+        if self.dirty_since.is_some() {
+            return;
+        }
+        self.dirty_since = Some(Instant::now());
+        self.only_lazy = true;
+        self.schedule(self.lazy_delay, ctx);
     }
 
     fn schedule(&mut self, delay: Duration, ctx: &mut ModelContext<Self>) {
@@ -88,6 +124,7 @@ impl CLIAgentRestoreSaveScheduler {
             return;
         }
         self.dirty_since = None;
+        self.only_lazy = false;
         ctx.dispatch_global_action(SAVE_APP_ACTION, ());
     }
 
@@ -96,6 +133,7 @@ impl CLIAgentRestoreSaveScheduler {
         if let Some(timer) = self.timer.take() {
             timer.abort();
         }
+        self.only_lazy = false;
         self.dirty_since.take().is_some()
     }
 }

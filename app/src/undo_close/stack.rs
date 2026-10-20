@@ -16,6 +16,7 @@ use crate::server::telemetry::{TelemetryEvent, UndoCloseItemType};
 use crate::tab::TabData;
 use crate::window_settings::WindowSettings;
 use crate::workspace::Workspace;
+use crate::workspace::view::glass;
 
 /// A unique identifier for an item in the undo close stack.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -268,7 +269,10 @@ impl UndoCloseStack {
                 let (background_blur_radius_pixels, background_backdrop) = {
                     let window_settings = WindowSettings::as_ref(ctx);
                     (
-                        Some(*window_settings.background_blur_radius),
+                        Some(glass::effective_blur_radius(
+                            *window_settings.background_blur_radius,
+                            ctx,
+                        )),
                         *window_settings.background_backdrop,
                     )
                 };

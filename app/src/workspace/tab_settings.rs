@@ -616,6 +616,18 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.show_details_on_hover",
         description: "Whether to show a details sidecar when hovering over a vertical tab.",
     },
+    // Fork feature: a translucent, blurred vertical tabs panel and header.
+    vertical_tabs_glass: VerticalTabsGlass {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::MAC,
+        // Fork-only setting: never synced to the user's Warp account.
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.vertical_tabs.glass",
+        description: "Whether the vertical tabs panel and the window header are translucent over a blurred desktop.",
+    },
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,

@@ -9,6 +9,7 @@ pub mod conversation_list;
 mod crash_recovery;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
+pub(crate) mod glass;
 pub mod global_search;
 pub(crate) mod launch_modal;
 pub(crate) mod left_panel;
@@ -3892,6 +3893,15 @@ impl Workspace {
             }
             TabSettingsChangedEvent::VerticalTabsSortMode { .. } => {
                 self.handle_vertical_tabs_status_order_setting_changed(ctx);
+                ctx.notify();
+            }
+            TabSettingsChangedEvent::VerticalTabsGlass { .. } => {
+                let blur_radius = glass::effective_blur_radius(
+                    *WindowSettings::as_ref(ctx).background_blur_radius,
+                    ctx,
+                );
+                ctx.windows()
+                    .set_all_windows_background_blur_radius(blur_radius);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowCodeReviewButton { .. } => {
@@ -21795,8 +21805,16 @@ impl Workspace {
         .with_height(TAB_BAR_HEIGHT)
         .finish();
 
+        // Fork: with glass, the opaque content below already edges the
+        // translucent header, so the line is kept transparent (not removed,
+        // which would change the header's height).
+        let tab_bar_border_fill = if glass::glass_layout(false, ctx).is_some() {
+            warp_core::ui::theme::Fill::Solid(ColorU::transparent_black())
+        } else {
+            appearance.theme().outline()
+        };
         let tab_bar_border =
-            Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(appearance.theme().outline());
+            Border::bottom(TAB_BAR_BORDER_HEIGHT).with_border_fill(tab_bar_border_fill);
 
         let tab_bar_element = Container::new(
             EventHandler::new(Clipped::new(self.render_tab_bar_hoverable(bar_contents)).finish())
@@ -23007,6 +23025,34 @@ impl Workspace {
         terminal_view: Box<dyn Element>,
         hide_vertical_tabs: bool,
     ) -> Box<dyn Element> {
+        // Fork: with glass, the tabs panel is rendered on its own, next to
+        // one opaque block holding everything else.
+        if let Some(layout) = glass::glass_layout(hide_vertical_tabs, app) {
+            let config = TabSettings::as_ref(app)
+                .header_toolbar_chip_selection
+                .clone();
+            let pane_group = self.active_tab_pane_group().as_ref(app);
+            let tabs_panel = self.render_config_panel(
+                &HeaderToolbarItemKind::TabsPanel,
+                pane_group,
+                &config,
+                app,
+            );
+            let rest = self.render_panels_row(app, terminal_view, hide_vertical_tabs, true);
+            return glass::render_glass_panels(tabs_panel, rest, layout, self.window_id, app);
+        }
+        self.render_panels_row(app, terminal_view, hide_vertical_tabs, false)
+    }
+
+    /// The panels and the tab content in a row. `skip_tabs_panel` leaves out
+    /// the vertical tabs panel, which glass renders on its own.
+    fn render_panels_row(
+        &self,
+        app: &AppContext,
+        terminal_view: Box<dyn Element>,
+        hide_vertical_tabs: bool,
+        skip_tabs_panel: bool,
+    ) -> Box<dyn Element> {
         let mut panels_view = Flex::row();
         let mut prev_panel_added = false;
 
@@ -23026,6 +23072,9 @@ impl Workspace {
             let pane_group = self.active_tab_pane_group().as_ref(app);
 
             for item in config.left_items() {
+                if skip_tabs_panel && item == HeaderToolbarItemKind::TabsPanel {
+                    continue;
+                }
                 Self::add_panel_with_separator(
                     &mut panels_view,
                     &mut prev_panel_added,
@@ -23066,6 +23115,9 @@ impl Workspace {
             let pane_group = self.active_tab_pane_group().as_ref(app);
 
             for item in config.right_items() {
+                if skip_tabs_panel && item == HeaderToolbarItemKind::TabsPanel {
+                    continue;
+                }
                 Self::add_panel_with_separator(
                     &mut panels_view,
                     &mut prev_panel_added,
@@ -23558,6 +23610,9 @@ impl Workspace {
         }
         if *tab_settings.use_vertical_tabs.value() {
             context.set.insert(flags::USE_VERTICAL_TABS_FLAG);
+        }
+        if glass::is_glass_enabled(app) {
+            context.set.insert(flags::VERTICAL_TABS_GLASS_FLAG);
         }
         if *tab_settings.preserve_active_tab_color.value() {
             context.set.insert(flags::PRESERVE_ACTIVE_TAB_COLOR_FLAG);
@@ -27054,6 +27109,8 @@ impl View for Workspace {
         let appearance = Appearance::as_ref(app);
 
         let tab_bar_mode = self.tab_bar_mode(app);
+        // Fork: glass applies to the regular (not simplified WASM) layout.
+        let glass_layout = glass::glass_layout(false, app);
 
         // For WASM simplified tab bar views (Warp Drive objects, shared sessions, conversation transcripts),
         // we render the tab bar outside of panels so that the details panel only affects content below the tab bar.
@@ -27088,9 +27145,15 @@ impl View for Workspace {
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
+            // Fork: with glass, the terminal background is painted only
+            // behind the opaque block (see `glass::render_glass_panels`).
+            if glass_layout.is_some() {
+                outer_column.finish()
+            } else {
+                Container::new(outer_column.finish())
+                    .with_background(util::get_terminal_background_fill(self.window_id, app))
+                    .finish()
+            }
         };
         let mut stack = Stack::new();
 
@@ -28174,11 +28237,13 @@ impl View for Workspace {
                 stack.add_child(workspace.finish());
             }
             _ => {
-                stack.add_child(
-                    workspace
-                        .with_background(theme.surface_2().with_opacity(background_opacity))
-                        .finish(),
-                );
+                // Fork: with glass, the whole window gets a translucent tint.
+                let window_fill = if glass_layout.is_some() {
+                    glass::window_tint(self.window_id, app)
+                } else {
+                    theme.surface_2().with_opacity(background_opacity).into()
+                };
+                stack.add_child(workspace.with_background(window_fill).finish());
             }
         }
 

@@ -1,6 +1,6 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use instant::Instant;
 use warp_core::features::FeatureFlag;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
 
@@ -29,9 +29,12 @@ pub struct AgentNotificationsModel {
     /// Artifacts accumulated during the current turn for each conversation.
     /// Drained into the notification when a terminal state fires, cleared on InProgress.
     pub(crate) pending_artifacts: HashMap<AIConversationId, Vec<Artifact>>,
-    /// When each terminal view's agent session last changed status. Feeds the
-    /// age labels and ordering of the status-ordered vertical tabs panel.
-    session_activity: HashMap<EntityId, Instant>,
+    /// When each terminal view's agent session last changed status, in unix
+    /// milliseconds. Feeds the age labels and ordering of the status-ordered
+    /// vertical tabs panel. Wall-clock time, unlike `Instant` (which stops
+    /// while a Mac sleeps), so ages stay right across sleep, and a restored
+    /// session's time from before a restart can be seeded.
+    session_activity: HashMap<EntityId, i64>,
     /// Terminal views the user explicitly marked as unread.
     manually_unread: HashSet<EntityId>,
     /// The terminal view focused in each window, whether or not the window
@@ -46,6 +49,10 @@ pub struct AgentNotificationsModel {
     /// session is registered as in progress before its first prompt, so
     /// this tells a session that is working apart from one that is waiting.
     prompted_cli_sessions: HashMap<EntityId, Option<String>>,
+}
+
+fn now_unix_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 impl Entity for AgentNotificationsModel {
@@ -82,15 +89,36 @@ impl AgentNotificationsModel {
         }
     }
 
-    /// When the agent session in `terminal_view_id` last changed status, if
-    /// a change has been observed since launch.
-    pub(crate) fn last_activity_at(&self, terminal_view_id: EntityId) -> Option<Instant> {
+    /// When the agent session in `terminal_view_id` last changed status, in
+    /// unix milliseconds, if a change has been observed since launch or
+    /// seeded from the saved app state.
+    pub(crate) fn last_activity_unix_ms(&self, terminal_view_id: EntityId) -> Option<i64> {
         self.session_activity.get(&terminal_view_id).copied()
     }
 
     fn record_session_activity(&mut self, terminal_view_id: EntityId) {
         self.session_activity
-            .insert(terminal_view_id, Instant::now());
+            .insert(terminal_view_id, now_unix_ms());
+    }
+
+    /// Seeds when the agent session restored into `terminal_view_id` last
+    /// changed status, as saved with the app state, so its age and position
+    /// survive a restart. A change observed since launch wins.
+    pub(crate) fn seed_session_activity(
+        &mut self,
+        terminal_view_id: EntityId,
+        unix_ms: i64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if unix_ms <= 0 {
+            return;
+        }
+        // Never in the future, so a skewed clock can't keep a row on top.
+        let unix_ms = unix_ms.min(now_unix_ms());
+        if let Entry::Vacant(entry) = self.session_activity.entry(terminal_view_id) {
+            entry.insert(unix_ms);
+            ctx.emit(AgentManagementEvent::NotificationUpdated);
+        }
     }
 
     /// Whether the terminal view has unread activity: either an unread

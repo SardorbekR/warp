@@ -35,6 +35,7 @@ use warpui::clipboard::ClipboardContent;
 use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::{EXECUTE_PENDING_COMMAND_DELAY, Event};
+use crate::ai::agent_management::AgentNotificationsModel;
 use crate::settings::CompiledCommandsForCodingAgentToolbar;
 use crate::terminal::cli_agent_sessions::launch_command::runs_through_remote_wrapper;
 use crate::terminal::cli_agent_sessions::restore::{
@@ -182,6 +183,22 @@ impl TerminalView {
         self.cli_agent_session_restore.record.clone()
     }
 
+    /// [`Self::cli_agent_session_for_snapshot`] with when the session last changed status, for
+    /// the saved app state.
+    pub(crate) fn cli_agent_session_for_app_state(
+        &self,
+        app: &AppContext,
+    ) -> Option<PersistedCLIAgentSession> {
+        let mut record = self.cli_agent_session_for_snapshot()?;
+        if app.has_singleton_model::<AgentNotificationsModel>()
+            && let Some(at) =
+                AgentNotificationsModel::as_ref(app).last_activity_unix_ms(self.view_id)
+        {
+            record.last_activity_at_unix_ms = Some(at);
+        }
+        Some(record)
+    }
+
     /// The interrupted CLI agent session (e.g. restored after Warp quit or crashed) that this
     /// pane offers, if any. Cheap; suitable for calling while rendering. Changes are announced
     /// with [`Event::TerminalViewStateChanged`]. Whether it can be resumed in this pane, rather
@@ -317,6 +334,15 @@ impl TerminalView {
             && record.can_resume_here()
             && record.evidently_interactive;
         self.remove_cli_agent_session_restore_banner(ctx);
+        // Keep the session's age and position in the status-ordered tabs panel.
+        if let Some(at) = record.last_activity_at_unix_ms
+            && ctx.has_singleton_model::<AgentNotificationsModel>()
+        {
+            let view_id = self.view_id;
+            AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                model.seed_session_activity(view_id, at, ctx);
+            });
+        }
         let was_interrupted = self.cli_agent_session_restore.phase == RecoveryPhase::Interrupted;
         let state = &mut self.cli_agent_session_restore;
         state.cancel_resume();
@@ -948,6 +974,17 @@ impl TerminalView {
             if superseded {
                 self.remove_cli_agent_session_restore_banner(ctx);
             }
+        }
+        // A status change leaves the record as it is, but the saved app state also keeps when
+        // the session last changed status (see `cli_agent_session_for_app_state`). That can wait
+        // for a lazy save.
+        if matches!(event, CLIAgentSessionsModelEvent::StatusChanged { .. })
+            && self.cli_agent_session_restore.record.is_some()
+            && ctx.has_singleton_model::<CLIAgentRestoreSaveScheduler>()
+        {
+            CLIAgentRestoreSaveScheduler::handle(ctx).update(ctx, |scheduler, ctx| {
+                scheduler.request_lazy_save(ctx);
+            });
         }
         self.save_if_cli_agent_record_changed(before, ctx);
     }

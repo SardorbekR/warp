@@ -182,7 +182,8 @@ pub(super) fn group_by_project<'a>(
 /// Label used for rows whose project can't be determined.
 pub(super) const OTHER_PROJECT_LABEL: &str = "Other";
 
-/// The pieces of a group header: "proj", "· N", and optionally "· k needs you".
+/// The pieces of a group header: "proj", "N", and optionally "k needs you"
+/// (shown at the far end of the header).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GroupHeaderText {
     pub name: String,
@@ -193,9 +194,9 @@ pub(super) struct GroupHeaderText {
 pub(super) fn group_header_text(group: &ProjectGroup<'_>) -> GroupHeaderText {
     GroupHeaderText {
         name: group.project.unwrap_or(OTHER_PROJECT_LABEL).to_owned(),
-        count: format!("· {}", group.row_indices.len()),
+        count: group.row_indices.len().to_string(),
         needs_you: (group.needs_you_count > 0)
-            .then(|| format!("· {} needs you", group.needs_you_count)),
+            .then(|| format!("{} needs you", group.needs_you_count)),
     }
 }
 
@@ -379,6 +380,13 @@ pub(super) fn project_palette_color(project: &str) -> AnsiColorIdentifier {
         .get(project_palette_index(project))
         .copied()
         .unwrap_or(AnsiColorIdentifier::Blue)
+}
+
+/// How long before `now_unix_ms` the change at `changed_at_unix_ms` was; zero
+/// if the clock went backwards.
+pub(super) fn activity_age(now_unix_ms: i64, changed_at_unix_ms: i64) -> Duration {
+    u64::try_from(now_unix_ms.saturating_sub(changed_at_unix_ms))
+        .map_or(Duration::ZERO, Duration::from_millis)
 }
 
 /// A compact relative age: "now", "4m", "2h", "3d".

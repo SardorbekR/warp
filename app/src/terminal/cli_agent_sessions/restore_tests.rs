@@ -31,6 +31,7 @@ fn record(
         launched_locally: true,
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
+        last_activity_at_unix_ms: None,
     }
 }
 
@@ -118,6 +119,37 @@ fn missing_optional_fields_default() {
     assert_eq!(restored.title, None);
     assert_eq!(restored.status, None);
     assert_eq!(restored.updated_at_unix_ms, 0);
+    assert_eq!(restored.last_activity_at_unix_ms, None);
+}
+
+#[test]
+fn last_activity_round_trips_and_does_not_count_as_content() {
+    let mut original = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    original.last_activity_at_unix_ms = Some(1_759_999_000_000);
+    let json = original.to_json().expect("record should serialize");
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("valid record");
+    assert_eq!(restored.last_activity_at_unix_ms, Some(1_759_999_000_000));
+
+    // Only the activity time differs, which must not cause a save.
+    let mut later = restored.clone();
+    later.last_activity_at_unix_ms = Some(1_760_000_000_000);
+    assert!(later.has_same_content(&restored));
+
+    // A record without it doesn't write the key at all.
+    let without = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    let json = without.to_json().expect("record should serialize");
+    assert!(!json.contains("last_activity_at_unix_ms"), "{json}");
+}
+
+#[test]
+fn non_positive_last_activity_is_dropped() {
+    for value in ["0", "-5"] {
+        let json = format!(
+            r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}","last_activity_at_unix_ms":{value}}}"#
+        );
+        let restored = PersistedCLIAgentSession::from_json(&json).expect("valid record");
+        assert_eq!(restored.last_activity_at_unix_ms, None, "{json}");
+    }
 }
 
 #[test]
@@ -335,6 +367,31 @@ fn resumed_session_inherits_restored_record_until_plugin_reports() {
     assert_eq!(live.title.as_deref(), Some("fix the login bug"));
     // Same content as the restored record, so the timestamp doesn't move.
     assert_eq!(live.updated_at_unix_ms, restored.updated_at_unix_ms);
+}
+
+#[test]
+fn live_record_keeps_the_last_activity_of_the_same_session_only() {
+    let mut restored = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    restored.last_activity_at_unix_ms = Some(1_759_999_000_000);
+
+    let same = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/proj"), Some("next prompt")),
+    );
+    let live =
+        PersistedCLIAgentSession::from_live_session(&same, None, Some(&restored), LOCAL_AGENT, 9)
+            .expect("Claude sessions are persisted");
+    assert_eq!(live.last_activity_at_unix_ms, Some(1_759_999_000_000));
+
+    let other_id = "7c1d2e3f-4a5b-4c6d-8e9f-0a1b2c3d4e5f";
+    let other = live_session(
+        CLIAgent::Claude,
+        context(Some(other_id), Some("/proj"), Some("a new session")),
+    );
+    let live =
+        PersistedCLIAgentSession::from_live_session(&other, None, Some(&restored), LOCAL_AGENT, 9)
+            .expect("Claude sessions are persisted");
+    assert_eq!(live.last_activity_at_unix_ms, None);
 }
 
 #[test]

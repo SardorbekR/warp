@@ -426,9 +426,22 @@ fn render_pane_row_element(
     let is_selected = is_active_tab && is_focused;
     let show_pin = FeatureFlag::PinnedTabs.is_enabled() && is_pinned && !container_is_hovered;
     let mut row = Hoverable::new(mouse_state, move |state| {
+        // Status-ordered rows (fork) have their own look, with the selected
+        // row raised as a card.
+        let status_row_look = status_row_click.is_some().then(|| {
+            status_list::status_row_look(
+                is_selected,
+                is_in_multi_selection,
+                state.is_hovered(),
+                is_being_dragged,
+                theme,
+            )
+        });
         // Hovered or selected rows always fully round; otherwise derive the
         // resting radius from the row's stack position.
-        let corner_radius = if state.is_hovered() || is_selected {
+        let corner_radius = if status_row_look.is_some() {
+            CornerRadius::with_all(Radius::Pixels(status_list::STATUS_ROW_CORNER_RADIUS))
+        } else if state.is_hovered() || is_selected {
             CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS))
         } else {
             stack_position.corner_radius()
@@ -437,23 +450,38 @@ fn render_pane_row_element(
             .with_padding(padding)
             .with_corner_radius(corner_radius);
 
-        if let Some(background) = pane_row_background(
-            pane_color,
-            is_selected,
-            is_in_multi_selection,
-            state.is_hovered(),
-            is_being_dragged,
-            theme,
-        ) {
+        let (background, border_fill) = match status_row_look {
+            Some(look) => {
+                if let Some(drop_shadow) = look.drop_shadow {
+                    container = container.with_drop_shadow(drop_shadow);
+                }
+                (
+                    look.background,
+                    look.border.map_or(ElementFill::None, Into::into),
+                )
+            }
+            None => (
+                pane_row_background(
+                    pane_color,
+                    is_selected,
+                    is_in_multi_selection,
+                    state.is_hovered(),
+                    is_being_dragged,
+                    theme,
+                ),
+                if is_selected {
+                    internal_colors::fg_overlay_3(theme).into()
+                } else {
+                    ElementFill::None
+                },
+            ),
+        };
+        if let Some(background) = background {
             container = container.with_background(background);
         }
 
         let pane: Box<dyn Element> = container
-            .with_border(Border::all(1.).with_border_fill(if is_selected {
-                internal_colors::fg_overlay_3(theme).into()
-            } else {
-                ElementFill::None
-            }))
+            .with_border(Border::all(1.).with_border_fill(border_fill))
             .finish();
 
         // Pin indicator anchored at the visible pane's top-right corner. Pin

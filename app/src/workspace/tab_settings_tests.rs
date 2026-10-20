@@ -136,6 +136,30 @@ fn fork_vertical_tabs_settings_are_never_synced_to_cloud() {
         UseVerticalTabs::sync_to_cloud(),
         SyncToCloud::Never
     ));
+    assert!(matches!(
+        VerticalTabsGlass::sync_to_cloud(),
+        SyncToCloud::Never
+    ));
+}
+
+#[test]
+fn vertical_tabs_glass_defaults_to_true() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(*settings.vertical_tabs_glass);
+        });
+    });
+}
+
+#[test]
+fn vertical_tabs_glass_uses_vertical_tabs_path() {
+    assert_eq!(
+        VerticalTabsGlass::toml_path(),
+        Some("appearance.vertical_tabs.glass")
+    );
+    assert_eq!(VerticalTabsGlass::toml_key(), "glass");
 }
 
 #[test]

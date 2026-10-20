@@ -103,7 +103,7 @@ use crate::view_components::DismissibleToast;
 use crate::window_settings::WindowSettings;
 use crate::workspace::hoa_onboarding::mark_hoa_onboarding_completed;
 use crate::workspace::tab_settings::TabSettings;
-use crate::workspace::view::OnboardingTutorial;
+use crate::workspace::view::{OnboardingTutorial, glass};
 use crate::workspace::{
     OneTimeModalModel, PaneViewLocator, Workspace, WorkspaceAction, WorkspaceRegistry,
 };
@@ -701,7 +701,10 @@ pub fn create_transferred_window(
             window_style,
             window_bounds,
             title: Some(WINDOW_TITLE.to_owned()),
-            background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
+            background_blur_radius_pixels: Some(glass::effective_blur_radius(
+                *window_settings.background_blur_radius,
+                ctx,
+            )),
             background_backdrop: *window_settings.background_backdrop,
             on_gpu_driver_selected: on_gpu_driver_selected_callback(),
             ..Default::default()
@@ -768,7 +771,10 @@ fn open_from_restored(arg: &OpenFromRestoredArg, ctx: &mut AppContext) {
         let (background_blur_radius_pixels, background_backdrop) = {
             let window_settings = WindowSettings::as_ref(ctx);
             (
-                Some(*window_settings.background_blur_radius),
+                Some(glass::effective_blur_radius(
+                    *window_settings.background_blur_radius,
+                    ctx,
+                )),
                 *window_settings.background_backdrop,
             )
         };
@@ -1297,7 +1303,10 @@ fn default_window_options(window_settings: &WindowSettings, ctx: &AppContext) ->
         window_style,
         window_bounds: next_bounds,
         title: Some("Warp".to_owned()),
-        background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
+        background_blur_radius_pixels: Some(glass::effective_blur_radius(
+            *window_settings.background_blur_radius,
+            ctx,
+        )),
         background_backdrop: *window_settings.background_backdrop,
         on_gpu_driver_selected: on_gpu_driver_selected_callback(),
         ..Default::default()
@@ -1482,7 +1491,10 @@ fn toggle_quake_mode_window(global_resource_handles: &GlobalResourceHandles, ctx
                     window_style: WindowStyle::Pin,
                     window_bounds: WindowBounds::ExactPosition(config.window_bounds),
                     title: Some("Warp".to_owned()),
-                    background_blur_radius_pixels: Some(*window_settings.background_blur_radius),
+                    background_blur_radius_pixels: Some(glass::effective_blur_radius(
+                        *window_settings.background_blur_radius,
+                        ctx,
+                    )),
                     background_backdrop: *window_settings.background_backdrop,
                     // Ignore the quake window for positioning the next window
                     anchor_new_windows_from_closed_position:

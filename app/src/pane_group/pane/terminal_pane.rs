@@ -568,7 +568,7 @@ impl PaneContent for TerminalPane {
                 active_profile_id,
                 conversation_ids_to_restore,
                 active_conversation_id,
-                cli_agent_session: view.cli_agent_session_for_snapshot(),
+                cli_agent_session: view.cli_agent_session_for_app_state(app),
             })
         }
     }

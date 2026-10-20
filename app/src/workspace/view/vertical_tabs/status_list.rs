@@ -15,15 +15,17 @@ use std::time::Duration;
 
 use instant::Instant;
 use pathfinder_color::ColorU;
+use pathfinder_geometry::vector::vec2f;
 use settings::Setting as _;
 use warp_core::ui::Icon as WarpIcon;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
-use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
+use warp_core::ui::theme::{ColorScheme, Fill as WarpThemeFill, WarpTheme};
 use warpui::elements::{
-    Border, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult,
-    Element, Empty, EventHandler, Expanded, Flex, Hoverable, MainAxisSize, MouseInBehavior,
-    MouseStateHandle, Padding, ParentElement, Radius, SavePosition, Shrinkable, Text,
+    Align, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult,
+    DropShadow, Element, Empty, EventHandler, Expanded, Flex, Hoverable, Icon, MainAxisSize,
+    MouseInBehavior, MouseStateHandle, Padding, ParentElement, Radius, SavePosition, Shrinkable,
+    Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -32,18 +34,18 @@ use warpui::{AppContext, EntityId, EventContext, SingletonEntity, TaskId, ViewHa
 
 use super::status_order::{
     AttentionBucket, FreezeInputs, GroupHeaderText, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE,
-    StatusRowKey, StatusSortInput, compact_age_label, group_by_project, group_header_text,
-    is_order_frozen, project_name, project_palette_color, resolve_display_order,
+    StatusRowKey, StatusSortInput, activity_age, compact_age_label, group_by_project,
+    group_header_text, is_order_frozen, project_name, project_palette_color, resolve_display_order,
     row_attention_bucket, row_display_status, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
     TerminalPrimaryLineFont, TypedPane, VerticalTabsPanelState, agent_tab_text_preference,
-    any_workspace_pane_being_dragged, pane_matches_query, preferred_agent_tab_titles,
-    render_inline_tab_rename_editor, render_pane_row_element, render_synced_inputs_indicator,
-    render_title_indicator, resolve_icon_with_status_variant, resolved_terminal_working_directory,
-    row_shows_synced_inputs_indicator, terminal_agent_text, terminal_primary_line_data,
-    terminal_title_fallback_font,
+    any_workspace_pane_being_dragged, pane_matches_query, pane_row_background,
+    preferred_agent_tab_titles, render_inline_tab_rename_editor, render_pane_row_element,
+    render_synced_inputs_indicator, resolve_icon_with_status_variant,
+    resolved_terminal_working_directory, row_shows_synced_inputs_indicator, terminal_agent_text,
+    terminal_primary_line_data, terminal_title_fallback_font,
 };
 use crate::ai::agent::conversation::{ConversationStatus, StatusColorStyle};
 use crate::ai::agent_management::AgentNotificationsModel;
@@ -54,34 +56,61 @@ use crate::tab::tab_position_id;
 use crate::terminal::TerminalView;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::view::TerminalViewState;
-use crate::ui_components::icon_with_status::{IconWithStatusVariant, render_icon_with_status};
+use crate::ui_components::icon_with_status::IconWithStatusVariant;
 use crate::workspace::action::WorkspaceAction;
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsDisplayGranularity, VerticalTabsSortMode,
 };
 use crate::workspace::{PaneViewLocator, Workspace};
 
-/// Size of the agent / pane icon at the start of each row.
-const ROW_ICON_SIZE: f32 = 20.;
 /// Size of the status glyph at the end of each row.
-const STATUS_GLYPH_SIZE: f32 = 14.;
-const ROW_TITLE_FONT_SIZE: f32 = 12.;
-const ROW_META_FONT_SIZE: f32 = 11.;
-const PROJECT_TAG_FONT_SIZE: f32 = 10.;
-const PROJECT_TAG_MAX_WIDTH: f32 = 84.;
-const GROUP_HEADER_FONT_SIZE: f32 = 11.;
-const GROUP_HEADER_DOT_SIZE: f32 = 6.;
-const ROW_SPACING: f32 = 1.;
+const STATUS_GLYPH_SIZE: f32 = 16.;
+const ROW_TITLE_FONT_SIZE: f32 = 13.;
+const ROW_META_FONT_SIZE: f32 = 12.;
+/// Width of the age slot, so that project tags line up across rows.
+const ROW_AGE_WIDTH: f32 = 28.;
+const PROJECT_TAG_FONT_SIZE: f32 = 11.;
+const PROJECT_TAG_MAX_WIDTH: f32 = 78.;
+const GROUP_HEADER_FONT_SIZE: f32 = 12.;
+const ROW_SPACING: f32 = 2.;
 const ERROR_ICON_SIZE: f32 = 12.;
+/// Inset of the list, rows and headers from the panel's edges.
+const LIST_HORIZONTAL_PADDING: f32 = 10.;
+/// Every status row is fully rounded (hover, selection and resting alike).
+pub(super) const STATUS_ROW_CORNER_RADIUS: f32 = 8.;
+
+const RUNNING_GLYPH_PATH: &str = "bundled/svg/fork-status-running.svg";
+const NEEDS_YOU_GLYPH_PATH: &str = "bundled/svg/fork-status-needs-you.svg";
+const DONE_UNREAD_GLYPH_PATH: &str = "bundled/svg/fork-status-done-unread.svg";
+const DONE_READ_GLYPH_PATH: &str = "bundled/svg/fork-status-done-read.svg";
+
+/// "Needs you" amber, fixed so it doesn't depend on the theme's ANSI yellow.
+const NEEDS_YOU_AMBER_DARK: ColorU = ColorU {
+    r: 0xF5,
+    g: 0xB1,
+    b: 0x3D,
+    a: 0xFF,
+};
+const NEEDS_YOU_AMBER_LIGHT: ColorU = ColorU {
+    r: 0xD9,
+    g: 0x8A,
+    b: 0x0F,
+    a: 0xFF,
+};
+/// A darker amber for "k needs you" text on light themes, so it stays
+/// readable.
+const NEEDS_YOU_TEXT_LIGHT: ColorU = ColorU {
+    r: 0x9A,
+    g: 0x55,
+    b: 0x00,
+    a: 0xFF,
+};
 
 /// Everything needed to sort and render one row, gathered once per render.
 struct StatusRow<'a> {
     key: StatusRowKey,
     tab_index: usize,
     props: PaneProps<'a>,
-    /// The row icon, without a status badge (the status is shown at the end
-    /// of the row instead).
-    icon: IconWithStatusVariant,
     status: Option<ConversationStatus>,
     terminal_view_id: Option<EntityId>,
     is_unread: bool,
@@ -130,7 +159,6 @@ enum StatusRowTitle {
 
 struct SectionHeader {
     text: GroupHeaderText,
-    color: Option<AnsiColorIdentifier>,
 }
 
 /// A run of rows, optionally preceded by a project header.
@@ -175,19 +203,31 @@ pub(super) fn render_status_ordered_list(
     // Rows are moved into their elements in display order.
     let mut slots: Vec<Option<StatusRow<'_>>> = rows.into_iter().map(Some).collect();
     let show_project_tag = !matches!(mode, VerticalTabsSortMode::GroupByProject);
+    let palette = StatusPalette::new(theme);
     let mut list = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_spacing(ROW_SPACING);
     for (section_index, section) in sections.into_iter().enumerate() {
         if let Some(header) = section.header {
-            list.add_child(render_group_header(&header, section_index == 0, appearance));
+            list.add_child(render_group_header(
+                &header,
+                section_index == 0,
+                &palette,
+                appearance,
+            ));
         }
         for row_index in section.row_indices {
             let Some(row) = slots.get_mut(row_index).and_then(Option::take) else {
                 continue;
             };
-            list.add_child(render_status_row(row, show_project_tag, appearance, app));
+            list.add_child(render_status_row(
+                row,
+                show_project_tag,
+                &palette,
+                appearance,
+                app,
+            ));
         }
     }
 
@@ -195,9 +235,9 @@ pub(super) fn render_status_ordered_list(
         .with_padding(
             Padding::uniform(0.)
                 .with_top(2.)
-                .with_left(6.)
-                .with_right(6.)
-                .with_bottom(8.),
+                .with_left(LIST_HORIZONTAL_PADDING)
+                .with_right(LIST_HORIZONTAL_PADDING)
+                .with_bottom(10.),
         )
         .finish()
 }
@@ -261,7 +301,6 @@ fn layout_sections(
             .map(|group| ListSection {
                 header: Some(SectionHeader {
                     text: group_header_text(&group),
-                    color: group.project.map(project_palette_color),
                 }),
                 row_indices: group.row_indices,
             })
@@ -404,7 +443,7 @@ pub(super) fn any_row_shows_age(workspace: &Workspace, app: &AppContext) -> bool
         pane_group.visible_pane_ids().iter().any(|pane_id| {
             pane_group
                 .terminal_view_from_pane_id(*pane_id, app)
-                .is_some_and(|view| notifications.last_activity_at(view.id()).is_some())
+                .is_some_and(|view| notifications.last_activity_unix_ms(view.id()).is_some())
         })
     })
 }
@@ -483,7 +522,7 @@ fn collect_status_rows<'a>(
     let appearance = Appearance::as_ref(app);
     let notifications = AgentNotificationsModel::as_ref(app);
     let cli_sessions = CLIAgentSessionsModel::as_ref(app);
-    let now = Instant::now();
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let query_lower = (!state.search_query.is_empty()).then(|| state.search_query.to_lowercase());
     let is_tab_being_renamed = workspace.current_workspace_state.is_tab_being_renamed();
 
@@ -570,27 +609,17 @@ fn collect_status_rows<'a>(
             }
 
             let terminal_view_id = terminal_view_handle.as_ref().map(|handle| handle.id());
-            let (mut icon, status) = split_status(resolve_icon_with_status_variant(
-                &props.typed,
-                &props.title,
-                appearance,
-                app,
-            ));
-            // An interrupted session has no live agent yet; show whose it was.
-            if let Some(record) = interrupted_record
-                && !matches!(icon, IconWithStatusVariant::CLIAgent { .. })
-            {
-                icon = IconWithStatusVariant::CLIAgent {
-                    agent: record.agent,
-                    status: None,
-                    is_ambient: false,
-                };
-            }
+            let icon =
+                resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app);
+            // An interrupted session has no live agent yet, but it was one.
+            let is_cli_agent = matches!(icon, IconWithStatusVariant::CLIAgent { .. })
+                || interrupted_record.is_some();
+            let status = icon_status(icon);
             // Only a CLI agent's own status can be the optimistic "in
             // progress" it is registered with before the first prompt. The
             // session is identified by the id it would be resumed with, which
             // (unlike the live id) ignores nested headless runs in the pane.
-            let is_awaiting_first_prompt = matches!(icon, IconWithStatusVariant::CLIAgent { .. })
+            let is_awaiting_first_prompt = is_cli_agent
                 && terminal_view_id.is_some_and(|id| {
                     cli_sessions.session(id).is_some_and(|session| {
                         notifications.is_cli_session_awaiting_first_prompt(
@@ -603,8 +632,8 @@ fn collect_status_rows<'a>(
             let is_unread =
                 terminal_view_id.is_some_and(|id| notifications.is_terminal_view_unread(id));
             let age = terminal_view_id
-                .and_then(|id| notifications.last_activity_at(id))
-                .map(|changed_at| now.saturating_duration_since(changed_at));
+                .and_then(|id| notifications.last_activity_unix_ms(id))
+                .map(|changed_at| activity_age(now_unix_ms, changed_at));
             let is_errored = terminal_view
                 .is_some_and(|view| view.current_state().state == TerminalViewState::Errored);
             let title = status_row_title(&props, terminal_view, interrupted_title, app);
@@ -618,7 +647,6 @@ fn collect_status_rows<'a>(
                     pane_id,
                 },
                 tab_index,
-                icon,
                 bucket: row_attention_bucket(status.as_ref(), is_unread, interrupted.is_some()),
                 status,
                 terminal_view_id,
@@ -637,45 +665,16 @@ fn collect_status_rows<'a>(
     rows
 }
 
-/// Separates the status from an icon variant so the row can show the icon
-/// without a badge and the status as its own glyph.
-fn split_status(
-    variant: IconWithStatusVariant,
-) -> (IconWithStatusVariant, Option<ConversationStatus>) {
+/// The status an icon variant carries as its badge. The row shows it as its
+/// own glyph at the end instead of an icon.
+fn icon_status(variant: IconWithStatusVariant) -> Option<ConversationStatus> {
     match variant {
-        IconWithStatusVariant::OzAgent { status, is_ambient } => (
-            IconWithStatusVariant::OzAgent {
-                status: None,
-                is_ambient,
-            },
-            status,
-        ),
-        IconWithStatusVariant::CLIAgent {
-            agent,
-            status,
-            is_ambient,
-        } => (
-            IconWithStatusVariant::CLIAgent {
-                agent,
-                status: None,
-                is_ambient,
-            },
-            status,
-        ),
-        IconWithStatusVariant::CustomAvatar {
-            avatar,
-            status,
-            is_ambient,
-        } => (
-            IconWithStatusVariant::CustomAvatar {
-                avatar,
-                status: None,
-                is_ambient,
-            },
-            status,
-        ),
-        variant @ (IconWithStatusVariant::Neutral { .. }
-        | IconWithStatusVariant::NeutralElement { .. }) => (variant, None),
+        IconWithStatusVariant::OzAgent { status, .. }
+        | IconWithStatusVariant::CLIAgent { status, .. }
+        | IconWithStatusVariant::CustomAvatar { status, .. } => status,
+        IconWithStatusVariant::Neutral { .. } | IconWithStatusVariant::NeutralElement { .. } => {
+            None
+        }
     }
 }
 
@@ -746,9 +745,96 @@ fn status_row_title(
     }
 }
 
+/// Colors of the status list that depend on whether the theme is dark.
+struct StatusPalette {
+    text_main: ColorU,
+    text_sub: ColorU,
+    text_faint: ColorU,
+    /// The running glyph: a little softer than the main text.
+    running: ColorU,
+    /// The needs-you glyph.
+    needs_you: ColorU,
+    /// "k needs you" in group headers (darker on light themes, to stay
+    /// readable as text).
+    needs_you_text: ColorU,
+}
+
+impl StatusPalette {
+    fn new(theme: &WarpTheme) -> Self {
+        let is_dark = theme.inferred_color_scheme() == ColorScheme::LightOnDark;
+        let font_color = theme.font_color(theme.background()).into_solid();
+        let (needs_you, needs_you_text) = if is_dark {
+            (NEEDS_YOU_AMBER_DARK, NEEDS_YOU_AMBER_DARK)
+        } else {
+            (NEEDS_YOU_AMBER_LIGHT, NEEDS_YOU_TEXT_LIGHT)
+        };
+        Self {
+            text_main: coloru_with_opacity(font_color, 90),
+            text_sub: coloru_with_opacity(font_color, 60),
+            text_faint: coloru_with_opacity(font_color, 40),
+            running: coloru_with_opacity(font_color, 78),
+            needs_you,
+            needs_you_text,
+        }
+    }
+}
+
+/// How a status row's shell looks: the selected row is a raised card, other
+/// rows only show a hover or multi-selection fill.
+pub(super) struct StatusRowLook {
+    pub(super) background: Option<WarpThemeFill>,
+    pub(super) border: Option<WarpThemeFill>,
+    pub(super) drop_shadow: Option<DropShadow>,
+}
+
+pub(super) fn status_row_look(
+    is_selected: bool,
+    is_in_multi_selection: bool,
+    is_hovered: bool,
+    is_being_dragged: bool,
+    theme: &WarpTheme,
+) -> StatusRowLook {
+    if !is_selected {
+        return StatusRowLook {
+            background: pane_row_background(
+                None,
+                false,
+                is_in_multi_selection,
+                is_hovered,
+                is_being_dragged,
+                theme,
+            ),
+            border: None,
+            drop_shadow: None,
+        };
+    }
+    if theme.inferred_color_scheme() == ColorScheme::LightOnDark {
+        // A lighter pane. No shadow: the renderer draws a shadow under the
+        // whole rect, so it would darken this translucent card.
+        StatusRowLook {
+            background: Some(theme.foreground().with_opacity(11)),
+            border: Some(theme.foreground().with_opacity(9)),
+            drop_shadow: None,
+        }
+    } else {
+        // An opaque card lifted by a soft shadow.
+        StatusRowLook {
+            background: Some(WarpThemeFill::Solid(theme.background().into_solid())),
+            border: Some(theme.foreground().with_opacity(6)),
+            drop_shadow: Some(DropShadow {
+                color: ColorU::new(0, 0, 0, 26),
+                offset: vec2f(0., 1.),
+                blur_radius: 2.,
+                spread_radius: 3.,
+            }),
+        }
+    }
+}
+
 fn render_status_row(
     row: StatusRow<'_>,
     show_project_tag: bool,
+    palette: &StatusPalette,
     appearance: &Appearance,
     app: &AppContext,
 ) -> Box<dyn Element> {
@@ -756,7 +842,6 @@ fn render_status_row(
     let StatusRow {
         tab_index,
         mut props,
-        icon,
         status,
         terminal_view_id,
         is_unread,
@@ -786,11 +871,12 @@ fn render_status_row(
         );
     }
     title_line.add_child(
-        Shrinkable::new(1., render_row_title(title, is_unread, appearance, app)).finish(),
+        Shrinkable::new(
+            1.,
+            render_row_title(title, is_unread, palette, appearance, app),
+        )
+        .finish(),
     );
-    if is_unread {
-        title_line.add_child(render_title_indicator(theme));
-    }
     if row_shows_synced_inputs_indicator(&props, app) {
         title_line.add_child(render_synced_inputs_indicator());
     }
@@ -798,7 +884,7 @@ fn render_status_row(
     let mut trailing = Flex::row()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(6.);
+        .with_spacing(8.);
     if show_project_tag && let Some(project) = project.as_deref() {
         trailing.add_child(render_project_tag(project, appearance));
     }
@@ -811,34 +897,42 @@ fn render_status_row(
         };
         trailing.add_child(
             Text::new_inline(label, appearance.ui_font_family(), ROW_META_FONT_SIZE)
-                .with_color(theme.sub_text_color(theme.background()).into())
+                .with_color(palette.text_sub)
                 .finish(),
         );
     }
     if let Some(age) = age {
+        // Right-aligned in a fixed slot, so the tags before it line up.
         trailing.add_child(
-            Text::new_inline(
-                compact_age_label(age),
-                appearance.ui_font_family(),
-                ROW_META_FONT_SIZE,
+            ConstrainedBox::new(
+                Align::new(
+                    Text::new_inline(
+                        compact_age_label(age),
+                        appearance.ui_font_family(),
+                        ROW_META_FONT_SIZE,
+                    )
+                    .with_color(palette.text_sub)
+                    .finish(),
+                )
+                .right()
+                .finish(),
             )
-            .with_color(theme.sub_text_color(theme.background()).into())
+            .with_width(ROW_AGE_WIDTH)
+            .with_height(STATUS_GLYPH_SIZE)
             .finish(),
         );
     }
-    trailing.add_child(render_status_glyph(status.as_ref(), is_unread, theme));
+    trailing.add_child(render_status_glyph(
+        status.as_ref(),
+        is_unread,
+        palette,
+        theme,
+    ));
 
     let content = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(8.)
-        .with_child(render_icon_with_status(
-            icon,
-            ROW_ICON_SIZE,
-            0.,
-            theme,
-            theme.background(),
-        ))
         .with_child(Expanded::new(1., title_line.finish()).finish())
         .with_child(trailing.finish())
         .finish();
@@ -846,9 +940,11 @@ fn render_status_row(
     props.status_row_click = Some(StatusRowClick {
         mark_read_terminal_view_id: terminal_view_id.filter(|_| is_unread),
     });
+    // With the 1px border the shell always reserves, rows are 30px tall and
+    // inset 10px on the left and 9px on the right.
     let row = render_pane_row_element(
         props,
-        Padding::uniform(6.).with_left(8.).with_right(8.),
+        Padding::uniform(6.).with_left(9.).with_right(8.),
         true,
         content,
         theme,
@@ -863,10 +959,10 @@ fn render_status_row(
 fn render_row_title(
     title: StatusRowTitle,
     is_unread: bool,
+    palette: &StatusPalette,
     appearance: &Appearance,
     app: &AppContext,
 ) -> Box<dyn Element> {
-    let theme = appearance.theme();
     match title {
         StatusRowTitle::Editor(editor) => render_inline_tab_rename_editor(&editor, appearance, app),
         StatusRowTitle::Text { text, font } => {
@@ -876,9 +972,9 @@ fn render_row_title(
             };
             let mut text = Text::new_inline(text, font_family, ROW_TITLE_FONT_SIZE)
                 .with_clip(ClipConfig::ellipsis())
-                .with_color(theme.main_text_color(theme.background()).into());
+                .with_color(palette.text_main);
             if is_unread {
-                text = text.with_style(Properties::default().weight(Weight::Bold));
+                text = text.with_style(Properties::default().weight(Weight::Semibold));
             }
             text.finish()
         }
@@ -904,10 +1000,10 @@ fn render_project_tag(project: &str, appearance: &Appearance) -> Box<dyn Element
             .with_color(color)
             .finish(),
         )
-        .with_horizontal_padding(5.)
+        .with_horizontal_padding(6.)
         .with_vertical_padding(1.)
-        .with_background_color(coloru_with_opacity(color, 16))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_background_color(coloru_with_opacity(color, 14))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
         .finish(),
     )
     .with_max_width(PROJECT_TAG_MAX_WIDTH)
@@ -934,58 +1030,43 @@ fn status_icon(icon: WarpIcon, color: ColorU, size: f32) -> Box<dyn Element> {
     )
 }
 
-/// The status at the end of a row: ring = needs you, spinner = running,
+/// One of the fork's own status glyphs, drawn at the full slot size.
+fn status_glyph(path: &'static str, color: ColorU) -> Box<dyn Element> {
+    status_slot(Icon::new(path, color).finish(), STATUS_GLYPH_SIZE)
+}
+
+/// The status at the end of a row: ring = needs you, open arc = running,
 /// filled check = done and unread, faint check = done and read.
 fn render_status_glyph(
     status: Option<&ConversationStatus>,
     is_unread: bool,
+    palette: &StatusPalette,
     theme: &WarpTheme,
 ) -> Box<dyn Element> {
-    let faint: ColorU = theme.sub_text_color(theme.background()).into();
     match status {
         None => ConstrainedBox::new(Empty::new().finish())
             .with_width(STATUS_GLYPH_SIZE)
             .with_height(STATUS_GLYPH_SIZE)
             .finish(),
         Some(ConversationStatus::Blocked { .. }) => {
-            const RING_SIZE: f32 = 11.;
-            status_slot(
-                Container::new(Empty::new().finish())
-                    .with_border(Border::all(2.).with_border_color(theme.ansi_fg_yellow()))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(RING_SIZE / 2.)))
-                    .finish(),
-                RING_SIZE,
-            )
+            status_glyph(NEEDS_YOU_GLYPH_PATH, palette.needs_you)
         }
+        // Static on purpose: an animated spinner would redraw the window
+        // continuously while any agent runs.
+        Some(ConversationStatus::InProgress) => status_glyph(RUNNING_GLYPH_PATH, palette.running),
         Some(
-            status @ (ConversationStatus::InProgress
-            | ConversationStatus::TransientError
+            status @ (ConversationStatus::TransientError
             | ConversationStatus::WaitingForEvents
             | ConversationStatus::Cancelled),
         ) => {
             let (icon, color) = status.status_icon_and_color(theme, StatusColorStyle::Standard);
-            status_icon(icon, color, 12.)
+            status_icon(icon, color, 13.)
         }
         Some(ConversationStatus::Success) => {
             if is_unread {
-                const CHECK_SIZE: f32 = 9.;
-                const PADDING: f32 = (STATUS_GLYPH_SIZE - CHECK_SIZE) / 2.;
-                Container::new(
-                    ConstrainedBox::new(
-                        WarpIcon::Check.to_warpui_icon(theme.background()).finish(),
-                    )
-                    .with_width(CHECK_SIZE)
-                    .with_height(CHECK_SIZE)
-                    .finish(),
-                )
-                .with_uniform_padding(PADDING)
-                .with_background_color(theme.ansi_fg_green())
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-                    STATUS_GLYPH_SIZE / 2.,
-                )))
-                .finish()
+                status_glyph(DONE_UNREAD_GLYPH_PATH, palette.text_main)
             } else {
-                status_icon(WarpIcon::Check, faint, 12.)
+                status_glyph(DONE_READ_GLYPH_PATH, palette.text_faint)
             }
         }
         Some(ConversationStatus::Error) => {
@@ -995,41 +1076,25 @@ fn render_status_glyph(
             } else {
                 coloru_with_opacity(red, 60)
             };
-            status_icon(WarpIcon::Triangle, color, 12.)
+            status_icon(WarpIcon::Triangle, color, 13.)
         }
     }
 }
 
+/// "project  N ............ k needs you"
 fn render_group_header(
     header: &SectionHeader,
     is_first: bool,
+    palette: &StatusPalette,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
-    let theme = appearance.theme();
     let font_family = appearance.ui_font_family();
-    let sub_text: ColorU = theme.sub_text_color(theme.background()).into();
-    let dot_color = header
-        .color
-        .map(|color| ColorU::from(color.to_ansi_color(&theme.terminal_colors().normal)))
-        .unwrap_or(sub_text);
+    let medium = Properties::default().weight(Weight::Medium);
 
-    let mut row = Flex::row()
+    let name_and_count = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(5.)
-        .with_child(
-            ConstrainedBox::new(
-                Container::new(Empty::new().finish())
-                    .with_background_color(dot_color)
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-                        GROUP_HEADER_DOT_SIZE / 2.,
-                    )))
-                    .finish(),
-            )
-            .with_width(GROUP_HEADER_DOT_SIZE)
-            .with_height(GROUP_HEADER_DOT_SIZE)
-            .finish(),
-        )
+        .with_spacing(6.)
         .with_child(
             Shrinkable::new(
                 1.,
@@ -1039,8 +1104,8 @@ fn render_group_header(
                     GROUP_HEADER_FONT_SIZE,
                 )
                 .with_clip(ClipConfig::ellipsis())
-                .with_color(theme.main_text_color(theme.background()).into())
-                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(palette.text_sub)
+                .with_style(medium)
                 .finish(),
             )
             .finish(),
@@ -1051,13 +1116,20 @@ fn render_group_header(
                 font_family,
                 GROUP_HEADER_FONT_SIZE,
             )
-            .with_color(sub_text)
+            .with_color(palette.text_faint)
             .finish(),
         );
+
+    let mut row = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(8.)
+        .with_child(Expanded::new(1., name_and_count.finish()).finish());
     if let Some(needs_you) = header.text.needs_you.as_ref() {
         row.add_child(
             Text::new_inline(needs_you.clone(), font_family, GROUP_HEADER_FONT_SIZE)
-                .with_color(theme.ansi_fg_yellow())
+                .with_color(palette.needs_you_text)
+                .with_style(medium)
                 .finish(),
         );
     }
@@ -1065,10 +1137,10 @@ fn render_group_header(
     Container::new(row.finish())
         .with_padding(
             Padding::uniform(0.)
-                .with_top(if is_first { 6. } else { 12. })
-                .with_bottom(4.)
-                .with_left(8.)
-                .with_right(8.),
+                .with_top(if is_first { 10. } else { 16. })
+                .with_bottom(6.)
+                .with_left(10.)
+                .with_right(10.),
         )
         .finish()
 }

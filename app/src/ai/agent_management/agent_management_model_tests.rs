@@ -669,8 +669,8 @@ fn pruning_forgets_terminal_views_and_windows_that_are_gone() {
         notifications.read(&app, |model, _| {
             assert!(model.is_terminal_view_manually_unread(live_view));
             assert!(!model.is_terminal_view_manually_unread(closed_view));
-            assert!(model.last_activity_at(live_view).is_some());
-            assert!(model.last_activity_at(closed_view).is_none());
+            assert!(model.last_activity_unix_ms(live_view).is_some());
+            assert!(model.last_activity_unix_ms(closed_view).is_none());
             assert!(!model.is_cli_session_awaiting_first_prompt(live_view, None));
             assert!(model.is_cli_session_awaiting_first_prompt(closed_view, None));
             assert!(model.focused_terminal_by_window.is_empty());
@@ -725,7 +725,7 @@ fn cli_session_events_record_and_clear_activity() {
         let terminal_view_id = EntityId::new();
 
         notifications.read(&app, |model, _| {
-            assert!(model.last_activity_at(terminal_view_id).is_none());
+            assert!(model.last_activity_unix_ms(terminal_view_id).is_none());
         });
 
         cli_sessions.update(&mut app, |_: &mut CLIAgentSessionsModel, ctx| {
@@ -734,8 +734,9 @@ fn cli_session_events_record_and_clear_activity() {
                 agent: CLIAgent::Claude,
             });
         });
-        let started_at =
-            notifications.read(&app, |model, _| model.last_activity_at(terminal_view_id));
+        let started_at = notifications.read(&app, |model, _| {
+            model.last_activity_unix_ms(terminal_view_id)
+        });
         assert!(started_at.is_some());
 
         cli_sessions.update(&mut app, |_: &mut CLIAgentSessionsModel, ctx| {
@@ -747,8 +748,9 @@ fn cli_session_events_record_and_clear_activity() {
                 session_context: Box::default(),
             });
         });
-        let changed_at =
-            notifications.read(&app, |model, _| model.last_activity_at(terminal_view_id));
+        let changed_at = notifications.read(&app, |model, _| {
+            model.last_activity_unix_ms(terminal_view_id)
+        });
         assert!(changed_at.is_some());
         assert!(changed_at >= started_at);
 
@@ -759,7 +761,68 @@ fn cli_session_events_record_and_clear_activity() {
             });
         });
         notifications.read(&app, |model, _| {
-            assert!(model.last_activity_at(terminal_view_id).is_none());
+            assert!(model.last_activity_unix_ms(terminal_view_id).is_none());
+        });
+    });
+}
+
+#[test]
+fn seeded_activity_fills_in_only_until_a_change_is_seen() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let restored_view = EntityId::new();
+        let live_view = EntityId::new();
+        let saved_at = chrono::Utc::now().timestamp_millis() - 3 * 60 * 60 * 1000;
+
+        // A live change wins over the saved time.
+        emit_cli_event(
+            &mut app,
+            status_changed(live_view, CLIAgentSessionStatus::InProgress, true, None),
+        );
+        let live_at = notifications.read(&app, |model, _| model.last_activity_unix_ms(live_view));
+        notifications.update(&mut app, |model, ctx| {
+            model.seed_session_activity(restored_view, saved_at, ctx);
+            model.seed_session_activity(live_view, saved_at, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert_eq!(model.last_activity_unix_ms(restored_view), Some(saved_at));
+            assert_eq!(model.last_activity_unix_ms(live_view), live_at);
+        });
+
+        // A later change replaces the seeded time.
+        emit_cli_event(
+            &mut app,
+            status_changed(restored_view, CLIAgentSessionStatus::InProgress, true, None),
+        );
+        notifications.read(&app, |model, _| {
+            assert!(
+                model
+                    .last_activity_unix_ms(restored_view)
+                    .is_some_and(|at| at > saved_at)
+            );
+        });
+    });
+}
+
+#[test]
+fn seeded_activity_ignores_missing_and_future_times() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let unset_view = EntityId::new();
+        let future_view = EntityId::new();
+        let far_future = chrono::Utc::now().timestamp_millis() + 24 * 60 * 60 * 1000;
+
+        notifications.update(&mut app, |model, ctx| {
+            model.seed_session_activity(unset_view, 0, ctx);
+            model.seed_session_activity(future_view, far_future, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert_eq!(model.last_activity_unix_ms(unset_view), None);
+            assert!(
+                model
+                    .last_activity_unix_ms(future_view)
+                    .is_some_and(|at| at < far_future)
+            );
         });
     });
 }
@@ -776,7 +839,7 @@ fn conversation_status_change_records_activity_but_restore_does_not() {
             model.restore_conversations(terminal_view_id, vec![conversation], ctx);
         });
         notifications.read(&app, |model, _| {
-            assert!(model.last_activity_at(terminal_view_id).is_none());
+            assert!(model.last_activity_unix_ms(terminal_view_id).is_none());
         });
 
         history.update(&mut app, |model, ctx| {
@@ -786,7 +849,7 @@ fn conversation_status_change_records_activity_but_restore_does_not() {
             conv.update_status(ConversationStatus::InProgress, terminal_view_id, ctx);
         });
         notifications.read(&app, |model, _| {
-            assert!(model.last_activity_at(terminal_view_id).is_some());
+            assert!(model.last_activity_unix_ms(terminal_view_id).is_some());
         });
     });
 }

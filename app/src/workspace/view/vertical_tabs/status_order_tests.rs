@@ -5,10 +5,10 @@ use warpui::EntityId;
 use super::{
     AttentionBucket, FreezeInputs, GroupHeaderText, KEYBOARD_NAVIGATION_FREEZE_TIMEOUT,
     OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup,
-    StatusRowKey, StatusRowNavigation, StatusSortInput, attention_bucket, compact_age_label,
-    group_by_project, group_header_text, is_order_frozen, navigation_target, project_name,
-    project_palette_color, project_palette_index, reconcile_frozen_order, resolve_display_order,
-    row_attention_bucket, row_display_status, status_sorted_indices,
+    StatusRowKey, StatusRowNavigation, StatusSortInput, activity_age, attention_bucket,
+    compact_age_label, group_by_project, group_header_text, is_order_frozen, navigation_target,
+    project_name, project_palette_color, project_palette_index, reconcile_frozen_order,
+    resolve_display_order, row_attention_bucket, row_display_status, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -384,7 +384,7 @@ fn group_header_text_omits_needs_you_when_zero() {
         group_header_text(&quiet),
         GroupHeaderText {
             name: "warp".to_owned(),
-            count: "· 3".to_owned(),
+            count: "3".to_owned(),
             needs_you: None,
         }
     );
@@ -398,8 +398,8 @@ fn group_header_text_omits_needs_you_when_zero() {
         group_header_text(&urgent),
         GroupHeaderText {
             name: OTHER_PROJECT_LABEL.to_owned(),
-            count: "· 4".to_owned(),
-            needs_you: Some("· 1 needs you".to_owned()),
+            count: "4".to_owned(),
+            needs_you: Some("1 needs you".to_owned()),
         }
     );
 }
@@ -460,6 +460,18 @@ fn palette_spreads_distinct_projects() {
     let distinct: std::collections::HashSet<usize> =
         names.into_iter().map(project_palette_index).collect();
     assert!(distinct.len() > 1);
+}
+
+#[test]
+fn activity_age_is_wall_clock_difference_and_never_negative() {
+    assert_eq!(activity_age(10_000, 4_000), Duration::from_millis(6_000));
+    assert_eq!(activity_age(10_000, 10_000), Duration::ZERO);
+    // The clock went backwards (or a time from the future).
+    assert_eq!(activity_age(4_000, 10_000), Duration::ZERO);
+    assert_eq!(
+        activity_age(i64::MAX, i64::MIN),
+        Duration::from_millis(i64::MAX as u64)
+    );
 }
 
 #[test]

@@ -134,6 +134,9 @@ pub struct LeafSnapshot {
     pub contents: LeafContents,
 }
 
+// Fork: the terminal snapshot carries the pane's CLI agent session record,
+// which puts it over clippy's size-difference limit. Snapshots are short-lived.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum LeafContents {
     Terminal(TerminalPaneSnapshot),

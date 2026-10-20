@@ -95,8 +95,10 @@ use crate::workspace::tab_settings::{
     DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
     ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
     TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
-    UseVerticalTabs, VerticalTabsSortMode, WorkspaceDecorationVisibility, canonical_directory_key,
+    UseVerticalTabs, VerticalTabsGlass, VerticalTabsSortMode, WorkspaceDecorationVisibility,
+    canonical_directory_key,
 };
+use crate::workspace::view::glass;
 use crate::{send_telemetry_from_ctx, themes};
 
 const FONT_SIZE_INPUT_BOX_WIDTH: f32 = 80.;
@@ -402,6 +404,17 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             context,
             flags::USE_LATEST_USER_PROMPT_AS_CONVERSATION_TITLE_IN_TAB_NAMES_FLAG,
         ));
+        // Fork: glass needs the macOS window blur.
+        if cfg!(target_os = "macos") {
+            toggle_binding_pairs.push(ToggleSettingActionPair::new(
+                "glass vertical tabs panel",
+                builder(SettingsAction::AppearancePageToggle(
+                    AppearancePageAction::ToggleVerticalTabsGlass,
+                )),
+                context,
+                flags::VERTICAL_TABS_GLASS_FLAG,
+            ));
+        }
     }
 
     if FeatureFlag::VerticalTabs.is_enabled() && FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
@@ -521,6 +534,7 @@ pub enum AppearancePageAction {
     ToggleShowVerticalTabPanelInRestoredWindows,
     ToggleHideTitleBarSearchBarInVerticalTabs,
     ToggleUseLatestUserPromptAsConversationTitleInTabNames,
+    ToggleVerticalTabsGlass,
     ToggleLigatureRendering,
     SetWindowBackdrop(WindowBackdrop),
     ToggleLeftPanelVisibility,
@@ -712,6 +726,7 @@ impl TypedActionView for AppearanceSettingsPageView {
             ToggleUseLatestUserPromptAsConversationTitleInTabNames => {
                 self.toggle_use_latest_user_prompt_as_conversation_title_in_tab_names(ctx)
             }
+            ToggleVerticalTabsGlass => self.toggle_vertical_tabs_glass(ctx),
             ToggleLigatureRendering => self.toggle_ligature_rendering(ctx),
             ToggleFocusPaneOnHover => {
                 PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
@@ -1554,6 +1569,9 @@ impl AppearanceSettingsPageView {
             if FeatureFlag::VerticalTabsStatusOrder.is_enabled() {
                 tab_settings_widgets.push(Box::new(VerticalTabsSortModeWidget {}));
             }
+            if cfg!(target_os = "macos") {
+                tab_settings_widgets.push(Box::new(VerticalTabsGlassWidget::default()));
+            }
             tab_settings_widgets.push(Box::new(
                 ShowVerticalTabPanelInRestoredWindowsWidget::default(),
             ));
@@ -1975,7 +1993,10 @@ impl AppearanceSettingsPageView {
         }
 
         ctx.windows()
-            .set_all_windows_background_blur_radius(blur_value as u8);
+            .set_all_windows_background_blur_radius(glass::effective_blur_radius(
+                blur_value as u8,
+                ctx,
+            ));
 
         WindowSettings::handle(ctx).update(ctx, |window_settings, ctx| {
             report_if_error!(
@@ -2569,6 +2590,15 @@ impl AppearanceSettingsPageView {
                     .toggle_and_save_value(ctx)
             );
         });
+    }
+
+    /// The workspace applies the matching window blur when the setting
+    /// changes.
+    fn toggle_vertical_tabs_glass(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.vertical_tabs_glass.toggle_and_save_value(ctx));
+        });
+        ctx.notify();
     }
 
     /// Set the workspace decoration visibility to a particular value.
@@ -4916,6 +4946,55 @@ impl SettingsWidget for VerticalTabsSortModeWidget {
             ),
             None,
             &view.vertical_tabs_sort_mode_dropdown,
+        )
+    }
+}
+
+/// Fork: the glass vertical tabs panel.
+#[derive(Default)]
+struct VerticalTabsGlassWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for VerticalTabsGlassWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "vertical tabs glass translucent blur transparent sidebar panel"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Glass vertical tabs panel".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                VerticalTabsGlass::storage_key(),
+                VerticalTabsGlass::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.vertical_tabs_glass)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleVerticalTabsGlass);
+                })
+                .finish(),
+            Some(format!(
+                "With vertical tabs, show the tabs panel and the window header over a blurred desktop, with the tab content opaque. The window blur is at least {} while this is on. Themes with a background image keep their usual look.",
+                glass::GLASS_BLUR_RADIUS
+            )),
         )
     }
 }

@@ -29,6 +29,7 @@ use crate::themes::theme::{CustomTheme, SelectedSystemThemes, ThemeKind};
 use crate::ui_components::blended_colors;
 use crate::user_config::{self, WarpConfig};
 use crate::window_settings::WindowSettings;
+use crate::workspace::view::glass;
 use crate::{GlobalResourceHandlesProvider, TelemetryEvent, send_telemetry_from_ctx};
 
 // UI does not scale, so we set a fixed size for all text.
@@ -663,8 +664,9 @@ impl SettingsImportView {
                         );
                     }
                     if let Some(blur_radius) = opacity_settings.blur_radius {
-                        ctx.windows()
-                            .set_all_windows_background_blur_radius(blur_radius);
+                        ctx.windows().set_all_windows_background_blur_radius(
+                            glass::effective_blur_radius(blur_radius, ctx),
+                        );
                         report_if_error!(
                             window_settings
                                 .background_blur_radius
