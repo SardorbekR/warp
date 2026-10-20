@@ -4,6 +4,17 @@ use crate::terminal::cli_agent_sessions::{CLIAgentInputState, CLIAgentSessionCon
 const CLAUDE_ID: &str = "3f2a9c1e-8d4b-4f6a-9e2d-1b7c5a0f8e3d";
 const CODEX_ID: &str = "019a6c2e-7b1d-7e42-a5f3-2c9d8e1b4a60";
 
+/// The pane's running command is the agent, started from its local shell.
+const LOCAL_AGENT: LaunchObservation = LaunchObservation {
+    launched_locally: true,
+    started_as_agent: true,
+};
+/// The pane saw nothing about how the agent was started, e.g. it reports from a script.
+const UNOBSERVED: LaunchObservation = LaunchObservation {
+    launched_locally: false,
+    started_as_agent: false,
+};
+
 fn record(
     agent: CLIAgent,
     session_id: Option<&str>,
@@ -18,6 +29,7 @@ fn record(
         status: None,
         remote_host: None,
         launched_locally: true,
+        evidently_interactive: true,
         updated_at_unix_ms: 1_000,
     }
 }
@@ -209,9 +221,14 @@ fn live_session_record() {
             ..context(Some(CLAUDE_ID), Some("/proj"), Some("  add tests  "))
         },
     );
-    let live =
-        PersistedCLIAgentSession::from_live_session(&session, Some("/elsewhere"), None, true, 5)
-            .expect("Claude sessions are persisted");
+    let live = PersistedCLIAgentSession::from_live_session(
+        &session,
+        Some("/elsewhere"),
+        None,
+        LOCAL_AGENT,
+        5,
+    )
+    .expect("Claude sessions are persisted");
     assert_eq!(live.agent, CLIAgent::Claude);
     assert_eq!(live.session_id.as_deref(), Some(CLAUDE_ID));
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj"));
@@ -228,7 +245,7 @@ fn live_session_record() {
 fn live_session_of_unsupported_agent_is_not_persisted() {
     let session = live_session(CLIAgent::Gemini, context(Some("abc"), Some("/proj"), None));
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5),
         None
     );
 }
@@ -244,8 +261,9 @@ fn live_session_falls_back_to_pane_cwd() {
             ..Default::default()
         },
     );
-    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, true, 5)
-        .expect("Codex sessions are persisted");
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, LOCAL_AGENT, 5)
+            .expect("Codex sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some(CODEX_ID));
     assert_eq!(live.launch_cwd.as_deref(), Some("/pane"));
 }
@@ -257,7 +275,7 @@ fn live_session_without_session_id_is_not_persisted() {
         context(None, Some("/proj"), Some("a prompt")),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5),
         None
     );
 }
@@ -270,7 +288,7 @@ fn fresh_session_without_activity_is_not_persisted() {
         context(Some(CLAUDE_ID), Some("/proj"), None),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5),
+        PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5),
         None
     );
 }
@@ -285,7 +303,7 @@ fn status_or_summary_counts_as_activity() {
         message: None,
         source: crate::terminal::cli_agent_sessions::BlockedSource::PermissionRequest,
     };
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5)
         .expect("a blocked session has done something");
     assert_eq!(live.title, None);
 
@@ -294,7 +312,9 @@ fn status_or_summary_counts_as_activity() {
         context(Some(CLAUDE_ID), Some("/proj"), None),
     );
     session.session_context.summary = Some("Wants to run Bash".to_owned());
-    assert!(PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5).is_some());
+    assert!(
+        PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5).is_some()
+    );
 }
 
 #[test]
@@ -306,7 +326,7 @@ fn resumed_session_inherits_restored_record_until_plugin_reports() {
         &session,
         Some("/other"),
         Some(&restored),
-        true,
+        LOCAL_AGENT,
         9,
     )
     .expect("Claude sessions are persisted");
@@ -324,9 +344,14 @@ fn launch_cwd_stays_pinned_for_the_same_session_id() {
         CLIAgent::Claude,
         context(Some(CLAUDE_ID), Some("/proj/subdir"), Some("next prompt")),
     );
-    let live =
-        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
-            .expect("Claude sessions are persisted");
+    let live = PersistedCLIAgentSession::from_live_session(
+        &session,
+        None,
+        Some(&previous),
+        LOCAL_AGENT,
+        9,
+    )
+    .expect("Claude sessions are persisted");
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj"));
     assert_eq!(live.title.as_deref(), Some("next prompt"));
     assert_eq!(live.updated_at_unix_ms, 9);
@@ -344,9 +369,14 @@ fn new_session_id_replaces_previous_session_fields() {
             Some("first prompt"),
         ),
     );
-    let live =
-        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
-            .expect("Claude sessions are persisted");
+    let live = PersistedCLIAgentSession::from_live_session(
+        &session,
+        None,
+        Some(&previous),
+        LOCAL_AGENT,
+        9,
+    )
+    .expect("Claude sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some("new-session"));
     assert_eq!(live.launch_cwd.as_deref(), Some("/proj/subdir"));
     assert_eq!(live.title.as_deref(), Some("first prompt"));
@@ -358,7 +388,13 @@ fn new_session_id_replaces_previous_session_fields() {
         context(Some("new-session"), Some("/proj/subdir"), None),
     );
     assert_eq!(
-        PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9),
+        PersistedCLIAgentSession::from_live_session(
+            &session,
+            None,
+            Some(&previous),
+            LOCAL_AGENT,
+            9
+        ),
         None
     );
 }
@@ -373,7 +409,7 @@ fn different_agent_does_not_inherit_previous_record() {
             &session,
             Some("/pane"),
             Some(&previous),
-            true,
+            LOCAL_AGENT,
             9
         ),
         None
@@ -390,9 +426,14 @@ fn status_change_alone_is_not_a_content_change() {
         CLIAgentSessionStatus::Cancelled,
     ] {
         session.status = status;
-        let live =
-            PersistedCLIAgentSession::from_live_session(&session, None, Some(&previous), true, 9)
-                .expect("Claude sessions are persisted");
+        let live = PersistedCLIAgentSession::from_live_session(
+            &session,
+            None,
+            Some(&previous),
+            LOCAL_AGENT,
+            9,
+        )
+        .expect("Claude sessions are persisted");
         assert!(live.has_same_content(&previous));
         assert_eq!(live.updated_at_unix_ms, previous.updated_at_unix_ms);
     }
@@ -404,22 +445,26 @@ fn nested_agent_prompt_keeps_the_title() {
         CLIAgent::Claude,
         context(Some(CLAUDE_ID), Some("/repo"), Some("fix the build")),
     );
-    let record = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
+    let record = PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5)
         .expect("Claude sessions are persisted");
     assert_eq!(record.title.as_deref(), Some("fix the build"));
 
     // e.g. a `claude -p` run by the agent's shell tool reported its own session and prompt.
     session.session_context.session_id = Some("nested".to_owned());
     session.session_context.query = Some("summarize the logs".to_owned());
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), true, 9)
-        .expect("Claude sessions are persisted");
+    session.session_context.query_from_other_session = true;
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), LOCAL_AGENT, 9)
+            .expect("Claude sessions are persisted");
     assert!(live.has_same_content(&record));
 
     // The agent's own next prompt retitles the record.
     session.session_context.session_id = Some(CLAUDE_ID.to_owned());
     session.session_context.query = Some("now add tests".to_owned());
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), true, 9)
-        .expect("Claude sessions are persisted");
+    session.session_context.query_from_other_session = false;
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&record), LOCAL_AGENT, 9)
+            .expect("Claude sessions are persisted");
     assert_eq!(live.session_id.as_deref(), Some(CLAUDE_ID));
     assert_eq!(live.title.as_deref(), Some("now add tests"));
 }
@@ -431,17 +476,18 @@ fn sessions_not_started_from_the_local_command_line_are_copy_only() {
         context(Some(CLAUDE_ID), Some("/srv/app"), Some("deploy")),
     );
     // e.g. the plugin reported from an SSH session Warp didn't take over, or from tmux.
-    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, false, 5)
+    let live = PersistedCLIAgentSession::from_live_session(&session, None, None, UNOBSERVED, 5)
         .expect("the session is still persisted, to show and copy");
     assert!(!live.launched_locally);
     assert!(!live.is_remote());
     assert!(!live.can_resume_here());
 
     // Once seen running locally, the session stays resumable while it's tracked.
-    let local = PersistedCLIAgentSession::from_live_session(&session, None, None, true, 5)
+    let local = PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5)
         .expect("Claude sessions are persisted");
-    let later = PersistedCLIAgentSession::from_live_session(&session, None, Some(&local), false, 6)
-        .expect("Claude sessions are persisted");
+    let later =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&local), UNOBSERVED, 6)
+            .expect("Claude sessions are persisted");
     assert!(later.can_resume_here());
 
     // A remote host always makes it copy-only.
@@ -482,12 +528,18 @@ fn paths_with_control_characters_are_dropped() {
             ..context(Some(CLAUDE_ID), None, Some("a prompt"))
         },
     );
-    let live =
-        PersistedCLIAgentSession::from_live_session(&session, Some("/pane\u{0}"), None, true, 5)
-            .expect("Claude sessions are persisted");
+    let live = PersistedCLIAgentSession::from_live_session(
+        &session,
+        Some("/pane\u{0}"),
+        None,
+        LOCAL_AGENT,
+        5,
+    )
+    .expect("Claude sessions are persisted");
     assert_eq!(live.launch_cwd, None);
-    let live = PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, true, 5)
-        .expect("Claude sessions are persisted");
+    let live =
+        PersistedCLIAgentSession::from_live_session(&session, Some("/pane"), None, LOCAL_AGENT, 5)
+            .expect("Claude sessions are persisted");
     assert_eq!(live.launch_cwd.as_deref(), Some("/pane"));
 }
 
@@ -659,4 +711,50 @@ fn quote_shell_arg_doubles_all_powershell_quote_characters() {
         quote_shell_arg("Bob’s $proj", ShellType::PowerShell),
         "'Bob’’s $proj'"
     );
+}
+
+#[test]
+fn sessions_are_evidently_interactive_once_seen_as_such() {
+    let session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/repo"), Some("run the tests")),
+    );
+    // e.g. `claude -p` run by `npm test`: the pane's running command is the script.
+    let script = LaunchObservation {
+        launched_locally: true,
+        started_as_agent: false,
+    };
+    let headless = PersistedCLIAgentSession::from_live_session(&session, None, None, script, 5)
+        .expect("headless runs are still persisted");
+    assert!(!headless.evidently_interactive);
+    assert!(headless.can_resume_here());
+
+    let started = PersistedCLIAgentSession::from_live_session(&session, None, None, LOCAL_AGENT, 5)
+        .expect("Claude sessions are persisted");
+    assert!(started.evidently_interactive);
+    assert!(!headless.has_same_content(&started), "gaining it is saved");
+    // Once seen, it sticks for the session.
+    let later =
+        PersistedCLIAgentSession::from_live_session(&session, None, Some(&started), UNOBSERVED, 6)
+            .expect("Claude sessions are persisted");
+    assert!(later.evidently_interactive);
+
+    // An idle prompt or permission request is evidence too.
+    let mut prompted = session.clone();
+    prompted.session_context.showed_interactive_prompt = true;
+    let prompted = PersistedCLIAgentSession::from_live_session(&prompted, None, None, script, 5)
+        .expect("Claude sessions are persisted");
+    assert!(prompted.evidently_interactive);
+
+    let round_trip = started
+        .to_json()
+        .and_then(|json| PersistedCLIAgentSession::from_json(&json))
+        .expect("record should round-trip");
+    assert!(round_trip.evidently_interactive);
+    // Records from before this field existed aren't.
+    let json =
+        format!(r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}","launched_locally":true}}"#);
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
+    assert!(!restored.evidently_interactive);
+    assert!(restored.can_resume_here());
 }

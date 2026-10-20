@@ -39,13 +39,16 @@ pub(super) fn init(ctx: &mut AppContext) {
 }
 
 /// Resumes the interrupted CLI agent session in every terminal pane of the workspace's window,
-/// skipping panes where that could disturb something (a running command or typed input).
+/// skipping panes where that could disturb something (a running command or typed input) and
+/// sessions that are open, or being resumed, in another pane: each session is resumed once.
 pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContext<Workspace>) {
     let terminal_views: Vec<_> = workspace
         .tab_views()
         .flat_map(|pane_group| pane_group.as_ref(ctx).terminal_views(ctx))
         .collect();
 
+    // Each pane's resume checks the sessions other panes run, resume or track (see
+    // `CLIAgentSessionsModel::resume_claim_elsewhere`), so each session is resumed once.
     let mut resumed = 0usize;
     let mut skipped = 0usize;
     for terminal_view in terminal_views {
@@ -55,6 +58,7 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
             CLIAgentResumeOutcome::Resumed => resumed = resumed.saturating_add(1),
             CLIAgentResumeOutcome::Busy
             | CLIAgentResumeOutcome::HasDraft
+            | CLIAgentResumeOutcome::AlreadyOpen
             | CLIAgentResumeOutcome::CopyOnly => skipped = skipped.saturating_add(1),
             CLIAgentResumeOutcome::NothingToResume => {}
         }
@@ -67,15 +71,14 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
             format!("{count} agent sessions")
         }
     };
+    const SKIP_REASONS: &str =
+        "busy, unsent input, already open in another pane, or not resumable from this pane";
     let message = match (resumed, skipped) {
         (0, 0) => "No agent sessions to resume".to_owned(),
         (resumed, 0) => format!("Resuming {}", sessions(resumed)),
-        (0, skipped) => format!(
-            "Couldn't resume {}: busy, unsent input, or not started from the pane's shell",
-            sessions(skipped)
-        ),
+        (0, skipped) => format!("Couldn't resume {}: {SKIP_REASONS}", sessions(skipped)),
         (resumed, skipped) => format!(
-            "Resuming {}; skipped {} (busy, unsent input, or not started from the pane's shell)",
+            "Resuming {}; skipped {} ({SKIP_REASONS})",
             sessions(resumed),
             sessions(skipped)
         ),

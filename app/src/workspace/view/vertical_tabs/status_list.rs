@@ -31,10 +31,10 @@ use warpui::text_layout::ClipConfig;
 use warpui::{AppContext, EntityId, EventContext, SingletonEntity, TaskId, ViewHandle};
 
 use super::status_order::{
-    AttentionBucket, FreezeInputs, GroupHeaderText, POINTER_IDLE_RELEASE, StatusRowKey,
-    StatusSortInput, compact_age_label, group_by_project, group_header_text, is_order_frozen,
-    project_name, project_palette_color, resolve_display_order, row_attention_bucket,
-    row_display_status, status_sorted_indices,
+    AttentionBucket, FreezeInputs, GroupHeaderText, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE,
+    StatusRowKey, StatusSortInput, compact_age_label, group_by_project, group_header_text,
+    is_order_frozen, project_name, project_palette_color, resolve_display_order,
+    row_attention_bucket, row_display_status, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -306,9 +306,10 @@ fn is_status_list_frozen(
     })
 }
 
-/// Extra time after [`POINTER_IDLE_RELEASE`] before the re-render that lets
-/// an idle pointer's freeze go. It also limits how often pointer moves
-/// reschedule that re-render.
+/// Extra time after a pointer idle limit ([`POINTER_IDLE_RELEASE`] or
+/// [`POINTER_IDLE_CAP`]) before the re-render that lets an idle pointer's
+/// freeze go. It also limits how often pointer moves reschedule that
+/// re-render.
 const POINTER_IDLE_RELEASE_SLACK: Duration = Duration::from_secs(1);
 
 /// Real (not synthetic) pointer moves over the status list and its detail
@@ -318,8 +319,11 @@ const POINTER_IDLE_RELEASE_SLACK: Duration = Duration::from_secs(1);
 pub(super) struct StatusListPointerActivity {
     last_real_move_at: Cell<Option<Instant>>,
     /// The pending re-render that releases the freeze once the pointer has
-    /// been idle long enough, and when it fires.
+    /// been idle for [`POINTER_IDLE_RELEASE`] (the limit while the window is
+    /// inactive), and when it fires.
     idle_release_notify: Cell<Option<(TaskId, Instant)>>,
+    /// The same for [`POINTER_IDLE_CAP`], the active window's limit.
+    idle_cap_notify: Cell<Option<(TaskId, Instant)>>,
 }
 
 impl StatusListPointerActivity {
@@ -338,25 +342,37 @@ impl StatusListPointerActivity {
     fn record_real_move(&self, ctx: &mut EventContext) {
         let now = Instant::now();
         self.last_real_move_at.set(Some(now));
-        let Some(release_at) = now.checked_add(POINTER_IDLE_RELEASE) else {
-            return;
-        };
-        // Keep one re-render scheduled for when this move stops freezing the
-        // list, so an idle pointer never keeps it frozen.
-        let is_scheduled = self
-            .idle_release_notify
-            .get()
-            .is_some_and(|(_, notify_at)| notify_at >= release_at);
-        if is_scheduled {
-            return;
-        }
-        if let Some((timer_id, _)) = self.idle_release_notify.take() {
-            ctx.clear_notify_timer(timer_id);
-        }
-        self.idle_release_notify.set(Some(
-            ctx.notify_after(POINTER_IDLE_RELEASE.saturating_add(POINTER_IDLE_RELEASE_SLACK)),
-        ));
+        // Either limit can apply by the time it runs out, since the window
+        // can become active or inactive in the meantime.
+        schedule_idle_release(&self.idle_release_notify, now, POINTER_IDLE_RELEASE, ctx);
+        schedule_idle_release(&self.idle_cap_notify, now, POINTER_IDLE_CAP, ctx);
     }
+}
+
+/// Keeps one re-render scheduled for when a pointer move at `moved_at` stops
+/// freezing the list under `idle_limit`, so an idle pointer never keeps it
+/// frozen.
+fn schedule_idle_release(
+    pending: &Cell<Option<(TaskId, Instant)>>,
+    moved_at: Instant,
+    idle_limit: Duration,
+    ctx: &mut EventContext,
+) {
+    let Some(release_at) = moved_at.checked_add(idle_limit) else {
+        return;
+    };
+    let is_scheduled = pending
+        .get()
+        .is_some_and(|(_, notify_at)| notify_at >= release_at);
+    if is_scheduled {
+        return;
+    }
+    if let Some((timer_id, _)) = pending.take() {
+        ctx.clear_notify_timer(timer_id);
+    }
+    pending.set(Some(ctx.notify_after(
+        idle_limit.saturating_add(POINTER_IDLE_RELEASE_SLACK),
+    )));
 }
 
 /// Records real pointer moves over `child` (the status list or the detail
@@ -571,13 +587,15 @@ fn collect_status_rows<'a>(
                 };
             }
             // Only a CLI agent's own status can be the optimistic "in
-            // progress" it is registered with before the first prompt.
+            // progress" it is registered with before the first prompt. The
+            // session is identified by the id it would be resumed with, which
+            // (unlike the live id) ignores nested headless runs in the pane.
             let is_awaiting_first_prompt = matches!(icon, IconWithStatusVariant::CLIAgent { .. })
                 && terminal_view_id.is_some_and(|id| {
                     cli_sessions.session(id).is_some_and(|session| {
                         notifications.is_cli_session_awaiting_first_prompt(
                             id,
-                            session.session_context.session_id.as_deref(),
+                            session.session_context.resume_session_id.as_deref(),
                         )
                     })
                 });

@@ -21,6 +21,7 @@ fn record(launched_locally: bool) -> PersistedCLIAgentSession {
         status: None,
         remote_host: None,
         launched_locally,
+        evidently_interactive: true,
         updated_at_unix_ms: 1_000,
     }
 }
@@ -108,5 +109,43 @@ fn resume_all_resumes_local_sessions_and_skips_copy_only_ones() {
             terminal.read(&app, |view, _| view.cli_agent_session_for_snapshot()),
             Some(record(true))
         );
+    })
+}
+
+#[test]
+fn resume_all_resumes_each_session_once() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let first = active_terminal(&app, &workspace);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+        let second = active_terminal(&app, &workspace);
+        assert_ne!(first.id(), second.id());
+        // e.g. the same session was restored into two panes.
+        for terminal in [&first, &second] {
+            terminal.update(&mut app, |view, ctx| {
+                view.restore_cli_agent_session(record(true), ctx);
+            });
+        }
+
+        workspace.update(&mut app, |workspace, ctx| {
+            resume_all_cli_agent_sessions(workspace, ctx)
+        });
+        let still_offered: Vec<_> = [&first, &second]
+            .into_iter()
+            .filter(|terminal| restorable(&app, terminal).is_some())
+            .collect();
+        assert_eq!(still_offered.len(), 1, "only one pane resumes it");
+
+        // Resuming all again doesn't resume it a second time while the first resume runs.
+        workspace.update(&mut app, |workspace, ctx| {
+            resume_all_cli_agent_sessions(workspace, ctx)
+        });
+        let still_offered = still_offered
+            .first()
+            .expect("one pane still offers the session");
+        assert!(restorable(&app, still_offered).is_some());
     })
 }

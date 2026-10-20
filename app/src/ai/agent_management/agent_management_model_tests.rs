@@ -798,6 +798,8 @@ fn emit_cli_event(app: &mut App, event: CLIAgentSessionsModelEvent) {
     });
 }
 
+/// A status change of a session whose live and resume session ids are both
+/// `session_id`.
 fn status_changed(
     terminal_view_id: EntityId,
     status: CLIAgentSessionStatus,
@@ -811,6 +813,7 @@ fn status_changed(
         is_prompt_submit,
         session_context: Box::new(CLIAgentSessionContext {
             session_id: session_id.map(str::to_owned),
+            resume_session_id: session_id.map(str::to_owned),
             ..Default::default()
         }),
     }
@@ -893,5 +896,58 @@ fn cli_session_awaits_first_prompt_until_a_prompt_is_submitted() {
             },
         );
         assert!(awaiting(&app, None));
+    });
+}
+
+#[test]
+fn nested_headless_run_prompt_does_not_count_as_a_new_session() {
+    App::test((), |mut app| async move {
+        let (_history, notifications) = setup_app(&mut app);
+        let terminal_view_id = EntityId::new();
+        let awaiting = |app: &App, resume_session_id: Option<&str>| {
+            notifications.read(app, |model, _| {
+                model.is_cli_session_awaiting_first_prompt(terminal_view_id, resume_session_id)
+            })
+        };
+
+        emit_cli_event(
+            &mut app,
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+            },
+        );
+        emit_cli_event(
+            &mut app,
+            status_changed(
+                terminal_view_id,
+                CLIAgentSessionStatus::InProgress,
+                true,
+                Some("outer"),
+            ),
+        );
+        assert!(!awaiting(&app, Some("outer")));
+
+        // A nested headless run (e.g. `claude -p` started by the agent)
+        // submits its own prompt under its own live session id, while the
+        // session the pane would resume stays the outer one.
+        emit_cli_event(
+            &mut app,
+            CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                agent: CLIAgent::Claude,
+                status: CLIAgentSessionStatus::InProgress,
+                is_prompt_submit: true,
+                session_context: Box::new(CLIAgentSessionContext {
+                    session_id: Some("nested".to_owned()),
+                    resume_session_id: Some("outer".to_owned()),
+                    ..Default::default()
+                }),
+            },
+        );
+        assert!(!awaiting(&app, Some("outer")));
+        // The outer session switching to another one (e.g. `/clear`) still
+        // awaits that session's first prompt.
+        assert!(awaiting(&app, Some("after-clear")));
     });
 }

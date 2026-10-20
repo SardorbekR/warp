@@ -405,6 +405,12 @@ pub enum WorkspaceAction {
     MarkTerminalViewRead {
         terminal_view_id: EntityId,
     },
+    /// Fork: acts on the interrupted CLI agent session of a terminal view
+    /// (e.g. from its sidebar row's context menu).
+    InterruptedCLIAgentSession {
+        terminal_view_id: EntityId,
+        action: crate::tab::InterruptedSessionAction,
+    },
     /// Closes the focused panel. This happens as an explicit action from the user.
     ClosePanel,
     CopyTextToClipboard(String),
@@ -1116,6 +1122,7 @@ impl WorkspaceAction {
             | SetVerticalTabsSortMode(_)
             | MarkTerminalViewUnread { .. }
             | MarkTerminalViewRead { .. }
+            | InterruptedCLIAgentSession { .. }
             | ToggleWelcomeTips
             | CopyTextToClipboard(_)
             | CopyCurrentPath

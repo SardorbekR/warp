@@ -25203,6 +25203,12 @@ impl TypedActionView for Workspace {
                 });
                 ctx.notify();
             }
+            InterruptedCLIAgentSession {
+                terminal_view_id,
+                action,
+            } => {
+                self.handle_interrupted_cli_agent_session_action(*terminal_view_id, *action, ctx);
+            }
             SetVerticalTabsViewMode(mode) => {
                 let mode = *mode;
                 TabSettings::handle(ctx).update(ctx, |settings, ctx| {

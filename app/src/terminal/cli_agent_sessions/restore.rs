@@ -67,8 +67,25 @@ pub struct PersistedCLIAgentSession {
     /// treated as copy-only.
     #[serde(default)]
     pub launched_locally: bool,
+    /// Whether the session was evidently interactive: the pane's running command was the agent
+    /// itself, or the agent showed a prompt only interactive sessions show. A headless run (e.g.
+    /// `claude -p` inside `npm test` or a git hook) never is. Only such sessions are resumed
+    /// automatically or replace an interrupted session the pane offers. Missing in older records.
+    #[serde(default)]
+    pub evidently_interactive: bool,
     #[serde(default)]
     pub updated_at_unix_ms: i64,
+}
+
+/// What a pane saw of how the agent session reporting through it was started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaunchObservation {
+    /// The pane's running command started the agent in its local shell (see
+    /// [`PersistedCLIAgentSession::launched_locally`]).
+    pub launched_locally: bool,
+    /// The pane's running command is the agent itself (directly or through an alias), rather
+    /// than e.g. a script that runs it.
+    pub started_as_agent: bool,
 }
 
 /// Unknown statuses (e.g. written by a newer build) are dropped instead of invalidating the
@@ -214,6 +231,7 @@ impl PersistedCLIAgentSession {
             status: self.status,
             remote_host: owned(self.remote_host),
             launched_locally: self.launched_locally,
+            evidently_interactive: self.evidently_interactive,
             updated_at_unix_ms: self.updated_at_unix_ms,
         })
     }
@@ -228,15 +246,15 @@ impl PersistedCLIAgentSession {
     /// Fields the live session hasn't reported yet are carried over from `previous` when it
     /// describes the same agent session (e.g. a restored record that is being resumed), and the
     /// launch directory stays pinned to the first one seen for a session id. `pane_cwd` is the
-    /// fallback launch directory for agents that don't report one. `launched_from_local_command`
-    /// says whether the pane's running command is the agent in its local shell (see
-    /// [`Self::launched_locally`]); once seen, it sticks for the session. `updated_at_unix_ms`
-    /// only advances when the content changes.
+    /// fallback launch directory for agents that don't report one. `launch` is what the pane saw
+    /// of the running command (see [`Self::launched_locally`] and
+    /// [`Self::evidently_interactive`]); once seen, either sticks for the session.
+    /// `updated_at_unix_ms` only advances when the content changes.
     pub fn from_live_session(
         session: &CLIAgentSession,
         pane_cwd: Option<&str>,
         previous: Option<&Self>,
-        launched_from_local_command: bool,
+        launch: LaunchObservation,
         now_unix_ms: i64,
     ) -> Option<Self> {
         let agent = session.agent;
@@ -256,13 +274,11 @@ impl PersistedCLIAgentSession {
             .or_else(|| non_empty_without_control_chars(context.launch_cwd.as_deref()))
             .or_else(|| non_empty_without_control_chars(pane_cwd))
             .map(str::to_owned);
-        // After an event from a nested agent (e.g. a `claude -p` run by the agent's shell tool),
-        // the prompt describes that run rather than the session this record resumes.
-        let prompt_is_from_resumed_session =
-            context.resume_session_id.is_none() || context.session_id == context.resume_session_id;
         let title = context
             .latest_user_prompt()
-            .filter(|_| prompt_is_from_resumed_session)
+            // A prompt reported by a nested run (e.g. `claude -p` started by the agent's shell
+            // tool) or another agent describes that run, not the session this record resumes.
+            .filter(|_| !context.query_from_other_session)
             .map(|title| truncate_title(&title))
             .or_else(|| previous_same_session.and_then(|previous| previous.title.clone()));
         let transcript_path = non_empty_without_control_chars(context.transcript_path.as_deref())
@@ -279,8 +295,11 @@ impl PersistedCLIAgentSession {
             return None;
         }
 
-        let launched_locally = launched_from_local_command
+        let launched_locally = launch.launched_locally
             || previous_same_session.is_some_and(|previous| previous.launched_locally);
+        let evidently_interactive = launch.started_as_agent
+            || context.showed_interactive_prompt
+            || previous_same_session.is_some_and(|previous| previous.evidently_interactive);
         let mut record = Self {
             agent,
             session_id: Some(session_id),
@@ -291,6 +310,7 @@ impl PersistedCLIAgentSession {
             remote_host: non_empty_without_control_chars(session.remote_host.as_deref())
                 .map(str::to_owned),
             launched_locally,
+            evidently_interactive,
             updated_at_unix_ms: now_unix_ms,
         };
         if let Some(previous) = previous
@@ -311,6 +331,7 @@ impl PersistedCLIAgentSession {
             && self.transcript_path == other.transcript_path
             && self.remote_host == other.remote_host
             && self.launched_locally == other.launched_locally
+            && self.evidently_interactive == other.evidently_interactive
     }
 
     pub fn is_remote(&self) -> bool {

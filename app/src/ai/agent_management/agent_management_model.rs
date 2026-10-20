@@ -239,8 +239,8 @@ impl AgentNotificationsModel {
     }
 
     /// Whether the CLI agent session in `terminal_view_id` hasn't had a
-    /// prompt submitted yet. `current_session_id` is the session's current
-    /// agent session id: when it differs from the one seen at the last prompt
+    /// prompt submitted yet. `current_session_id` is the session's resume
+    /// session id: when it differs from the one seen at the last prompt
     /// (e.g. after `/clear`), the new session hasn't been prompted either.
     pub(crate) fn is_cli_session_awaiting_first_prompt(
         &self,
@@ -351,8 +351,11 @@ impl AgentNotificationsModel {
                 ..
             } => {
                 if *is_prompt_submit {
+                    // Keyed by the id the session would be resumed with, so a
+                    // nested headless run (e.g. `claude -p` inside the agent)
+                    // reporting its own id doesn't look like a new session.
                     self.prompted_cli_sessions
-                        .insert(*terminal_view_id, session_context.session_id.clone());
+                        .insert(*terminal_view_id, session_context.resume_session_id.clone());
                 }
                 self.record_session_activity(*terminal_view_id);
             }

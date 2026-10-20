@@ -359,6 +359,15 @@ pub struct PaneNameMenuTarget {
     pub reset_label: &'static str,
 }
 
+/// Fork: what to do with a terminal pane's interrupted CLI agent session (one
+/// that was running when Warp quit or crashed, and hasn't been resumed yet).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterruptedSessionAction {
+    Resume,
+    CopyResumeCommand,
+    Dismiss,
+}
+
 /// TabData struct holds the state of the given tab. It includes the pane group and mouse states
 /// used for closing the tab or tracking the mouse over the rendered tab.
 /// It has to be "stored" by some View to persist its state.
@@ -475,6 +484,7 @@ impl TabData {
         let mut menu_items = vec![];
 
         for section_items in [
+            self.interrupted_session_menu_items(pane_name_target, ctx),
             self.read_state_menu_items(pane_name_target, ctx),
             self.pin_menu_items(index),
             self.tab_group_menu_items(index, tab_groups, is_only_member_of_group),
@@ -600,6 +610,57 @@ impl TabData {
                 .unwrap_or_else(|| configuration.title());
             Self::copyable_metadata_value(Some(title.to_string()))
         })
+    }
+
+    /// Resume / copy the resume command of / dismiss the interrupted CLI
+    /// agent session of the clicked terminal pane, while it offers one.
+    /// Resume is left out for a session the pane can't resume itself (e.g.
+    /// one that ran over SSH, or whose directory is missing here), whose
+    /// command can only be copied.
+    fn interrupted_session_menu_items(
+        &self,
+        pane_name_target: Option<PaneNameMenuTarget>,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        let Some(target) =
+            pane_name_target.filter(|target| self.pane_group.id() == target.locator.pane_group_id)
+        else {
+            return vec![];
+        };
+        let Some(terminal_view) = self
+            .pane_group
+            .as_ref(ctx)
+            .terminal_view_from_pane_id(target.locator.pane_id, ctx)
+        else {
+            return vec![];
+        };
+        let terminal_view_ref = terminal_view.as_ref(ctx);
+        if terminal_view_ref.restorable_cli_agent_session().is_none() {
+            return vec![];
+        }
+        let can_resume_here = terminal_view_ref.can_resume_restored_cli_agent_session_here();
+        let terminal_view_id = terminal_view.id();
+        let item = |label: &str, action: InterruptedSessionAction| {
+            MenuItemFields::new(label)
+                .with_on_select_action(WorkspaceAction::InterruptedCLIAgentSession {
+                    terminal_view_id,
+                    action,
+                })
+                .into_item()
+        };
+        let mut items = Vec::with_capacity(3);
+        if can_resume_here {
+            items.push(item("Resume session", InterruptedSessionAction::Resume));
+        }
+        items.push(item(
+            "Copy resume command",
+            InterruptedSessionAction::CopyResumeCommand,
+        ));
+        items.push(item(
+            "Dismiss interrupted session",
+            InterruptedSessionAction::Dismiss,
+        ));
+        items
     }
 
     /// "Mark as read" / "Mark as unread" for the clicked terminal pane. Only

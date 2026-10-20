@@ -234,10 +234,16 @@ pub(super) fn resolve_display_order<K: Copy + Eq + Hash>(
 }
 
 /// How long the pointer may rest without really moving before it stops
-/// freezing the order. The UI framework refreshes hover state with synthetic
-/// moves after every frame, and some platforms don't report the pointer
-/// leaving the window, so hover state alone could freeze the list forever.
+/// freezing the order of a window that isn't the active (key) window. The UI
+/// framework refreshes hover state with synthetic moves after every frame,
+/// and an inactive window may never hear that the pointer left, so its hover
+/// state alone could freeze the list forever.
 pub(super) const POINTER_IDLE_RELEASE: Duration = Duration::from_secs(5);
+
+/// The same limit for the active window, which does hear the pointer leave,
+/// so a pointer resting on a row keeps it in place while the user reads. The
+/// cap is only a last resort that keeps the list from freezing forever.
+pub(super) const POINTER_IDLE_CAP: Duration = Duration::from_secs(120);
 
 /// The longest keyboard navigation keeps the order frozen after its last
 /// step, in case no other interaction ends it first.
@@ -247,7 +253,8 @@ pub(super) const KEYBOARD_NAVIGATION_FREEZE_TIMEOUT: Duration = Duration::from_s
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct FreezeInputs {
     pub is_panel_open: bool,
-    /// Whether this window is the active (key) window.
+    /// Whether this window is the active (key) window, which decides how long
+    /// a resting pointer keeps the order frozen.
     pub is_window_active: bool,
     /// Whether the pointer was last over the row list.
     pub is_pointer_over_list: bool,
@@ -269,15 +276,19 @@ pub(super) struct FreezeInputs {
 }
 
 /// Rows keep their positions while the user is pointing at the list or its
-/// detail sidecar in the active window, is stepping through rows with the
-/// keyboard, has a context menu open, or is dragging a pane, so nothing moves
-/// under them. Pointing and keyboard navigation always run out on their own.
+/// detail sidecar, is stepping through rows with the keyboard, has a context
+/// menu open, or is dragging a pane, so nothing moves under them. Pointing
+/// and keyboard navigation always run out on their own.
 pub(super) fn is_order_frozen(inputs: &FreezeInputs) -> bool {
+    let pointer_idle_limit = if inputs.is_window_active {
+        POINTER_IDLE_CAP
+    } else {
+        POINTER_IDLE_RELEASE
+    };
     let is_pointer_live = inputs.is_panel_open
-        && inputs.is_window_active
         && inputs
             .since_real_pointer_move
-            .is_some_and(|idle| idle < POINTER_IDLE_RELEASE);
+            .is_some_and(|idle| idle < pointer_idle_limit);
     let is_pointing = is_pointer_live
         && (inputs.is_pointer_over_list
             || inputs.is_pointer_over_detail_sidecar

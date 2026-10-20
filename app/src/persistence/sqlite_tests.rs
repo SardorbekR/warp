@@ -1180,6 +1180,7 @@ fn test_cli_agent_session_record() -> PersistedCLIAgentSession {
         status: Some(PersistedCLIAgentStatus::Blocked),
         remote_host: None,
         launched_locally: true,
+        evidently_interactive: true,
         updated_at_unix_ms: 1_760_000_000_000,
     }
 }

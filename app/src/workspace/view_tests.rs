@@ -3120,6 +3120,264 @@ fn test_next_tab_uses_tab_order_in_manual_order() {
     });
 }
 
+/// A CLI agent session record as restoring the app after a crash hands it to
+/// a pane: resumable from the pane's own shell, or (with `remote_host`) one
+/// that ran over SSH, whose command can only be copied.
+fn interrupted_cli_agent_session(
+    remote_host: Option<&str>,
+) -> crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession {
+    crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession {
+        agent: crate::terminal::CLIAgent::Claude,
+        session_id: Some("4b9e3c1a-session".to_owned()),
+        // A directory that exists here, like a real launch directory.
+        launch_cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
+        title: Some("fix the login bug".to_owned()),
+        transcript_path: None,
+        status: None,
+        remote_host: remote_host.map(str::to_owned),
+        launched_locally: remote_host.is_none(),
+        evidently_interactive: true,
+        updated_at_unix_ms: 1_000,
+    }
+}
+
+/// Opens the vertical tabs context menu of the active tab's first pane
+/// (closing any menu that is open) and returns it with that pane's terminal
+/// view.
+fn open_first_pane_context_menu(
+    workspace: &mut Workspace,
+    ctx: &mut ViewContext<Workspace>,
+) -> (
+    ViewHandle<Menu<WorkspaceAction>>,
+    ViewHandle<crate::terminal::TerminalView>,
+) {
+    workspace.show_tab_right_click_menu = None;
+    let pane_group = workspace.active_tab_pane_group().clone();
+    let pane_id = pane_group.as_ref(ctx).pane_id_from_index(0).unwrap();
+    let terminal_view = pane_group
+        .as_ref(ctx)
+        .terminal_view_from_pane_id(pane_id, ctx)
+        .expect("mock workspace starts with a terminal pane");
+    workspace.toggle_vertical_tabs_pane_context_menu(
+        workspace.active_tab_index,
+        VerticalTabsPaneContextMenuTarget::ClickedPane(PaneViewLocator {
+            pane_group_id: pane_group.id(),
+            pane_id,
+        }),
+        Vector2F::zero(),
+        ctx,
+    );
+    (workspace.tab_right_click_menu.clone(), terminal_view)
+}
+
+const RESUME_SESSION_ITEM: &str = "Resume session";
+const COPY_RESUME_COMMAND_ITEM: &str = "Copy resume command";
+const DISMISS_INTERRUPTED_SESSION_ITEM: &str = "Dismiss interrupted session";
+
+#[test]
+fn test_pane_context_menu_resumes_or_dismisses_an_interrupted_session() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        // Without an interrupted session there's nothing to offer.
+        let (menu, terminal_view) = workspace.update(&mut app, open_first_pane_context_menu);
+        menu.update(&mut app, |menu, ctx| {
+            for item in [
+                RESUME_SESSION_ITEM,
+                COPY_RESUME_COMMAND_ITEM,
+                DISMISS_INTERRUPTED_SESSION_ITEM,
+            ] {
+                assert!(!menu.set_selected_by_name(item, ctx), "{item}");
+            }
+        });
+
+        terminal_view.update(&mut app, |view, ctx| {
+            view.restore_cli_agent_session(interrupted_cli_agent_session(None), ctx);
+        });
+        let (menu, _) = workspace.update(&mut app, open_first_pane_context_menu);
+        menu.update(&mut app, |menu, ctx| {
+            for item in [
+                RESUME_SESSION_ITEM,
+                COPY_RESUME_COMMAND_ITEM,
+                DISMISS_INTERRUPTED_SESSION_ITEM,
+            ] {
+                assert!(menu.set_selected_by_name(item, ctx), "{item}");
+            }
+            assert!(menu.set_selected_by_name(DISMISS_INTERRUPTED_SESSION_ITEM, ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+        terminal_view.read(&app, |view, _| {
+            assert!(view.restorable_cli_agent_session().is_none());
+        });
+        let (menu, _) = workspace.update(&mut app, open_first_pane_context_menu);
+        menu.update(&mut app, |menu, ctx| {
+            assert!(!menu.set_selected_by_name(RESUME_SESSION_ITEM, ctx));
+            assert!(!menu.set_selected_by_name(DISMISS_INTERRUPTED_SESSION_ITEM, ctx));
+        });
+
+        // Resuming hands the session to the pane, which stops offering it.
+        terminal_view.update(&mut app, |view, ctx| {
+            view.restore_cli_agent_session(interrupted_cli_agent_session(None), ctx);
+        });
+        let (menu, _) = workspace.update(&mut app, open_first_pane_context_menu);
+        menu.update(&mut app, |menu, ctx| {
+            assert!(menu.set_selected_by_name(RESUME_SESSION_ITEM, ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+        terminal_view.read(&app, |view, _| {
+            assert!(view.restorable_cli_agent_session().is_none());
+        });
+    });
+}
+
+#[test]
+fn test_pane_context_menu_only_copies_a_session_the_pane_cannot_resume() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        let (_, terminal_view) = workspace.update(&mut app, open_first_pane_context_menu);
+        terminal_view.update(&mut app, |view, ctx| {
+            view.restore_cli_agent_session(
+                interrupted_cli_agent_session(Some("me@build-box")),
+                ctx,
+            );
+        });
+        // Offered in manual order too, since the row still shows the session.
+        let (menu, _) = workspace.update(&mut app, open_first_pane_context_menu);
+        menu.update(&mut app, |menu, ctx| {
+            assert!(!menu.set_selected_by_name(RESUME_SESSION_ITEM, ctx));
+            assert!(menu.set_selected_by_name(DISMISS_INTERRUPTED_SESSION_ITEM, ctx));
+            assert!(menu.set_selected_by_name(COPY_RESUME_COMMAND_ITEM, ctx));
+            menu.handle_action(&MenuAction::Enter, ctx);
+        });
+        let clipboard_text =
+            terminal_view.update(&mut app, |_, ctx| ctx.clipboard().read().plain_text);
+        assert!(
+            clipboard_text.contains("4b9e3c1a-session"),
+            "{clipboard_text:?}"
+        );
+        // Copying keeps the session on offer.
+        terminal_view.read(&app, |view, _| {
+            assert!(view.restorable_cli_agent_session().is_some());
+        });
+    });
+}
+
+#[test]
+fn test_nested_headless_run_keeps_the_agent_row_running() {
+    use crate::terminal::CLIAgent;
+    use crate::terminal::cli_agent_sessions::event::parse_event;
+    use crate::terminal::cli_agent_sessions::listener::CLIAgentSessionListener;
+    use crate::terminal::cli_agent_sessions::{
+        CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    };
+
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _status_order_guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        // Terminal views look up the agent's task when its status changes.
+        app.add_singleton_model(
+            crate::ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
+        );
+
+        let workspace = mock_workspace(&mut app);
+        // Three idle tabs with tab 2 active; tab 1 runs a plugin-backed agent.
+        let agent_terminal_view = workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            assert_eq!(workspace.active_tab_index, 2);
+            workspace.tabs[1]
+                .pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .expect("each tab starts with a terminal pane")
+        });
+        let agent_terminal_view_id = agent_terminal_view.id();
+        let listener = agent_terminal_view.update(&mut app, |view, ctx| {
+            let model_event_dispatcher = view.model_event_dispatcher().clone();
+            ctx.add_model(|ctx| {
+                CLIAgentSessionListener::new(
+                    agent_terminal_view_id,
+                    CLIAgent::Claude,
+                    &model_event_dispatcher,
+                    ctx,
+                )
+            })
+        });
+        let sessions = CLIAgentSessionsModel::handle(&app);
+        sessions.update(&mut app, |model, ctx| {
+            model.set_session(
+                agent_terminal_view_id,
+                CLIAgentSession {
+                    agent: CLIAgent::Claude,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext::default(),
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input: false,
+                    listener: Some(listener),
+                    plugin_version: Some("1.0.0".to_owned()),
+                    remote_host: None,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                    received_rich_notification: true,
+                },
+                ctx,
+            );
+        });
+        let emit = |app: &mut App, body: &str| {
+            let event = parse_event(Some("warp://cli-agent"), body).expect("valid event");
+            sessions.update(app, |model, ctx| {
+                model.update_from_event(agent_terminal_view_id, &event, ctx);
+            });
+        };
+        // The tab of the first row, in the order shown right now (not kept
+        // in place by the previous step's keyboard navigation).
+        let first_row_tab = |app: &mut App| {
+            workspace.update(app, |workspace, ctx| {
+                workspace.end_status_list_keyboard_navigation(ctx);
+                workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+                workspace.active_tab_index
+            })
+        };
+
+        emit(
+            &mut app,
+            r#"{"v":1,"agent":"claude","event":"session_start","session_id":"outer"}"#,
+        );
+        emit(
+            &mut app,
+            r#"{"v":1,"agent":"claude","event":"prompt_submit","session_id":"outer","query":"fix the bug"}"#,
+        );
+        // The running agent sorts ahead of the idle tabs.
+        assert_eq!(first_row_tab(&mut app), 1);
+
+        // A nested headless run (e.g. `claude -p` started by the agent)
+        // reports its own session id, which doesn't make the agent a new
+        // session that awaits its first prompt.
+        emit(
+            &mut app,
+            r#"{"v":1,"agent":"claude","event":"tool_complete","session_id":"nested"}"#,
+        );
+        assert_eq!(first_row_tab(&mut app), 1);
+        // Nor does the nested run's own prompt.
+        emit(
+            &mut app,
+            r#"{"v":1,"agent":"claude","event":"prompt_submit","session_id":"nested","query":"summarize"}"#,
+        );
+        assert_eq!(first_row_tab(&mut app), 1);
+    });
+}
+
 #[test]
 fn test_selecting_rename_from_tab_group_context_menu_preserves_editor_focus() {
     let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);

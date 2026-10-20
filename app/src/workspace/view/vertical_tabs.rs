@@ -64,9 +64,9 @@ use crate::pane_group::{
 };
 use crate::safe_triangle::SafeTriangle;
 use crate::tab::{
-    SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, is_vertical_tabs_status_order_active,
-    reveals_tab_shortcut_hints, tab_activate_binding_name, tab_position_id,
-    vertical_tabs_sort_mode,
+    InterruptedSessionAction, SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData,
+    is_vertical_tabs_status_order_active, reveals_tab_shortcut_hints, tab_activate_binding_name,
+    tab_position_id, vertical_tabs_sort_mode,
 };
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -755,10 +755,12 @@ pub(super) struct VerticalTabsPanelState {
     panel_right_click_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
     /// Status order: tracks whether the mouse is over the row list, which
-    /// freezes the row order until the mouse leaves (or rests).
+    /// freezes the row order until the mouse leaves (or rests in an inactive
+    /// window).
     status_list_hover_state: MouseStateHandle,
     /// Status order: real pointer moves over the row list and the detail
-    /// sidecar, so a pointer that stopped moving stops freezing the order.
+    /// sidecar, so a pointer that stopped moving stops freezing the order
+    /// (soon in an inactive window, after a long cap in the active one).
     status_list_pointer: Rc<status_list::StatusListPointerActivity>,
     /// Status order: the row order displayed last frame, reused while frozen.
     status_list_last_order: RefCell<Vec<StatusRowKey>>,
@@ -1782,7 +1784,8 @@ fn render_vertical_tabs_panel(
     // Status order: track whether the mouse is over the list so rows don't
     // reorder under the cursor. Hovering notifies on enter/leave, which
     // re-renders and applies the latest order once the mouse leaves; real
-    // moves are recorded so a resting pointer releases the order too.
+    // moves are recorded so a pointer resting in an inactive window (which
+    // may never hear it leave) releases the order too.
     let scrollable_groups = if is_vertical_tabs_status_order_active(app) {
         status_list::track_real_pointer_moves(
             Hoverable::new(state.status_list_hover_state.clone(), |_| scrollable_groups)
@@ -7803,6 +7806,42 @@ impl Workspace {
     /// Releases a stuck status-order freeze when the window loses focus.
     pub(super) fn reset_vertical_tabs_status_list_hover(&self) {
         self.vertical_tabs_panel.reset_status_list_hover();
+    }
+
+    /// Applies a row context-menu action to the interrupted CLI agent session
+    /// of `terminal_view_id`, if that pane is in this workspace.
+    pub(super) fn handle_interrupted_cli_agent_session_action(
+        &self,
+        terminal_view_id: EntityId,
+        action: InterruptedSessionAction,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(terminal_view) = self
+            .tab_views()
+            .flat_map(|pane_group| pane_group.as_ref(ctx).terminal_views(ctx))
+            .find(|terminal_view| terminal_view.id() == terminal_view_id)
+        else {
+            return;
+        };
+        match action {
+            // Each does what the matching button of the pane's restore banner
+            // does, including its feedback when the session can't be resumed.
+            InterruptedSessionAction::Resume => {
+                terminal_view.update(ctx, |view, ctx| {
+                    view.resume_restored_cli_agent_session_with_feedback(ctx);
+                });
+            }
+            InterruptedSessionAction::CopyResumeCommand => {
+                terminal_view.update(ctx, |view, ctx| {
+                    view.copy_restored_cli_agent_session_command(ctx);
+                });
+            }
+            InterruptedSessionAction::Dismiss => {
+                terminal_view.update(ctx, |view, ctx| {
+                    view.dismiss_restored_cli_agent_session(ctx);
+                });
+            }
+        }
     }
 
     /// Applies a tab-navigation keybinding to the rows of the status-ordered

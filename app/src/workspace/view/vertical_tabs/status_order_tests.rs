@@ -4,11 +4,11 @@ use warpui::EntityId;
 
 use super::{
     AttentionBucket, FreezeInputs, GroupHeaderText, KEYBOARD_NAVIGATION_FREEZE_TIMEOUT,
-    OTHER_PROJECT_LABEL, POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup, StatusRowKey,
-    StatusRowNavigation, StatusSortInput, attention_bucket, compact_age_label, group_by_project,
-    group_header_text, is_order_frozen, navigation_target, project_name, project_palette_color,
-    project_palette_index, reconcile_frozen_order, resolve_display_order, row_attention_bucket,
-    row_display_status, status_sorted_indices,
+    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup,
+    StatusRowKey, StatusRowNavigation, StatusSortInput, attention_bucket, compact_age_label,
+    group_by_project, group_header_text, is_order_frozen, navigation_target, project_name,
+    project_palette_color, project_palette_index, reconcile_frozen_order, resolve_display_order,
+    row_attention_bucket, row_display_status, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -586,8 +586,12 @@ fn order_is_not_frozen_without_a_reason() {
     assert!(!is_order_frozen(&FreezeInputs::default()));
 }
 
+fn just_under(limit: Duration) -> Option<Duration> {
+    limit.checked_sub(Duration::from_millis(1))
+}
+
 #[test]
-fn pointer_over_the_list_freezes_while_it_moves_in_the_active_window() {
+fn pointer_resting_on_the_list_of_the_active_window_keeps_it_frozen() {
     let pointing = FreezeInputs {
         is_pointer_over_list: true,
         since_real_pointer_move: recently(),
@@ -600,19 +604,28 @@ fn pointer_over_the_list_freezes_while_it_moves_in_the_active_window() {
         since_real_pointer_move: None,
         ..pointing
     }));
-    // A pointer that rests stops freezing the list, so it never stays
-    // frozen (e.g. the pointer left the window without that being reported).
+    // The active window hears the pointer leave, so a pointer resting on a
+    // row while the user reads the list keeps every row in place...
+    for idle in [
+        POINTER_IDLE_RELEASE,
+        Duration::from_secs(6),
+        Duration::from_secs(60),
+    ] {
+        assert!(
+            is_order_frozen(&FreezeInputs {
+                since_real_pointer_move: Some(idle),
+                ..pointing
+            }),
+            "{idle:?}"
+        );
+    }
     assert!(is_order_frozen(&FreezeInputs {
-        since_real_pointer_move: POINTER_IDLE_RELEASE.checked_sub(Duration::from_millis(1)),
+        since_real_pointer_move: just_under(POINTER_IDLE_CAP),
         ..pointing
     }));
+    // ...up to a last-resort cap, so the list can never stay frozen forever.
     assert!(!is_order_frozen(&FreezeInputs {
-        since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
-        ..pointing
-    }));
-    // Focus loss: the pointer of an inactive window doesn't freeze it.
-    assert!(!is_order_frozen(&FreezeInputs {
-        is_window_active: false,
+        since_real_pointer_move: Some(POINTER_IDLE_CAP),
         ..pointing
     }));
     // A closed panel can't be pointed at, even if it closed under the pointer.
@@ -623,6 +636,39 @@ fn pointer_over_the_list_freezes_while_it_moves_in_the_active_window() {
     // Moving elsewhere doesn't freeze the list.
     assert!(!is_order_frozen(&FreezeInputs {
         is_pointer_over_list: false,
+        ..pointing
+    }));
+}
+
+#[test]
+fn pointer_over_the_list_of_an_inactive_window_freezes_only_while_it_moves() {
+    let pointing = FreezeInputs {
+        is_window_active: false,
+        is_pointer_over_list: true,
+        since_real_pointer_move: recently(),
+        ..idle_freeze_inputs()
+    };
+    assert!(is_order_frozen(&pointing));
+
+    // An inactive window may never hear that the pointer left, so a resting
+    // pointer releases it after a short idle time.
+    assert!(is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: just_under(POINTER_IDLE_RELEASE),
+        ..pointing
+    }));
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
+        ..pointing
+    }));
+    // So losing focus after the pointer has rested a while releases the list
+    // at once.
+    assert!(is_order_frozen(&FreezeInputs {
+        is_window_active: true,
+        since_real_pointer_move: Some(Duration::from_secs(30)),
+        ..pointing
+    }));
+    assert!(!is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: Some(Duration::from_secs(30)),
         ..pointing
     }));
 }
@@ -643,20 +689,26 @@ fn detail_sidecar_freezes_while_shown_or_pointed_at() {
         is_detail_sidecar_shown: true,
         ..moving
     }));
-    // The same limits as the list: an inactive window or a resting pointer
-    // doesn't keep it frozen.
+    let on_sidecar = FreezeInputs {
+        is_detail_sidecar_shown: true,
+        is_pointer_over_detail_sidecar: true,
+        ..moving
+    };
+    // The same limits as the list: resting in the active window keeps it
+    // frozen up to the cap, while an inactive window releases it soon.
+    assert!(is_order_frozen(&FreezeInputs {
+        since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
+        ..on_sidecar
+    }));
     for inputs in [
         FreezeInputs {
-            is_detail_sidecar_shown: true,
-            is_pointer_over_detail_sidecar: true,
-            is_window_active: false,
-            ..moving
+            since_real_pointer_move: Some(POINTER_IDLE_CAP),
+            ..on_sidecar
         },
         FreezeInputs {
-            is_detail_sidecar_shown: true,
-            is_pointer_over_detail_sidecar: true,
+            is_window_active: false,
             since_real_pointer_move: Some(POINTER_IDLE_RELEASE),
-            ..moving
+            ..on_sidecar
         },
     ] {
         assert!(!is_order_frozen(&inputs), "{inputs:?}");

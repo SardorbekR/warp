@@ -1,20 +1,23 @@
 pub mod event;
+pub(crate) mod launch_command;
 pub mod listener;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod plugin_manager;
 pub mod restore;
 pub mod restore_save;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use event::{CLIAgentEvent, CLIAgentEventSource, CLIAgentEventType};
 use warp_core::execution_mode::AppExecutionMode;
 use warpui::r#async::SpawnedFutureHandle;
-use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
+use warpui::{
+    AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity, WeakViewHandle,
+};
 
 use self::listener::CLIAgentSessionListener;
-use super::CLIAgent;
+use super::{CLIAgent, TerminalView};
 use crate::ai::blocklist::InputConfig;
 
 /// How long to wait, after observing a synthesized Ctrl-C write to a working
@@ -23,6 +26,14 @@ use crate::ai::blocklist::InputConfig;
 pub const CTRL_C_CANCEL_WINDOW: Duration = Duration::from_secs(2);
 
 const NEEDS_INPUT_STATUS_MESSAGE: &str = "Agent requires user input";
+
+/// How long to wait, after a lone Escape byte is written to the PTY of an agent in the middle of
+/// a turn, for further plugin activity before concluding it interrupted the turn. Claude Code
+/// reports no `Stop` when Escape interrupts it. See `observe_escape_write`.
+pub const ESCAPE_TURN_END_WINDOW: Duration = CTRL_C_CANCEL_WINDOW;
+
+/// How many nested session ids (see [`CLIAgentSessionContext::nested_session_ids`]) are kept.
+const MAX_NESTED_SESSION_IDS: usize = 16;
 
 /// What caused a session to become [`CLIAgentSessionStatus::Blocked`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,17 +89,31 @@ pub struct CLIAgentSessionContext {
     pub summary: Option<String>,
     pub query: Option<String>,
     pub response: Option<String>,
-    /// The session id this agent instance would be resumed with: the first id reported, replaced
-    /// only by a later `SessionStart` (the same agent switching sessions, e.g. after `/clear` or
-    /// an in-session `/resume`). Unlike `session_id`, it ignores ids reported on other events,
-    /// which can come from a nested headless run (e.g. `claude -p` inside Claude Code) writing to
-    /// the same terminal.
+    /// The session id this agent instance would be resumed with. It follows the agent switching
+    /// sessions (`/clear`, which the plugin reports only through the new id's own events, or an
+    /// in-session `/resume`, reported by a `SessionStart`), but not nested runs of the agent
+    /// (e.g. `claude -p` started by its shell tool) writing to the same terminal: their
+    /// `SessionStart` arrives during a turn, and their ids are kept in `nested_session_ids`.
+    /// Unlike `session_id`, it ignores other agents' events.
     pub resume_session_id: Option<String>,
     /// The first `cwd` reported for `resume_session_id`. Unlike `cwd`, it doesn't follow the
     /// agent around, so it identifies where the session can be resumed from.
     pub launch_cwd: Option<String>,
     /// Transcript file for `resume_session_id`, when the plugin has reported it.
     pub transcript_path: Option<String>,
+    /// Whether the `resume_session_id` session is in the middle of a turn: a prompt was submitted
+    /// and the agent hasn't stopped since.
+    pub resume_turn_in_progress: bool,
+    /// Whether `query` was last written by an event from another session than
+    /// `resume_session_id` (a nested run or another agent), so it doesn't describe that session.
+    pub query_from_other_session: bool,
+    /// Ids announced by a `SessionStart` during a turn: nested runs of the agent, whose events
+    /// don't switch `resume_session_id` unless they show a prompt only an interactive session
+    /// shows. Oldest first, at most [`MAX_NESTED_SESSION_IDS`].
+    pub nested_session_ids: VecDeque<String>,
+    /// Whether the agent showed a prompt only an interactive session shows (an idle prompt or a
+    /// permission request), unlike e.g. `claude -p` run by a script.
+    pub showed_interactive_prompt: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -165,9 +190,52 @@ impl CLIAgentSessionContext {
             .map(str::to_owned)
     }
 
+    /// Whether an event of `event_type` from the same agent that reports `session_id` switches
+    /// the resume identity to that session. A `SessionStart` with a new id during a turn comes
+    /// from a nested run, whose id is remembered so its later events are ignored too. Any other
+    /// event with an id that wasn't announced that way comes from the agent itself having
+    /// switched sessions (`/clear` reports no `SessionStart`). A nested id is adopted once it
+    /// shows a prompt that headless runs (`claude -p`) never show.
+    fn adopts_reported_session(
+        &mut self,
+        session_id: &str,
+        event_type: &CLIAgentEventType,
+    ) -> bool {
+        match self.resume_session_id.as_deref() {
+            None => return true,
+            Some(current) if current == session_id => return false,
+            Some(_) => {}
+        }
+        let nested = self.nested_session_ids.iter().any(|id| id == session_id);
+        let adopts = match event_type {
+            CLIAgentEventType::SessionStart => {
+                if self.resume_turn_in_progress && !nested {
+                    self.nested_session_ids.push_back(session_id.to_owned());
+                    while self.nested_session_ids.len() > MAX_NESTED_SESSION_IDS {
+                        self.nested_session_ids.pop_front();
+                    }
+                }
+                !self.resume_turn_in_progress
+            }
+            CLIAgentEventType::IdlePrompt | CLIAgentEventType::PermissionRequest => true,
+            CLIAgentEventType::PromptSubmit
+            | CLIAgentEventType::ToolComplete
+            | CLIAgentEventType::Stop
+            | CLIAgentEventType::StopFailure
+            | CLIAgentEventType::PermissionReplied
+            | CLIAgentEventType::QuestionAsked
+            | CLIAgentEventType::NeedsInput
+            | CLIAgentEventType::Unknown(_) => !nested,
+        };
+        if adopts {
+            self.nested_session_ids.retain(|id| id != session_id);
+        }
+        adopts
+    }
+
     /// Updates the resume identity from an event that reported `session_id` (after `cwd` was
-    /// updated from it). `replaces_session` is set for `SessionStart`, the only event that may
-    /// switch an agent instance to another session once it has one.
+    /// updated from it). `replaces_session` says whether the event may switch an agent instance
+    /// that already has a session to `session_id` (see [`Self::adopts_reported_session`]).
     fn sync_resume_identity(
         &mut self,
         session_id: Option<&str>,
@@ -183,11 +251,13 @@ impl CLIAgentSessionContext {
         if self.resume_session_id != previous_session_id {
             self.launch_cwd = None;
             self.transcript_path = None;
+            self.resume_turn_in_progress = false;
             // Prompts and tool state from the previous session don't describe the new one. The
             // first id reported for a session that was detected from its command is the same
             // session, so its state is kept.
             if previous_session_id.is_some() {
                 self.query = None;
+                self.query_from_other_session = false;
                 self.response = None;
                 self.summary = None;
                 self.tool_name = None;
@@ -284,6 +354,59 @@ impl CLIAgentSession {
         self.session_context.tool_input_preview = None;
     }
 
+    /// Updates the session that crash recovery would resume from `event`, and returns whether the
+    /// event belongs to that session. Another agent's events (e.g. from a nested `codex exec`)
+    /// never do, and events that don't name their agent never switch sessions. See
+    /// [`CLIAgentSessionContext::adopts_reported_session`] for when the agent's own events do.
+    fn sync_resume_identity_from_event(&mut self, event: &CLIAgentEvent) -> bool {
+        let same_agent = event.agent == self.agent;
+        if !same_agent && event.agent != CLIAgent::Unknown {
+            return false;
+        }
+        let context = &mut self.session_context;
+        let replaces_session = same_agent
+            && event.session_id.as_deref().is_some_and(|session_id| {
+                context.adopts_reported_session(session_id, &event.event)
+            });
+        context.sync_resume_identity(
+            event.session_id.as_deref(),
+            replaces_session,
+            event.payload.transcript_path.as_deref(),
+        );
+        let from_resumed_session = event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| context.resume_session_id.as_deref() == Some(session_id));
+        if from_resumed_session {
+            match &event.event {
+                // Tool and permission events only happen during a turn, so they also reopen one
+                // that was taken for interrupted (see `observe_escape_write`).
+                CLIAgentEventType::PromptSubmit
+                | CLIAgentEventType::ToolComplete
+                | CLIAgentEventType::PermissionRequest
+                | CLIAgentEventType::PermissionReplied
+                | CLIAgentEventType::QuestionAsked => context.resume_turn_in_progress = true,
+                // With background work pending, the agent wakes itself again to finish the turn.
+                CLIAgentEventType::Stop if event.payload.has_pending_background_work() => {}
+                CLIAgentEventType::Stop
+                | CLIAgentEventType::StopFailure
+                | CLIAgentEventType::IdlePrompt => context.resume_turn_in_progress = false,
+                CLIAgentEventType::SessionStart
+                | CLIAgentEventType::NeedsInput
+                | CLIAgentEventType::Unknown(_) => {}
+            }
+            if same_agent
+                && matches!(
+                    event.event,
+                    CLIAgentEventType::IdlePrompt | CLIAgentEventType::PermissionRequest
+                )
+            {
+                context.showed_interactive_prompt = true;
+            }
+        }
+        from_resumed_session
+    }
+
     /// Applies an event to this session, updating context and status.
     /// Returns the new status if it changed, or `None` if the event was irrelevant.
     fn apply_event(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
@@ -296,11 +419,15 @@ impl CLIAgentSession {
             .session_id
             .clone()
             .or(self.session_context.session_id.take());
-        self.session_context.sync_resume_identity(
-            event.session_id.as_deref(),
-            matches!(event.event, CLIAgentEventType::SessionStart),
-            event.payload.transcript_path.as_deref(),
-        );
+        let from_resumed_session = self.sync_resume_identity_from_event(event);
+        if matches!(
+            event.event,
+            CLIAgentEventType::PromptSubmit
+                | CLIAgentEventType::Stop
+                | CLIAgentEventType::StopFailure
+        ) {
+            self.session_context.query_from_other_session = !from_resumed_session;
+        }
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
@@ -464,6 +591,41 @@ struct CtrlCCancelState {
     /// still matches when it fires, so a stale callback racing a disarming event
     /// is a no-op instead of overwriting that event's status with `Cancelled`.
     armed_token: Option<u64>,
+    /// Timer that ends the turn after a lone Escape went unanswered. See `observe_escape_write`.
+    pending_turn_end: Option<SpawnedFutureHandle>,
+    /// Identifies the window `pending_turn_end` belongs to, like `armed_token`.
+    turn_end_token: Option<u64>,
+}
+
+/// What a pane does with the agent session it claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CLIAgentResumeClaimKind {
+    /// The pane is resuming the session: the resume is queued or its commands were sent.
+    Resuming,
+    /// The pane tracks the session and persists it.
+    Tracking,
+}
+
+/// An agent session a pane resumes or tracks, so that no other pane resumes it too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CLIAgentResumeClaim {
+    pub agent: CLIAgent,
+    pub session_id: String,
+    pub kind: CLIAgentResumeClaimKind,
+}
+
+struct PaneResumeClaim {
+    /// Claims of panes that no longer exist are ignored.
+    pane: WeakViewHandle<TerminalView>,
+    claim: CLIAgentResumeClaim,
+}
+
+impl PaneResumeClaim {
+    /// Unlike upgrading `pane`, this also holds while the pane is being updated, e.g. when it
+    /// runs another pane's update.
+    fn pane_exists(&self, ctx: &AppContext) -> bool {
+        self.pane.window_id(ctx).is_some()
+    }
 }
 
 /// Singleton model that tracks pane-scoped CLI agent state and plugin-enriched session context.
@@ -477,6 +639,8 @@ pub struct CLIAgentSessionsModel {
     /// Source of `CtrlCCancelState::armed_token` values. Monotonically increasing;
     /// never reused, so a stale callback can never alias a newer window.
     next_ctrl_c_token: u64,
+    /// The session each pane resumes or tracks, keyed by terminal view.
+    resume_claims: HashMap<EntityId, PaneResumeClaim>,
 }
 
 impl Entity for CLIAgentSessionsModel {
@@ -492,11 +656,66 @@ impl CLIAgentSessionsModel {
             plugin_auto_failures: HashSet::new(),
             ctrl_c_cancel_state: HashMap::new(),
             next_ctrl_c_token: 0,
+            resume_claims: HashMap::new(),
         }
     }
 
     pub fn session(&self, terminal_view_id: EntityId) -> Option<&CLIAgentSession> {
         self.sessions.get(&terminal_view_id)
+    }
+
+    /// Whether `agent`'s session `session_id` is open in a pane other than `terminal_view_id`,
+    /// so resuming it there would run it twice.
+    pub fn is_session_open_elsewhere(
+        &self,
+        terminal_view_id: EntityId,
+        agent: CLIAgent,
+        session_id: &str,
+    ) -> bool {
+        self.sessions.iter().any(|(view_id, session)| {
+            *view_id != terminal_view_id
+                && session.agent == agent
+                && session.session_context.resume_session_id.as_deref() == Some(session_id)
+        })
+    }
+
+    /// Records the agent session `pane` resumes or tracks (`None` when it does neither), so other
+    /// panes don't resume it too. Forgets the claims of panes that no longer exist.
+    pub(crate) fn set_resume_claim(
+        &mut self,
+        pane: WeakViewHandle<TerminalView>,
+        claim: Option<CLIAgentResumeClaim>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let pane_id = pane.id();
+        self.resume_claims
+            .retain(|view_id, existing| *view_id != pane_id && existing.pane_exists(ctx));
+        if let Some(claim) = claim {
+            self.resume_claims
+                .insert(pane_id, PaneResumeClaim { pane, claim });
+        }
+    }
+
+    /// How another existing pane than `terminal_view_id` claims `agent`'s session
+    /// `session_id`, if one does.
+    pub(crate) fn resume_claim_elsewhere(
+        &self,
+        terminal_view_id: EntityId,
+        agent: CLIAgent,
+        session_id: &str,
+        ctx: &AppContext,
+    ) -> Option<CLIAgentResumeClaimKind> {
+        self.resume_claims
+            .iter()
+            .filter(|(view_id, pane_claim)| {
+                **view_id != terminal_view_id
+                    && pane_claim.claim.agent == agent
+                    && pane_claim.claim.session_id == session_id
+                    && pane_claim.pane_exists(ctx)
+            })
+            .map(|(_, pane_claim)| pane_claim.claim.kind)
+            // A pane that tracks the session already runs it.
+            .max_by_key(|kind| matches!(kind, CLIAgentResumeClaimKind::Tracking))
     }
 
     /// Returns `true` if the rich input editor is currently open for this terminal.
@@ -581,6 +800,7 @@ impl CLIAgentSessionsModel {
 
     pub fn remove_session(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         self.abort_pending_cancel(terminal_view_id);
+        self.abort_pending_turn_end(terminal_view_id);
         self.ctrl_c_cancel_state.remove(&terminal_view_id);
         if let Some(session) = self.sessions.remove(&terminal_view_id) {
             ctx.emit(CLIAgentSessionsModelEvent::Ended {
@@ -617,6 +837,8 @@ impl CLIAgentSessionsModel {
         if !matches!(event.event, CLIAgentEventType::IdlePrompt) {
             self.abort_pending_cancel(terminal_view_id);
         }
+        // Any report from the agent settles the turn state itself.
+        self.abort_pending_turn_end(terminal_view_id);
         if matches!(event.event, CLIAgentEventType::PromptSubmit) {
             self.ctrl_c_cancel_state
                 .entry(terminal_view_id)
@@ -766,6 +988,81 @@ impl CLIAgentSessionsModel {
         self.force_cancel(terminal_view_id, ctx);
     }
 
+    /// Observes a lone Escape byte (`0x1b`) written to this session's PTY. Like Ctrl-C, Escape
+    /// interrupts a Claude Code turn without any hook firing, which would leave the turn open
+    /// forever and make the session's own later `SessionStart` (an in-session `/resume`) look
+    /// like a nested run. If the session is in the middle of a turn, arms a grace window after
+    /// which the turn counts as over unless the agent reports anything first. Only the turn
+    /// changes: Escape also dismisses menus, so the status is left alone.
+    pub fn observe_escape_write(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.observe_escape_write_with_window(terminal_view_id, ESCAPE_TURN_END_WINDOW, ctx);
+    }
+
+    fn observe_escape_write_with_window(
+        &mut self,
+        terminal_view_id: EntityId,
+        window: Duration,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let in_turn = self.sessions.get(&terminal_view_id).is_some_and(|session| {
+            session.supports_rich_status() && session.session_context.resume_turn_in_progress
+        });
+        if !in_turn
+            || self
+                .ctrl_c_cancel_state
+                .get(&terminal_view_id)
+                .is_some_and(|state| state.pending_turn_end.is_some())
+        {
+            return;
+        }
+        let token = self.next_ctrl_c_token;
+        self.next_ctrl_c_token = self.next_ctrl_c_token.saturating_add(1);
+        let handle = ctx.spawn_abortable(
+            async move { warpui::r#async::Timer::after(window).await },
+            move |model, _, _| model.resolve_pending_turn_end(terminal_view_id, token),
+            |_, _| {},
+        );
+        let state = self
+            .ctrl_c_cancel_state
+            .entry(terminal_view_id)
+            .or_default();
+        state.pending_turn_end = Some(handle);
+        state.turn_end_token = Some(token);
+    }
+
+    fn resolve_pending_turn_end(&mut self, terminal_view_id: EntityId, token: u64) {
+        let owns_current_window = self
+            .ctrl_c_cancel_state
+            .get_mut(&terminal_view_id)
+            .is_some_and(|state| {
+                if state.turn_end_token != Some(token) {
+                    return false;
+                }
+                state.pending_turn_end = None;
+                state.turn_end_token = None;
+                true
+            });
+        if !owns_current_window {
+            return;
+        }
+        if let Some(session) = self.sessions.get_mut(&terminal_view_id) {
+            session.session_context.resume_turn_in_progress = false;
+        }
+    }
+
+    fn abort_pending_turn_end(&mut self, terminal_view_id: EntityId) {
+        if let Some(state) = self.ctrl_c_cancel_state.get_mut(&terminal_view_id) {
+            state.turn_end_token = None;
+            if let Some(handle) = state.pending_turn_end.take() {
+                handle.abort();
+            }
+        }
+    }
+
     /// Aborts and clears any armed pending-cancel window for this terminal.
     /// Invalidates the token so a callback already queued when the abort
     /// fires too late to matter (see `resolve_pending_cancel`) is a no-op.
@@ -793,6 +1090,8 @@ impl CLIAgentSessionsModel {
         }
 
         session.status = CLIAgentSessionStatus::Cancelled;
+        // The interrupted turn is over, so `/clear` or an in-session `/resume` may follow.
+        session.session_context.resume_turn_in_progress = false;
         let agent = session.agent;
         let session_context = Box::new(session.session_context.clone());
         ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
@@ -886,6 +1185,7 @@ impl CLIAgentSessionsModel {
         // A fresh session must re-observe `prompt_submit` before Ctrl-C can
         // arm, and any pending window belonged to the session being replaced.
         self.abort_pending_cancel(terminal_view_id);
+        self.abort_pending_turn_end(terminal_view_id);
         self.ctrl_c_cancel_state.remove(&terminal_view_id);
         if let Some(old) = self.sessions.insert(terminal_view_id, session) {
             ctx.emit(CLIAgentSessionsModelEvent::Ended {

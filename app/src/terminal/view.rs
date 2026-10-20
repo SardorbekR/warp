@@ -10040,11 +10040,29 @@ impl TerminalView {
 
         let bytes = data.into();
         let bytes_vec = bytes.to_vec();
+        let is_lone_escape = bytes_vec == [escape_sequences::C0::ESC];
         self.clear_selected_blocks(ctx);
         self.update_scroll_position_locking(ScrollPositionUpdate::AfterWriteUserBytesToPty, ctx);
         self.write_to_pty(bytes, ctx);
         self.emit_non_editor_typed_event(bytes_vec, ctx);
+        if is_lone_escape {
+            self.observe_escape_write_for_cli_agent(ctx);
+        }
         true
+    }
+
+    /// Escape interrupts a CLI agent's turn without the agent reporting it; see
+    /// `CLIAgentSessionsModel::observe_escape_write`.
+    fn observe_escape_write_for_cli_agent(&mut self, ctx: &mut ViewContext<Self>) {
+        let terminal_view_id = self.view_id;
+        let in_turn = CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_id)
+            .is_some_and(|session| session.session_context.resume_turn_in_progress);
+        if in_turn {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.observe_escape_write(terminal_view_id, ctx);
+            });
+        }
     }
 
     /// Write to the PTY if the session has finished bootstrapping and
@@ -20039,6 +20057,7 @@ impl TerminalView {
         }
 
         self.rich_content_views.clear();
+        self.on_block_list_cleared_for_cli_agent_restore(ctx);
 
         self.update_input_prompt_suggestions_banner_state(ctx);
 

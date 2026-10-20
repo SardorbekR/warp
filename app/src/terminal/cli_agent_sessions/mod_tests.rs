@@ -1600,8 +1600,14 @@ fn new_session_id_resets_launch_cwd_and_transcript_path() {
         Some("/repo/sub"),
         CLIAgentEventPayload::default(),
     ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("abc"),
+        Some("/repo/sub"),
+        CLIAgentEventPayload::default(),
+    ));
 
-    // e.g. `/resume` of another session from a subdirectory.
+    // e.g. `/resume` of another session from a subdirectory, between turns.
     session.apply_event(&session_event(
         CLIAgentEventType::SessionStart,
         Some("def"),
@@ -1619,6 +1625,202 @@ fn new_session_id_resets_launch_cwd_and_transcript_path() {
         Some("/repo/sub")
     );
     assert_eq!(session.session_context.transcript_path, None);
+}
+
+fn event_from(agent: CLIAgent, event: CLIAgentEventType, session_id: &str) -> CLIAgentEvent {
+    CLIAgentEvent {
+        agent,
+        ..session_event(
+            event,
+            Some(session_id),
+            Some("/elsewhere"),
+            CLIAgentEventPayload {
+                query: Some(format!("{agent:?} prompt")),
+                transcript_path: Some(format!("/t/{session_id}.jsonl")),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// A Claude session "main" in `/repo` that is in the middle of a turn.
+fn session_mid_turn() -> CLIAgentSession {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("fix the build".to_owned()),
+            ..Default::default()
+        },
+    ));
+    session
+}
+
+#[test]
+fn nested_session_start_during_a_turn_keeps_the_resume_identity() {
+    let mut session = session_mid_turn();
+    assert!(session.session_context.resume_turn_in_progress);
+
+    // The agent's shell tool runs `claude -p …` (or `claude -p --resume other …`), whose
+    // plugin reports its own session to the same terminal.
+    for event in [
+        CLIAgentEventType::SessionStart,
+        CLIAgentEventType::PromptSubmit,
+        CLIAgentEventType::Stop,
+    ] {
+        session.apply_event(&event_from(CLIAgent::Claude, event, "nested"));
+    }
+    let context = &session.session_context;
+    assert_eq!(context.resume_session_id.as_deref(), Some("main"));
+    assert_eq!(context.launch_cwd.as_deref(), Some("/repo"));
+    assert_eq!(context.transcript_path, None);
+    assert!(context.query_from_other_session);
+    assert!(
+        context.resume_turn_in_progress,
+        "the nested run's stop doesn't end the main turn"
+    );
+
+    // Another nested run in the same turn is ignored too.
+    session.apply_event(&event_from(
+        CLIAgent::Claude,
+        CLIAgentEventType::SessionStart,
+        "nested2",
+    ));
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("main")
+    );
+
+    // Once the main session stops, an in-session `/resume` switches sessions.
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("fix the build".to_owned()),
+            ..Default::default()
+        },
+    ));
+    assert!(!session.session_context.query_from_other_session);
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("cleared"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("cleared")
+    );
+    assert!(!session.session_context.resume_turn_in_progress);
+}
+
+#[test]
+fn stop_with_background_work_keeps_the_turn_open() {
+    let mut session = session_mid_turn();
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            pending_background_work_count: Some(1),
+            ..Default::default()
+        },
+    ));
+    // e.g. a background shell task runs `claude -p`.
+    session.apply_event(&event_from(
+        CLIAgent::Claude,
+        CLIAgentEventType::SessionStart,
+        "nested",
+    ));
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("main")
+    );
+}
+
+#[test]
+fn idle_prompt_ends_the_turn() {
+    let mut session = session_mid_turn();
+    session.apply_event(&session_event(
+        CLIAgentEventType::IdlePrompt,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert!(!session.session_context.resume_turn_in_progress);
+}
+
+#[test]
+fn other_agents_events_never_change_the_resume_identity() {
+    // `codex exec` run by Claude's shell tool reports Codex events (`task_started` is a
+    // `SessionStart`) through Claude's listener, even between Claude's turns.
+    let mut session = session_mid_turn();
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    for event in [
+        CLIAgentEventType::SessionStart,
+        CLIAgentEventType::PromptSubmit,
+        CLIAgentEventType::Stop,
+    ] {
+        session.apply_event(&event_from(CLIAgent::Codex, event, "codex-thread"));
+    }
+    let context = &session.session_context;
+    assert_eq!(context.resume_session_id.as_deref(), Some("main"));
+    assert_eq!(context.launch_cwd.as_deref(), Some("/repo"));
+    assert_eq!(context.transcript_path, None);
+    assert!(context.query_from_other_session);
+    assert!(!context.resume_turn_in_progress);
+    // The live id still follows events, as before.
+    assert_eq!(context.session_id.as_deref(), Some("codex-thread"));
+}
+
+#[test]
+fn ctrl_c_cancel_ends_the_turn() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(view_id, session_mid_turn(), ctx);
+            // What the Ctrl-C grace window does when the agent doesn't report back.
+            m.force_cancel(view_id, ctx);
+        });
+        model.read(&app, |m, _| {
+            let session = m.session(view_id).expect("session is registered");
+            assert_eq!(session.status, CLIAgentSessionStatus::Cancelled);
+            assert!(!session.session_context.resume_turn_in_progress);
+        });
+    });
+}
+
+#[test]
+fn sessions_open_in_other_panes_are_found_by_resume_id() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let pane = EntityId::new();
+        let other_pane = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(other_pane, session_mid_turn(), ctx);
+        });
+        model.read(&app, |m, _| {
+            assert!(m.is_session_open_elsewhere(pane, CLIAgent::Claude, "main"));
+            assert!(!m.is_session_open_elsewhere(other_pane, CLIAgent::Claude, "main"));
+            assert!(!m.is_session_open_elsewhere(pane, CLIAgent::Codex, "main"));
+            assert!(!m.is_session_open_elsewhere(pane, CLIAgent::Claude, "other"));
+        });
+    });
 }
 
 #[test]
@@ -1643,7 +1845,14 @@ fn nested_agent_ids_do_not_change_the_resume_identity() {
         },
     ));
 
-    // e.g. a `claude -p` run by the agent's own shell tool reports its own session.
+    // e.g. a `claude -p` run by the agent's own shell tool announces and reports its own
+    // session.
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("nested"),
+        Some("/tmp/scratch"),
+        CLIAgentEventPayload::default(),
+    ));
     session.apply_event(&session_event(
         CLIAgentEventType::Stop,
         Some("nested"),
@@ -1726,13 +1935,18 @@ fn new_session_id_resets_prompt_and_tool_state() {
     ));
     session.session_context.query = Some("old prompt".to_owned());
 
-    // `/clear` starts a new session: the old prompt no longer describes it.
+    // `/clear` starts a new session, first reported by its prompt: the old prompt no longer
+    // describes it.
     session.apply_event(&session_event(
-        CLIAgentEventType::SessionStart,
+        CLIAgentEventType::PromptSubmit,
         Some("def"),
         Some("/repo"),
         CLIAgentEventPayload::default(),
     ));
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("def")
+    );
     assert_eq!(session.session_context.query, None);
     assert_eq!(session.session_context.summary, None);
     assert_eq!(session.session_context.tool_name, None);
@@ -1805,14 +2019,20 @@ fn identity_change_on_any_event_emits_session_updated() {
         });
         assert_eq!(updates.get(), 1, "an unchanged identity emits nothing");
 
-        // Another id on a non-`SessionStart` event (e.g. a nested headless run) doesn't change
-        // the identity.
+        // Another id on an event that doesn't otherwise announce anything (e.g. the first stop
+        // after `/clear`, which reports no `SessionStart`) changes it.
+        let stop = session_event(
+            CLIAgentEventType::Stop,
+            Some("cleared"),
+            Some("/repo"),
+            CLIAgentEventPayload::default(),
+        );
         model.update(&mut app, |m, ctx| {
-            m.update_from_event(view_id, &idle("nested"), ctx);
+            m.update_from_event(view_id, &stop, ctx);
         });
-        assert_eq!(updates.get(), 1);
+        assert_eq!(updates.get(), 2);
 
-        // A `SessionStart` with another id (e.g. `/clear`) does.
+        // So does a `SessionStart` with another id between turns (an in-session `/resume`).
         let session_start = session_event(
             CLIAgentEventType::SessionStart,
             Some("def"),
@@ -1822,6 +2042,368 @@ fn identity_change_on_any_event_emits_session_updated() {
         model.update(&mut app, |m, ctx| {
             m.update_from_event(view_id, &session_start, ctx);
         });
-        assert_eq!(updates.get(), 2);
+        assert_eq!(updates.get(), 3);
+    });
+}
+
+/// A notification as the claude-code-warp plugin (2.4.0) sends it: the common fields its
+/// `build_payload` adds, plus the event's own.
+fn plugin_notification(event: &str, session_id: &str, fields: serde_json::Value) -> CLIAgentEvent {
+    let mut body = serde_json::json!({
+        "v": 1,
+        "agent": "claude",
+        "event": event,
+        "session_id": session_id,
+        "cwd": "/repo",
+        "project": "repo",
+    });
+    if let (Some(body), Some(fields)) = (body.as_object_mut(), fields.as_object()) {
+        body.extend(fields.clone());
+    }
+    parse_event(Some("warp://cli-agent"), &body.to_string()).expect("plugin notifications parse")
+}
+
+/// `on-session-start.sh`. Its hook only matches `startup|resume`: `/clear` and compaction send
+/// nothing.
+fn session_start(session_id: &str) -> CLIAgentEvent {
+    plugin_notification(
+        "session_start",
+        session_id,
+        serde_json::json!({ "plugin_version": "2.4.0" }),
+    )
+}
+
+fn prompt_submit(session_id: &str, prompt: &str) -> CLIAgentEvent {
+    plugin_notification(
+        "prompt_submit",
+        session_id,
+        serde_json::json!({ "query": prompt }),
+    )
+}
+
+fn tool_complete(session_id: &str) -> CLIAgentEvent {
+    plugin_notification(
+        "tool_complete",
+        session_id,
+        serde_json::json!({ "tool_name": "Bash" }),
+    )
+}
+
+/// `on-stop.sh`; `background_tasks` counts e.g. a dev server the agent left running.
+fn stop(session_id: &str, prompt: &str, background_tasks: u32) -> CLIAgentEvent {
+    plugin_notification(
+        "stop",
+        session_id,
+        serde_json::json!({
+            "query": prompt,
+            "response": "Done.",
+            "transcript_path": format!("/home/me/.claude/projects/repo/{session_id}.jsonl"),
+            "background_task_count": background_tasks,
+            "session_cron_count": 0,
+        }),
+    )
+}
+
+fn idle_prompt(session_id: &str) -> CLIAgentEvent {
+    plugin_notification(
+        "idle_prompt",
+        session_id,
+        serde_json::json!({ "summary": "Claude is waiting for your input" }),
+    )
+}
+
+fn permission_request(session_id: &str) -> CLIAgentEvent {
+    plugin_notification(
+        "permission_request",
+        session_id,
+        serde_json::json!({
+            "summary": "Wants to run Bash: npm test",
+            "tool_name": "Bash",
+            "tool_input": { "command": "npm test" },
+        }),
+    )
+}
+
+fn apply_all(session: &mut CLIAgentSession, events: &[CLIAgentEvent]) {
+    for event in events {
+        session.apply_event(event);
+    }
+}
+
+/// An interactive Claude session `old` that finished a turn and waits for the next prompt.
+fn idle_claude_session() -> CLIAgentSession {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    apply_all(
+        &mut session,
+        &[
+            session_start("old"),
+            prompt_submit("old", "fix the build"),
+            tool_complete("old"),
+            stop("old", "fix the build", 0),
+        ],
+    );
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some("old")
+    );
+    assert!(!session.session_context.resume_turn_in_progress);
+    session
+}
+
+/// An interactive Claude session `old` in the middle of a turn.
+fn claude_session_mid_turn() -> CLIAgentSession {
+    let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
+    apply_all(
+        &mut session,
+        &[session_start("old"), prompt_submit("old", "fix the build")],
+    );
+    assert!(session.session_context.resume_turn_in_progress);
+    session
+}
+
+fn assert_resumes(session: &CLIAgentSession, session_id: &str) {
+    assert_eq!(
+        session.session_context.resume_session_id.as_deref(),
+        Some(session_id)
+    );
+}
+
+#[test]
+fn clear_while_idle_switches_to_the_new_session() {
+    let mut session = idle_claude_session();
+    // `/clear`: the new session first shows up in its own prompt.
+    apply_all(
+        &mut session,
+        &[
+            prompt_submit("cleared", "start over"),
+            tool_complete("cleared"),
+        ],
+    );
+    assert_resumes(&session, "cleared");
+    assert!(session.session_context.resume_turn_in_progress);
+    assert_eq!(session.session_context.query.as_deref(), Some("start over"));
+    assert!(!session.session_context.query_from_other_session);
+
+    session.apply_event(&stop("cleared", "start over", 0));
+    let context = &session.session_context;
+    assert_resumes(&session, "cleared");
+    assert_eq!(context.launch_cwd.as_deref(), Some("/repo"));
+    assert_eq!(
+        context.transcript_path.as_deref(),
+        Some("/home/me/.claude/projects/repo/cleared.jsonl")
+    );
+    assert!(!context.resume_turn_in_progress);
+}
+
+#[test]
+fn clear_after_escape_switches_to_the_new_session() {
+    // Escape interrupted the turn, which reports no stop, so the turn still looks open.
+    let mut session = claude_session_mid_turn();
+    session.apply_event(&prompt_submit("cleared", "start over"));
+    assert_resumes(&session, "cleared");
+}
+
+#[test]
+fn clear_with_a_background_task_running_switches_to_the_new_session() {
+    let mut session = claude_session_mid_turn();
+    // A dev server the agent started keeps running, so every stop has background work.
+    session.apply_event(&stop("old", "fix the build", 1));
+    assert!(session.session_context.resume_turn_in_progress);
+
+    session.apply_event(&prompt_submit("cleared", "start over"));
+    assert_resumes(&session, "cleared");
+    session.apply_event(&stop("cleared", "start over", 1));
+    assert_resumes(&session, "cleared");
+}
+
+#[test]
+fn in_session_resume_while_idle_switches_to_the_picked_session() {
+    let mut session = idle_claude_session();
+    apply_all(
+        &mut session,
+        &[session_start("picked"), prompt_submit("picked", "continue")],
+    );
+    assert_resumes(&session, "picked");
+    assert_eq!(session.session_context.query.as_deref(), Some("continue"));
+}
+
+#[test]
+fn nested_headless_run_during_a_turn_never_switches() {
+    let mut session = claude_session_mid_turn();
+    // The agent's shell tool runs `claude -p "summarize"`.
+    apply_all(
+        &mut session,
+        &[
+            session_start("nested"),
+            prompt_submit("nested", "summarize"),
+            tool_complete("nested"),
+            stop("nested", "summarize", 0),
+        ],
+    );
+    assert_resumes(&session, "old");
+    assert!(
+        session.session_context.resume_turn_in_progress,
+        "the nested run's stop doesn't end the turn"
+    );
+    assert!(session.session_context.query_from_other_session);
+
+    apply_all(
+        &mut session,
+        &[tool_complete("old"), stop("old", "fix the build", 0)],
+    );
+    let context = &session.session_context;
+    assert_resumes(&session, "old");
+    assert!(!context.resume_turn_in_progress);
+    assert!(!context.query_from_other_session);
+    assert_eq!(
+        context.transcript_path.as_deref(),
+        Some("/home/me/.claude/projects/repo/old.jsonl")
+    );
+    assert!(!context.showed_interactive_prompt);
+
+    // A late event from the nested run, after the turn, is still recognized as nested.
+    session.apply_event(&stop("nested", "summarize", 0));
+    assert_resumes(&session, "old");
+}
+
+#[test]
+fn nested_id_is_adopted_once_it_shows_an_idle_prompt() {
+    // Escape interrupted the turn (no stop), then `/resume` picked another session: its
+    // `SessionStart` arrives while the turn still looks open, like a nested run's would.
+    let mut session = claude_session_mid_turn();
+    apply_all(
+        &mut session,
+        &[
+            session_start("picked"),
+            prompt_submit("picked", "continue"),
+            stop("picked", "continue", 0),
+        ],
+    );
+    assert_resumes(&session, "old");
+
+    // Headless runs never sit at an idle prompt.
+    session.apply_event(&idle_prompt("picked"));
+    let context = &session.session_context;
+    assert_resumes(&session, "picked");
+    assert!(!context.resume_turn_in_progress);
+    assert!(context.showed_interactive_prompt);
+    assert!(context.nested_session_ids.is_empty());
+}
+
+#[test]
+fn nested_id_is_adopted_once_it_asks_for_permission() {
+    let mut session = claude_session_mid_turn();
+    apply_all(
+        &mut session,
+        &[session_start("picked"), prompt_submit("picked", "continue")],
+    );
+    assert_resumes(&session, "old");
+
+    // Headless runs never show permission prompts.
+    session.apply_event(&permission_request("picked"));
+    assert_resumes(&session, "picked");
+    assert!(session.session_context.resume_turn_in_progress);
+    assert!(session.session_context.showed_interactive_prompt);
+}
+
+#[test]
+fn idle_prompt_of_the_session_ends_a_turn_left_open() {
+    let mut session = claude_session_mid_turn();
+    session.apply_event(&idle_prompt("old"));
+    assert!(!session.session_context.resume_turn_in_progress);
+    assert!(session.session_context.showed_interactive_prompt);
+    // So an in-session `/resume` switches sessions again.
+    session.apply_event(&session_start("picked"));
+    assert_resumes(&session, "picked");
+}
+
+#[test]
+fn nested_ids_are_bounded() {
+    let mut session = claude_session_mid_turn();
+    for index in 0..20 {
+        session.apply_event(&session_start(&format!("nested-{index}")));
+    }
+    let nested = &session.session_context.nested_session_ids;
+    assert_eq!(nested.len(), 16);
+    assert_eq!(nested.front().map(String::as_str), Some("nested-4"));
+    assert_resumes(&session, "old");
+}
+
+#[test]
+fn unnamed_agents_events_never_switch_sessions() {
+    let mut session = idle_claude_session();
+    let mut event = prompt_submit("other", "hi");
+    event.agent = CLIAgent::Unknown;
+    session.apply_event(&event);
+    assert_resumes(&session, "old");
+}
+
+#[test]
+fn unanswered_escape_ends_the_turn() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(view_id, claude_session_mid_turn(), ctx);
+            m.observe_escape_write_with_window(view_id, TEST_WINDOW, ctx);
+        });
+        Timer::after(TEST_WINDOW + TEST_WINDOW_BUFFER).await;
+
+        model.read(&app, |m, _| {
+            let session = m.session(view_id).expect("session is registered");
+            assert!(!session.session_context.resume_turn_in_progress);
+            assert_eq!(
+                session.status,
+                CLIAgentSessionStatus::InProgress,
+                "Escape may only have closed a menu, so the status is left alone"
+            );
+        });
+        // An in-session `/resume` now switches sessions.
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &session_start("picked"), ctx);
+        });
+        model.read(&app, |m, _| {
+            let session = m.session(view_id).expect("session is registered");
+            assert_resumes(session, "picked");
+        });
+    });
+}
+
+#[test]
+fn agent_activity_after_escape_keeps_the_turn_open() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(view_id, claude_session_mid_turn(), ctx);
+            m.observe_escape_write_with_window(view_id, TEST_WINDOW, ctx);
+            // e.g. Escape closed an autocomplete menu while a tool kept running.
+            m.update_from_event(view_id, &tool_complete("old"), ctx);
+        });
+        Timer::after(TEST_WINDOW + TEST_WINDOW_BUFFER).await;
+
+        model.read(&app, |m, _| {
+            let session = m.session(view_id).expect("session is registered");
+            assert!(session.session_context.resume_turn_in_progress);
+        });
+    });
+}
+
+#[test]
+fn escape_between_turns_arms_nothing() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(view_id, idle_claude_session(), ctx);
+            m.observe_escape_write_with_window(view_id, TEST_WINDOW, ctx);
+        });
+        model.read(&app, |m, _| {
+            assert!(
+                m.ctrl_c_cancel_state
+                    .get(&view_id)
+                    .is_none_or(|state| state.pending_turn_end.is_none())
+            );
+        });
     });
 }

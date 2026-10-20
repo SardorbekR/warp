@@ -33,10 +33,23 @@ pub enum CLIAgentSessionRestoreBannerEvent {
     Dismiss,
 }
 
+/// How the last attempt to resume the session from this pane ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviousResumeAttempt {
+    #[default]
+    NotAttempted,
+    /// The resume commands failed or never ran.
+    Failed,
+    /// The agent exited normally without reporting the session, so it's unknown whether the
+    /// session was resumed.
+    Unconfirmed,
+}
+
 pub struct CLIAgentSessionRestoreBanner {
     record: PersistedCLIAgentSession,
     transcript_missing: bool,
-    previous_resume_failed: bool,
+    launch_directory_missing: bool,
+    previous_resume: PreviousResumeAttempt,
     resume_mouse_state: MouseStateHandle,
     copy_mouse_state: MouseStateHandle,
     dismiss_mouse_state: MouseStateHandle,
@@ -44,11 +57,16 @@ pub struct CLIAgentSessionRestoreBanner {
 }
 
 impl CLIAgentSessionRestoreBanner {
-    pub fn new(record: PersistedCLIAgentSession, previous_resume_failed: bool) -> Self {
+    pub fn new(
+        record: PersistedCLIAgentSession,
+        previous_resume: PreviousResumeAttempt,
+        launch_directory_missing: bool,
+    ) -> Self {
         Self {
             record,
             transcript_missing: false,
-            previous_resume_failed,
+            launch_directory_missing,
+            previous_resume,
             resume_mouse_state: MouseStateHandle::default(),
             copy_mouse_state: MouseStateHandle::default(),
             dismiss_mouse_state: MouseStateHandle::default(),
@@ -65,6 +83,19 @@ impl CLIAgentSessionRestoreBanner {
             self.transcript_missing = transcript_missing;
             ctx.notify();
         }
+    }
+
+    /// Marks the session's launch directory as missing on this machine, which means it ran
+    /// elsewhere, so it can only be copied.
+    pub fn set_launch_directory_missing(&mut self, missing: bool, ctx: &mut ViewContext<Self>) {
+        if self.launch_directory_missing != missing {
+            self.launch_directory_missing = missing;
+            ctx.notify();
+        }
+    }
+
+    fn can_resume_here(&self) -> bool {
+        self.record.can_resume_here() && !self.launch_directory_missing
     }
 
     fn title_text(&self) -> String {
@@ -96,12 +127,23 @@ impl CLIAgentSessionRestoreBanner {
                  to resume it where it ran"
                     .to_owned(),
             );
+        } else if self.launch_directory_missing {
+            details.push(
+                "That directory doesn't exist here; copy the command to resume it where it ran"
+                    .to_owned(),
+            );
         }
         if self.transcript_missing {
             details.push("Transcript not found; resuming may fail".to_owned());
         }
-        if self.previous_resume_failed {
-            details.push("The last resume attempt failed".to_owned());
+        match self.previous_resume {
+            PreviousResumeAttempt::NotAttempted => {}
+            PreviousResumeAttempt::Failed => {
+                details.push("The last resume attempt failed".to_owned());
+            }
+            PreviousResumeAttempt::Unconfirmed => {
+                details.push("Warp couldn't confirm that the last resume worked".to_owned());
+            }
         }
         (!details.is_empty()).then(|| details.join(" · "))
     }
@@ -208,7 +250,7 @@ impl View for CLIAgentSessionRestoreBanner {
             .finish()
         };
         let mut buttons = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        if self.record.can_resume_here() {
+        if self.can_resume_here() {
             buttons.add_child(button(
                 ButtonVariant::Accent,
                 &self.resume_mouse_state,

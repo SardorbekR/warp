@@ -13,43 +13,56 @@
 //!   offers to resume it with an inline banner, and the sidebar can show it. A new agent session
 //!   with activity in the pane supersedes it; Dismiss clears it.
 //! - **ResumeQueued**: a resume was requested and waits for the shell. If it can't run within
-//!   [`RESUME_QUEUE_TIMEOUT`], the record goes back to Interrupted.
+//!   [`RESUME_QUEUE_TIMEOUT`] of the shell bootstrapping (or the shell doesn't bootstrap within
+//!   [`RESUME_BOOTSTRAP_FALLBACK`]), the record goes back to Interrupted.
 //! - **ResumePending**: the resume commands are being typed into the shell one at a time (a `cd`
 //!   to the launch directory, then the agent), each only into an empty input. The record is
 //!   kept, so another crash before the resumed agent reports back still has it. The resume is
 //!   acknowledged once the agent reports the same session id. If a command fails, or nothing ran
 //!   within [`RESUME_ACKNOWLEDGEMENT_TIMEOUT`] (a command still waiting in the input is then
 //!   withdrawn), the record goes back to Interrupted. The agent command's block exiting
-//!   successfully clears the record in any phase.
+//!   successfully once the resume was acknowledged clears the record.
+//!
+//! While a pane resumes or tracks a session, it claims the session in [`CLIAgentSessionsModel`]
+//! so no other pane resumes it too, and other panes stop offering it once it's tracked.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use instant::Instant;
 use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::clipboard::ClipboardContent;
-use warpui::{AppContext, SingletonEntity, ViewContext, ViewHandle};
+use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::{EXECUTE_PENDING_COMMAND_DELAY, Event};
+use crate::settings::CompiledCommandsForCodingAgentToolbar;
+use crate::terminal::cli_agent_sessions::launch_command::runs_through_remote_wrapper;
 use crate::terminal::cli_agent_sessions::restore::{
-    PersistedCLIAgentSession, is_resumable_agent, reported_session_id,
+    LaunchObservation, PersistedCLIAgentSession, is_resumable_agent, reported_session_id,
 };
 use crate::terminal::cli_agent_sessions::restore_save::CLIAgentRestoreSaveScheduler;
-use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentResumeClaim, CLIAgentResumeClaimKind, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
 use crate::terminal::general_settings::GeneralSettings;
 use crate::terminal::shell::ShellType;
 use crate::terminal::view::cli_agent_session_restore_banner::{
-    CLIAgentSessionRestoreBanner, CLIAgentSessionRestoreBannerEvent,
+    CLIAgentSessionRestoreBanner, CLIAgentSessionRestoreBannerEvent, PreviousResumeAttempt,
 };
 use crate::terminal::view::{RichContentInsertionPosition, RichContentMetadata};
 use crate::terminal::{CLIAgent, TerminalView};
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
 
-/// How long a requested resume may wait for the shell before it's offered again.
+/// How long a requested resume may wait for the shell, once it has bootstrapped, before it's
+/// offered again.
 const RESUME_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long sent resume commands may go without running or the agent starting before the
 /// session is offered again. Re-armed while a resume command is still running.
 const RESUME_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a resume queued before the login shell bootstrapped waits for it before the session
+/// is offered again, e.g. when the shell is stuck in its startup files.
+const RESUME_BOOTSTRAP_FALLBACK: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RecoveryPhase {
@@ -71,6 +84,19 @@ enum ResumeStep {
     Agent,
 }
 
+/// Whether the record's launch directory exists on this machine. Checked off the main thread; a
+/// directory that doesn't exist here means the agent ran somewhere else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum LaunchDirectoryCheck {
+    #[default]
+    NotChecked,
+    Checking(String),
+    Checked {
+        launch_cwd: String,
+        exists: bool,
+    },
+}
+
 #[derive(Default)]
 pub(super) struct CLIAgentSessionRestoreState {
     record: Option<PersistedCLIAgentSession>,
@@ -82,15 +108,27 @@ pub(super) struct CLIAgentSessionRestoreState {
     agent_block_active: bool,
     /// Whether this pane has acted on its login shell having bootstrapped.
     shell_ready_handled: bool,
+    /// Whether the banner waits for the login shell to bootstrap, so it isn't inserted among
+    /// the bootstrap output.
     show_banner_after_bootstrap: bool,
     banner: Option<ViewHandle<CLIAgentSessionRestoreBanner>>,
+    /// What the banner says about the last resume attempt, kept for when it's shown again.
+    previous_resume: PreviousResumeAttempt,
+    launch_directory: LaunchDirectoryCheck,
     /// Resume commands that haven't been typed into the shell yet.
     pending_resume_steps: VecDeque<(ResumeStep, String)>,
     /// The resume command handed to the shell (waiting in the input or running), if any.
     in_flight_resume_step: Option<(ResumeStep, String)>,
+    /// Whether the agent started by the resume reported the restored session (or moved on to
+    /// another one), which confirms the resume worked.
+    resume_acknowledged: bool,
     next_resume_step_timer: Option<SpawnedFutureHandle>,
     /// Times out a queued resume, or a sent one that was never acknowledged.
     resume_timer: Option<SpawnedFutureHandle>,
+    /// When a resume queued before the login shell bootstrapped gives up waiting for it.
+    bootstrap_fallback_deadline: Option<Instant>,
+    /// The claim last registered with [`CLIAgentSessionsModel`] for this pane.
+    resume_claim: Option<CLIAgentResumeClaim>,
 }
 
 impl CLIAgentSessionRestoreState {
@@ -116,8 +154,10 @@ pub(crate) enum CLIAgentResumeOutcome {
     Busy,
     /// The input editor has text the user typed, which resuming would overwrite.
     HasDraft,
-    /// The session didn't start from this pane's local shell (e.g. it ran over SSH or in tmux);
-    /// the pane can only show it and copy its command.
+    /// The session is already open in another pane, so resuming it here would run it twice.
+    AlreadyOpen,
+    /// The session didn't start from this pane's local shell (e.g. it ran over SSH or in tmux),
+    /// or its directory doesn't exist here; the pane can only show it and copy its command.
     CopyOnly,
 }
 
@@ -142,17 +182,26 @@ impl TerminalView {
         self.cli_agent_session_restore.record.clone()
     }
 
-    /// The interrupted CLI agent session (e.g. restored after Warp quit or crashed) that can be
-    /// resumed in this pane, if any. Cheap; suitable for calling while rendering. Changes are
-    /// announced with [`Event::TerminalViewStateChanged`]. Only a record for which
-    /// [`PersistedCLIAgentSession::can_resume_here`] holds can be resumed by the pane; others
-    /// are informational.
+    /// The interrupted CLI agent session (e.g. restored after Warp quit or crashed) that this
+    /// pane offers, if any. Cheap; suitable for calling while rendering. Changes are announced
+    /// with [`Event::TerminalViewStateChanged`]. Whether it can be resumed in this pane, rather
+    /// than only copied, is [`Self::can_resume_restored_cli_agent_session_here`].
     pub(crate) fn restorable_cli_agent_session(&self) -> Option<&PersistedCLIAgentSession> {
         let state = &self.cli_agent_session_restore;
         state
             .record
             .as_ref()
             .filter(|_| state.phase == RecoveryPhase::Interrupted)
+    }
+
+    /// Whether the offered session can be resumed in this pane, rather than only copied: it
+    /// started from the pane's local shell and its directory isn't known to be missing here.
+    pub(crate) fn can_resume_restored_cli_agent_session_here(&self) -> bool {
+        self.cli_agent_session_restore
+            .record
+            .as_ref()
+            .is_some_and(PersistedCLIAgentSession::can_resume_here)
+            && self.cli_agent_launch_directory_exists() != Some(false)
     }
 
     /// Moves to `phase`, letting the workspace (e.g. the sidebar) know when the pane starts or
@@ -163,6 +212,92 @@ impl TerminalView {
         state.phase = phase;
         if was_interrupted != (phase == RecoveryPhase::Interrupted) {
             ctx.emit(Event::TerminalViewStateChanged);
+        }
+        self.sync_cli_agent_resume_claim(ctx);
+    }
+
+    /// Registers the session this pane resumes or tracks with [`CLIAgentSessionsModel`], so other
+    /// panes don't resume it too.
+    fn sync_cli_agent_resume_claim(&mut self, ctx: &mut ViewContext<Self>) {
+        let state = &self.cli_agent_session_restore;
+        let kind = match state.phase {
+            RecoveryPhase::Tracking => Some(CLIAgentResumeClaimKind::Tracking),
+            RecoveryPhase::ResumeQueued | RecoveryPhase::ResumePending => {
+                Some(CLIAgentResumeClaimKind::Resuming)
+            }
+            RecoveryPhase::Interrupted => None,
+        };
+        let claim = kind.and_then(|kind| {
+            let record = state.record.as_ref()?;
+            Some(CLIAgentResumeClaim {
+                agent: record.agent,
+                session_id: record.session_id.clone()?,
+                kind,
+            })
+        });
+        if state.resume_claim == claim {
+            return;
+        }
+        self.cli_agent_session_restore.resume_claim = claim.clone();
+        let pane = ctx.handle();
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.set_resume_claim(pane, claim, ctx);
+        });
+    }
+
+    /// The agent and session id of the session this pane offers or is about to resume.
+    fn offered_cli_agent_session_key(&self) -> Option<(CLIAgent, String)> {
+        let state = &self.cli_agent_session_restore;
+        if !matches!(
+            state.phase,
+            RecoveryPhase::Interrupted | RecoveryPhase::ResumeQueued
+        ) {
+            return None;
+        }
+        let record = state.record.as_ref()?;
+        Some((record.agent, record.session_id.clone()?))
+    }
+
+    /// After an event about another pane's agent session, checks whether that pane now tracks
+    /// the session this pane offers. The check waits until every pane has handled the event, so
+    /// the other pane's claim is up to date.
+    fn schedule_cli_agent_offer_check(
+        &mut self,
+        other_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some((agent, session_id)) = self.offered_cli_agent_session_key() else {
+            return;
+        };
+        let other_runs_it = CLIAgentSessionsModel::as_ref(ctx)
+            .session(other_view_id)
+            .is_some_and(|session| {
+                session.agent == agent
+                    && session.session_context.resume_session_id.as_deref()
+                        == Some(session_id.as_str())
+            });
+        if other_runs_it {
+            let _ = ctx.spawn(async {}, |me, _, ctx| {
+                me.drop_cli_agent_offer_tracked_elsewhere(ctx);
+            });
+        }
+    }
+
+    /// Stops offering (and forgets) the session when another pane tracks it, since that pane
+    /// persists it from now on: two panes offering it could both resume it after a crash.
+    fn drop_cli_agent_offer_tracked_elsewhere(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some((agent, session_id)) = self.offered_cli_agent_session_key() else {
+            return;
+        };
+        let tracked_elsewhere = CLIAgentSessionsModel::as_ref(ctx).resume_claim_elsewhere(
+            self.view_id,
+            agent,
+            &session_id,
+            ctx,
+        ) == Some(CLIAgentResumeClaimKind::Tracking);
+        if tracked_elsewhere {
+            log::info!("An offered CLI agent session is now running in another pane");
+            self.clear_cli_agent_session_record(ctx);
         }
     }
 
@@ -177,8 +312,10 @@ impl TerminalView {
         if !is_resumable_agent(record.agent) {
             return;
         }
+        // A headless run (e.g. `claude -p` in a script) is only resumed when asked to.
         let auto_resume = *GeneralSettings::as_ref(ctx).auto_resume_cli_agent_sessions
-            && record.can_resume_here();
+            && record.can_resume_here()
+            && record.evidently_interactive;
         self.remove_cli_agent_session_restore_banner(ctx);
         let was_interrupted = self.cli_agent_session_restore.phase == RecoveryPhase::Interrupted;
         let state = &mut self.cli_agent_session_restore;
@@ -186,41 +323,44 @@ impl TerminalView {
         state.in_flight_resume_step = None;
         state.record = Some(record);
         state.record_is_live_instance = false;
+        state.resume_acknowledged = false;
+        state.show_banner_after_bootstrap = false;
+        state.launch_directory = LaunchDirectoryCheck::NotChecked;
+        self.check_cli_agent_launch_directory(ctx);
         if auto_resume {
-            state.show_banner_after_bootstrap = false;
             self.queue_cli_agent_resume(ctx);
             return;
         }
-        state.show_banner_after_bootstrap = true;
         self.set_cli_agent_recovery_phase(RecoveryPhase::Interrupted, ctx);
         if was_interrupted {
             // Still interrupted, but with another record.
             ctx.emit(Event::TerminalViewStateChanged);
         }
-        if self.cli_agent_session_restore.shell_ready_handled {
-            self.cli_agent_session_restore.show_banner_after_bootstrap = false;
-            self.show_cli_agent_session_restore_banner(false, ctx);
-        }
+        self.show_cli_agent_session_restore_banner(PreviousResumeAttempt::NotAttempted, ctx);
     }
 
     /// Resumes the interrupted CLI agent session in this pane, unless that could disturb
-    /// something: a running or pending command, or text the user typed into the input.
+    /// something: a running or pending command, text the user typed into the input, or the same
+    /// session open in another pane. Before the shell has bootstrapped, the resume is queued and
+    /// these are checked again once it has.
     pub(crate) fn resume_restored_cli_agent_session(
         &mut self,
         ctx: &mut ViewContext<Self>,
     ) -> CLIAgentResumeOutcome {
         let state = &self.cli_agent_session_restore;
-        let Some(record) = state.record.as_ref() else {
-            return CLIAgentResumeOutcome::NothingToResume;
-        };
-        if state.phase != RecoveryPhase::Interrupted {
+        if state.record.is_none() || state.phase != RecoveryPhase::Interrupted {
             return CLIAgentResumeOutcome::NothingToResume;
         }
-        if !record.can_resume_here() {
+        if !self.can_resume_restored_cli_agent_session_here() {
             return CLIAgentResumeOutcome::CopyOnly;
         }
-        if let Some(blocker) = self.cli_agent_resume_blocker(ctx) {
-            return blocker;
+        match self.cli_agent_resume_blocker(ctx) {
+            // The bootstrap itself (or a setup command) makes the pane look busy until the shell
+            // is ready; the queued resume waits for it.
+            Some(CLIAgentResumeOutcome::Busy)
+                if !self.cli_agent_session_restore.shell_ready_handled => {}
+            Some(blocker) => return blocker,
+            None => {}
         }
 
         self.remove_cli_agent_session_restore_banner(ctx);
@@ -230,11 +370,53 @@ impl TerminalView {
         CLIAgentResumeOutcome::Resumed
     }
 
+    /// Resumes the offered session like [`Self::resume_restored_cli_agent_session`], telling the
+    /// user with a toast when it can't.
+    pub(crate) fn resume_restored_cli_agent_session_with_feedback(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let message = match self.resume_restored_cli_agent_session(ctx) {
+            CLIAgentResumeOutcome::Busy => {
+                Some("Can't resume while something is running in this pane")
+            }
+            CLIAgentResumeOutcome::HasDraft => {
+                Some("Clear the input first: resuming would replace what you typed")
+            }
+            CLIAgentResumeOutcome::AlreadyOpen => {
+                Some("This session is already open in another pane")
+            }
+            CLIAgentResumeOutcome::CopyOnly => Some(
+                "This session can't be resumed here; copy its command to resume it where it ran",
+            ),
+            CLIAgentResumeOutcome::Resumed | CLIAgentResumeOutcome::NothingToResume => None,
+        };
+        if let Some(message) = message {
+            self.show_error_toast(message.to_owned(), ctx);
+        }
+    }
+
+    /// Whether the session is running in, being resumed in, or tracked by another pane.
+    fn cli_agent_session_open_elsewhere(&self, ctx: &AppContext) -> bool {
+        let sessions = CLIAgentSessionsModel::as_ref(ctx);
+        let Some(record) = self.cli_agent_session_restore.record.as_ref() else {
+            return false;
+        };
+        record.session_id.as_deref().is_some_and(|session_id| {
+            sessions.is_session_open_elsewhere(self.view_id, record.agent, session_id)
+                || sessions
+                    .resume_claim_elsewhere(self.view_id, record.agent, session_id, ctx)
+                    .is_some()
+        })
+    }
+
     /// Why the resume commands can't be typed into this pane right now, if they can't.
     fn cli_agent_resume_blocker(&self, ctx: &AppContext) -> Option<CLIAgentResumeOutcome> {
-        let busy = CLIAgentSessionsModel::as_ref(ctx)
-            .session(self.view_id)
-            .is_some()
+        if self.cli_agent_session_open_elsewhere(ctx) {
+            return Some(CLIAgentResumeOutcome::AlreadyOpen);
+        }
+        let sessions = CLIAgentSessionsModel::as_ref(ctx);
+        let busy = sessions.session(self.view_id).is_some()
             || self.has_pending_command_or_awaiting_completion(ctx)
             || self.is_long_running();
         if busy {
@@ -247,11 +429,27 @@ impl TerminalView {
         None
     }
 
-    /// Queues the resume and sends it right away if the shell is ready.
+    /// Queues the resume and sends it right away if the shell is ready. A session that another
+    /// pane resumes or runs is offered instead.
     fn queue_cli_agent_resume(&mut self, ctx: &mut ViewContext<Self>) {
-        self.cli_agent_session_restore.cancel_resume();
+        if self.cli_agent_session_open_elsewhere(ctx) {
+            self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::NotAttempted, ctx);
+            return;
+        }
+        let state = &mut self.cli_agent_session_restore;
+        state.cancel_resume();
+        state.resume_acknowledged = false;
         self.set_cli_agent_recovery_phase(RecoveryPhase::ResumeQueued, ctx);
-        self.arm_cli_agent_resume_timer(RESUME_QUEUE_TIMEOUT, ctx);
+        // The queue timeout starts once the shell has bootstrapped: a slow bootstrap isn't a
+        // failure, though one that never finishes is.
+        if self.cli_agent_session_restore.shell_ready_handled {
+            self.arm_cli_agent_resume_timer(RESUME_QUEUE_TIMEOUT, ctx);
+        } else {
+            self.cli_agent_session_restore.bootstrap_fallback_deadline =
+                Instant::now().checked_add(RESUME_BOOTSTRAP_FALLBACK);
+            self.arm_cli_agent_resume_timer(RESUME_BOOTSTRAP_FALLBACK, ctx);
+        }
+        self.check_cli_agent_launch_directory(ctx);
         self.try_send_queued_cli_agent_resume(ctx);
     }
 
@@ -267,9 +465,20 @@ impl TerminalView {
         }
     }
 
-    /// Sends a queued resume once the login shell is ready, or offers the session again if the
-    /// pane became busy or has typed input meanwhile. Otherwise it keeps waiting, until the next
-    /// block completes or the queue times out.
+    /// Tries to send a queued resume after the same short delay as pending commands, since the
+    /// shell may still be running prompt hooks.
+    fn schedule_queued_cli_agent_resume(&mut self, ctx: &mut ViewContext<Self>) {
+        let _ = ctx.spawn(
+            async {
+                Timer::after(EXECUTE_PENDING_COMMAND_DELAY).await;
+            },
+            |me, _, ctx| me.try_send_queued_cli_agent_resume(ctx),
+        );
+    }
+
+    /// Sends a queued resume once the login shell is ready and the launch directory was found.
+    /// While the pane is busy it keeps waiting, for the next block to complete or the queue to
+    /// time out; anything else that blocks it offers the session again.
     fn try_send_queued_cli_agent_resume(&mut self, ctx: &mut ViewContext<Self>) {
         if self.cli_agent_session_restore.phase != RecoveryPhase::ResumeQueued {
             return;
@@ -277,12 +486,32 @@ impl TerminalView {
         if !self.is_login_shell_bootstrapped || self.active_session_shell_type(ctx).is_none() {
             return;
         }
-        if self.cli_agent_resume_blocker(ctx).is_some() {
-            // Never type over a draft or into a busy pane; let the user decide.
-            self.mark_cli_agent_session_interrupted(false, ctx);
-            return;
+        match self.cli_agent_launch_directory_exists() {
+            // Checked off the main thread; the result tries again.
+            None => {
+                self.check_cli_agent_launch_directory(ctx);
+                return;
+            }
+            Some(false) => {
+                self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::NotAttempted, ctx);
+                return;
+            }
+            Some(true) => {}
         }
-        self.send_cli_agent_resume_commands(ctx);
+        match self.cli_agent_resume_blocker(ctx) {
+            None => self.send_cli_agent_resume_commands(ctx),
+            Some(CLIAgentResumeOutcome::Busy) => {}
+            // Never type over a draft or run a session twice; let the user decide.
+            Some(
+                CLIAgentResumeOutcome::HasDraft
+                | CLIAgentResumeOutcome::AlreadyOpen
+                | CLIAgentResumeOutcome::CopyOnly
+                | CLIAgentResumeOutcome::NothingToResume
+                | CLIAgentResumeOutcome::Resumed,
+            ) => {
+                self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::NotAttempted, ctx);
+            }
+        }
     }
 
     /// Starts typing the commands that resume the interrupted session into the shell.
@@ -297,7 +526,7 @@ impl TerminalView {
             .as_ref()
             .and_then(|record| record.resume_command_steps(shell_type, pane_cwd.as_deref()))
         else {
-            self.mark_cli_agent_session_interrupted(true, ctx);
+            self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx);
             return;
         };
         // The agent command is always the last step.
@@ -318,6 +547,7 @@ impl TerminalView {
             .collect();
         state.in_flight_resume_step = None;
         state.agent_block_active = false;
+        state.resume_acknowledged = false;
         self.set_cli_agent_recovery_phase(RecoveryPhase::ResumePending, ctx);
         self.arm_cli_agent_resume_timer(RESUME_ACKNOWLEDGEMENT_TIMEOUT, ctx);
         self.send_next_cli_agent_resume_step(ctx);
@@ -336,7 +566,7 @@ impl TerminalView {
             return;
         };
         if self.cli_agent_resume_blocker(ctx).is_some() {
-            self.mark_cli_agent_session_interrupted(true, ctx);
+            self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx);
             return;
         }
         self.set_pending_command(&command, ctx);
@@ -348,8 +578,27 @@ impl TerminalView {
         self.cli_agent_session_restore.resume_timer = None;
         match self.cli_agent_session_restore.phase {
             RecoveryPhase::ResumeQueued => {
+                let state = &self.cli_agent_session_restore;
+                if !state.shell_ready_handled {
+                    // The queue timeout starts once the shell has bootstrapped, unless it never
+                    // does.
+                    let remaining = state
+                        .bootstrap_fallback_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or_default();
+                    if !remaining.is_zero() {
+                        self.arm_cli_agent_resume_timer(remaining, ctx);
+                        return;
+                    }
+                    log::info!("The shell didn't get ready for a queued CLI agent session resume");
+                    self.mark_cli_agent_session_interrupted(
+                        PreviousResumeAttempt::NotAttempted,
+                        ctx,
+                    );
+                    return;
+                }
                 log::info!("A queued CLI agent session resume never got to run");
-                self.mark_cli_agent_session_interrupted(true, ctx);
+                self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx);
             }
             RecoveryPhase::ResumePending => {
                 let state = &self.cli_agent_session_restore;
@@ -367,7 +616,7 @@ impl TerminalView {
                 } else {
                     log::info!("CLI agent session resume commands never ran");
                     self.withdraw_unsent_cli_agent_resume_command(ctx);
-                    self.mark_cli_agent_session_interrupted(true, ctx);
+                    self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx);
                 }
             }
             RecoveryPhase::Tracking | RecoveryPhase::Interrupted => {}
@@ -392,8 +641,110 @@ impl TerminalView {
         });
     }
 
-    /// Shows the restore banner once the login shell has bootstrapped. Which bootstrap event
-    /// arrives first varies, so this is called from several; only the first call acts.
+    /// Whether the record's launch directory exists on this machine: `None` until checked. A
+    /// record without one is resumed in the pane's directory.
+    fn cli_agent_launch_directory_exists(&self) -> Option<bool> {
+        let state = &self.cli_agent_session_restore;
+        let Some(launch_cwd) = state
+            .record
+            .as_ref()
+            .and_then(|record| record.launch_cwd.as_deref())
+        else {
+            return Some(true);
+        };
+        match &state.launch_directory {
+            LaunchDirectoryCheck::Checked {
+                launch_cwd: checked,
+                exists,
+            } if checked == launch_cwd => Some(*exists),
+            LaunchDirectoryCheck::NotChecked
+            | LaunchDirectoryCheck::Checking(_)
+            | LaunchDirectoryCheck::Checked { .. } => None,
+        }
+    }
+
+    /// Starts checking, off the main thread, whether the launch directory of a session the pane
+    /// could resume exists here.
+    fn check_cli_agent_launch_directory(&mut self, ctx: &mut ViewContext<Self>) {
+        let state = &mut self.cli_agent_session_restore;
+        let Some(launch_cwd) = state
+            .record
+            .as_ref()
+            .filter(|record| record.can_resume_here())
+            .and_then(|record| record.launch_cwd.clone())
+        else {
+            return;
+        };
+        let already_checked = match &state.launch_directory {
+            LaunchDirectoryCheck::NotChecked => false,
+            LaunchDirectoryCheck::Checking(checking) => *checking == launch_cwd,
+            LaunchDirectoryCheck::Checked {
+                launch_cwd: checked,
+                ..
+            } => *checked == launch_cwd,
+        };
+        if already_checked {
+            return;
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            state.launch_directory = LaunchDirectoryCheck::Checking(launch_cwd.clone());
+            let path = launch_cwd.clone();
+            let _ = ctx.spawn(
+                async move { std::path::Path::new(&path).is_dir() },
+                move |me, exists, ctx| {
+                    me.on_cli_agent_launch_directory_checked(launch_cwd, exists, ctx)
+                },
+            );
+        }
+        // There's no local file system to check.
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = ctx;
+            state.launch_directory = LaunchDirectoryCheck::Checked {
+                launch_cwd,
+                exists: true,
+            };
+        }
+    }
+
+    fn on_cli_agent_launch_directory_checked(
+        &mut self,
+        launch_cwd: String,
+        exists: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let state = &mut self.cli_agent_session_restore;
+        if state.launch_directory != LaunchDirectoryCheck::Checking(launch_cwd.clone()) {
+            // The record changed while the check ran.
+            return;
+        }
+        state.launch_directory = LaunchDirectoryCheck::Checked { launch_cwd, exists };
+        if exists {
+            self.try_send_queued_cli_agent_resume(ctx);
+            return;
+        }
+        log::info!("The launch directory of a restored CLI agent session doesn't exist here");
+        if let Some(banner) = state.banner.clone() {
+            banner.update(ctx, |banner, ctx| {
+                banner.set_launch_directory_missing(true, ctx);
+            });
+        }
+        match state.phase {
+            // The sidebar may offer to resume it.
+            RecoveryPhase::Interrupted => ctx.emit(Event::TerminalViewStateChanged),
+            RecoveryPhase::ResumeQueued => {
+                self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::NotAttempted, ctx);
+            }
+            // A `cd` that was already sent fails and offers the session again.
+            RecoveryPhase::Tracking | RecoveryPhase::ResumePending => {}
+        }
+    }
+
+    /// Acts on the login shell having bootstrapped: shows a deferred banner and runs a queued
+    /// resume. Which bootstrap event arrives first varies, so this is called from several; only
+    /// the first call acts.
     pub(super) fn on_login_shell_bootstrapped_for_cli_agent_restore(
         &mut self,
         ctx: &mut ViewContext<Self>,
@@ -405,9 +756,13 @@ impl TerminalView {
         if std::mem::replace(&mut state.shell_ready_handled, true) {
             return;
         }
-        let show_banner = std::mem::take(&mut state.show_banner_after_bootstrap);
-        if show_banner && state.phase == RecoveryPhase::Interrupted {
-            self.show_cli_agent_session_restore_banner(false, ctx);
+        if std::mem::take(&mut state.show_banner_after_bootstrap) {
+            let previous_resume = state.previous_resume;
+            self.show_cli_agent_session_restore_banner(previous_resume, ctx);
+        }
+        if self.cli_agent_session_restore.phase == RecoveryPhase::ResumeQueued {
+            self.arm_cli_agent_resume_timer(RESUME_QUEUE_TIMEOUT, ctx);
+            self.schedule_queued_cli_agent_resume(ctx);
         }
     }
 
@@ -419,44 +774,64 @@ impl TerminalView {
     }
 
     /// Called after a block completes in a bootstrapped shell, including the bootstrap blocks
-    /// that precede the first prompt. Runs a queued resume after the same short delay as pending
-    /// commands, since the shell may still be running prompt hooks.
+    /// that precede the first prompt.
     pub(super) fn on_block_completed_for_cli_agent_restore(&mut self, ctx: &mut ViewContext<Self>) {
+        let was_ready = self.cli_agent_session_restore.shell_ready_handled;
         self.on_login_shell_bootstrapped_for_cli_agent_restore(ctx);
-        if self.cli_agent_session_restore.phase != RecoveryPhase::ResumeQueued {
-            return;
+        if was_ready && self.cli_agent_session_restore.phase == RecoveryPhase::ResumeQueued {
+            self.schedule_queued_cli_agent_resume(ctx);
         }
-        let _ = ctx.spawn(
-            async {
-                Timer::after(EXECUTE_PENDING_COMMAND_DELAY).await;
-            },
-            |me, _, ctx| me.try_send_queued_cli_agent_resume(ctx),
-        );
     }
 
-    /// Whether the command running in this pane is `agent`, started from the pane's local login
-    /// shell (directly or through an alias Warp resolves), so the session can be resumed by
-    /// typing its command into a fresh local shell.
-    fn running_command_is_local_cli_agent(&self, agent: CLIAgent, ctx: &AppContext) -> bool {
-        let Some(session_id) = self.active_block_session_id() else {
-            return false;
-        };
-        let is_local_login_shell = self.session_is_local(session_id, ctx)
-            && self
-                .sessions
-                .as_ref(ctx)
-                .get(session_id)
-                .is_some_and(|session| session.subshell_info().is_none());
-        if !is_local_login_shell {
-            return false;
+    /// Puts the banner back after the block list was cleared (e.g. Cmd-K), which drops all rich
+    /// content.
+    pub(super) fn on_block_list_cleared_for_cli_agent_restore(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.cli_agent_session_restore.banner.take().is_none() {
+            return;
         }
-        let detected = {
-            let model = self.model.lock();
-            self.detect_cli_agent_from_model(&model, ctx)
+        let previous_resume = self.cli_agent_session_restore.previous_resume;
+        self.show_cli_agent_session_restore_banner(previous_resume, ctx);
+    }
+
+    /// What the pane's running command says about the `agent` session reporting through it:
+    /// whether typing the resume command into a fresh local shell resumes it (the pane runs a
+    /// local login shell, no subshell, and the command doesn't go through a remote or container
+    /// wrapper such as `ssh` or `tmux`), and whether the command is the agent itself, as opposed
+    /// to e.g. a script that runs `claude -p`.
+    fn observe_cli_agent_launch(&self, agent: CLIAgent, ctx: &AppContext) -> LaunchObservation {
+        let Some(session_id) = self.active_block_session_id() else {
+            return LaunchObservation::default();
         };
-        // Custom toolbar command patterns aren't trusted: they can match wrappers (e.g. ones that
-        // ssh somewhere first).
-        matches!(detected, Some((detected, None)) if detected == agent)
+        let Some(session) = self.sessions.as_ref(ctx).get(session_id) else {
+            return LaunchObservation::default();
+        };
+        let command = {
+            let model = self.model.lock();
+            let active_block = model.block_list().active_block();
+            active_block
+                .is_active_and_long_running()
+                .then(|| active_block.command_with_secrets_obfuscated(false))
+        };
+        let Some(command) = command else {
+            return LaunchObservation::default();
+        };
+        let escape_char = session.shell_family().escape_char();
+        let started_as_agent =
+            CLIAgent::detect(&command, Some(escape_char), Some(session.aliases()), ctx)
+                == Some(agent)
+                || (ctx.has_singleton_model::<CompiledCommandsForCodingAgentToolbar>()
+                    && CompiledCommandsForCodingAgentToolbar::matched_agent(ctx, &command)
+                        == Some(agent));
+        let launched_locally = self.session_is_local(session_id, ctx)
+            && session.subshell_info().is_none()
+            && !runs_through_remote_wrapper(&command, escape_char, session.aliases());
+        LaunchObservation {
+            launched_locally,
+            started_as_agent,
+        }
     }
 
     /// Updates the record from the agent session in this pane and saves the app state when the
@@ -474,6 +849,7 @@ impl TerminalView {
             CLIAgentSessionsModelEvent::InputSessionChanged { .. } => return,
         }
         if event.terminal_view_id() != self.view_id {
+            self.schedule_cli_agent_offer_check(event.terminal_view_id(), ctx);
             return;
         }
 
@@ -482,10 +858,11 @@ impl TerminalView {
         let now = now_unix_ms();
         // Read the model rather than the event: events are delivered after the fact, and the
         // model has the latest state (e.g. the replacement after a session was replaced).
-        let app: &AppContext = ctx;
-        let launched_locally = CLIAgentSessionsModel::as_ref(app)
+        let launch = CLIAgentSessionsModel::as_ref(ctx)
             .session(self.view_id)
-            .is_some_and(|session| self.running_command_is_local_cli_agent(session.agent, app));
+            .map(|session| session.agent)
+            .map(|agent| self.observe_cli_agent_launch(agent, ctx))
+            .unwrap_or_default();
         let state = &mut self.cli_agent_session_restore;
         if matches!(event, CLIAgentSessionsModelEvent::Ended { .. }) {
             // Whatever is registered now (if anything) is a different session instance. Ending
@@ -506,7 +883,7 @@ impl TerminalView {
                         session,
                         pane_cwd.as_deref(),
                         previous,
-                        launched_locally,
+                        launch,
                         now,
                     ) {
                         state.record = Some(live);
@@ -514,14 +891,17 @@ impl TerminalView {
                     }
                 }
                 RecoveryPhase::Interrupted | RecoveryPhase::ResumeQueued => {
-                    // A new agent session that has done something replaces the interrupted one.
+                    // A new interactive agent session that has done something replaces the
+                    // interrupted one. A headless run (e.g. `claude -p` in a script) doesn't.
                     if let Some(live) = PersistedCLIAgentSession::from_live_session(
                         session,
                         pane_cwd.as_deref(),
                         None,
-                        launched_locally,
+                        launch,
                         now,
-                    ) {
+                    )
+                    .filter(|live| live.evidently_interactive)
+                    {
                         state.record = Some(live);
                         state.record_is_live_instance = true;
                         state.show_banner_after_bootstrap = false;
@@ -539,7 +919,7 @@ impl TerminalView {
                         session,
                         pane_cwd.as_deref(),
                         restored,
-                        launched_locally,
+                        launch,
                         now,
                     );
                     // The agent may also have moved on to another session with activity (e.g.
@@ -552,6 +932,7 @@ impl TerminalView {
                             state.record = Some(live);
                         }
                         state.record_is_live_instance = true;
+                        state.resume_acknowledged = true;
                         if let Some(timer) = state.resume_timer.take() {
                             timer.abort();
                         }
@@ -605,22 +986,32 @@ impl TerminalView {
                     state.next_resume_step_timer = Some(timer);
                 } else if state.phase == RecoveryPhase::ResumePending {
                     // e.g. the launch directory no longer exists.
-                    self.mark_cli_agent_session_interrupted(true, ctx);
+                    self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx);
                 }
                 return;
             }
             Some(ResumeStep::Agent) => {
                 state.record_is_live_instance = false;
-                let was_resuming = state.phase != RecoveryPhase::Tracking;
                 if state.record.is_none() {
                     return;
                 }
-                if succeeded {
-                    // The resumed agent was quit deliberately, even if the pane had already
-                    // given up waiting for it to report back.
-                    self.clear_cli_agent_session_record(ctx);
-                } else {
-                    self.mark_cli_agent_session_interrupted(was_resuming, ctx);
+                let acknowledged = std::mem::take(&mut state.resume_acknowledged);
+                match (succeeded, acknowledged) {
+                    // The resumed agent was quit deliberately.
+                    (true, true) => self.clear_cli_agent_session_record(ctx),
+                    // Without the agent reporting the session, it may not have resumed at all
+                    // (e.g. it didn't find the session), so the session stays on offer.
+                    (true, false) => self.mark_cli_agent_session_interrupted(
+                        PreviousResumeAttempt::Unconfirmed,
+                        ctx,
+                    ),
+                    (false, true) => self.mark_cli_agent_session_interrupted(
+                        PreviousResumeAttempt::NotAttempted,
+                        ctx,
+                    ),
+                    (false, false) => {
+                        self.mark_cli_agent_session_interrupted(PreviousResumeAttempt::Failed, ctx)
+                    }
                 }
                 return;
             }
@@ -631,35 +1022,41 @@ impl TerminalView {
             return;
         }
         state.record_is_live_instance = false;
-        let was_resuming = match state.phase {
-            RecoveryPhase::Tracking => false,
-            RecoveryPhase::ResumePending => true,
+        let previous_resume = match state.phase {
+            RecoveryPhase::Tracking => PreviousResumeAttempt::NotAttempted,
+            RecoveryPhase::ResumePending => PreviousResumeAttempt::Failed,
             RecoveryPhase::Interrupted | RecoveryPhase::ResumeQueued => return,
         };
-        if state.record.is_none() {
+        let Some(record) = state.record.as_ref() else {
             return;
-        }
-        if succeeded {
+        };
+        // A headless run that failed (e.g. `claude -p` in a failing script) isn't worth
+        // offering.
+        let headless_run_failed =
+            state.phase == RecoveryPhase::Tracking && !succeeded && !record.evidently_interactive;
+        if succeeded || headless_run_failed {
             self.clear_cli_agent_session_record(ctx);
         } else {
-            self.mark_cli_agent_session_interrupted(was_resuming, ctx);
+            self.mark_cli_agent_session_interrupted(previous_resume, ctx);
         }
     }
 
     fn mark_cli_agent_session_interrupted(
         &mut self,
-        previous_resume_failed: bool,
+        previous_resume: PreviousResumeAttempt,
         ctx: &mut ViewContext<Self>,
     ) {
         let state = &mut self.cli_agent_session_restore;
         state.cancel_resume();
+        state.resume_acknowledged = false;
         if state.record.is_none() {
             self.set_cli_agent_recovery_phase(RecoveryPhase::Tracking, ctx);
             return;
         }
         state.record_is_live_instance = false;
         self.set_cli_agent_recovery_phase(RecoveryPhase::Interrupted, ctx);
-        self.show_cli_agent_session_restore_banner(previous_resume_failed, ctx);
+        self.check_cli_agent_launch_directory(ctx);
+        self.show_cli_agent_session_restore_banner(previous_resume, ctx);
         ctx.notify();
     }
 
@@ -669,7 +1066,11 @@ impl TerminalView {
         state.record = None;
         state.record_is_live_instance = false;
         state.show_banner_after_bootstrap = false;
+        state.previous_resume = PreviousResumeAttempt::NotAttempted;
+        state.launch_directory = LaunchDirectoryCheck::NotChecked;
         state.in_flight_resume_step = None;
+        state.resume_acknowledged = false;
+        state.bootstrap_fallback_deadline = None;
         state.cancel_resume();
         self.set_cli_agent_recovery_phase(RecoveryPhase::Tracking, ctx);
         self.remove_cli_agent_session_restore_banner(ctx);
@@ -677,7 +1078,8 @@ impl TerminalView {
         self.save_if_cli_agent_record_changed(before, ctx);
     }
 
-    fn dismiss_restored_cli_agent_session(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Stops offering the interrupted session and forgets it.
+    pub(crate) fn dismiss_restored_cli_agent_session(&mut self, ctx: &mut ViewContext<Self>) {
         if self.cli_agent_session_restore.phase == RecoveryPhase::Interrupted {
             self.clear_cli_agent_session_record(ctx);
         } else {
@@ -690,6 +1092,7 @@ impl TerminalView {
         before: Option<PersistedCLIAgentSession>,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.sync_cli_agent_resume_claim(ctx);
         let after = self.cli_agent_session_restore.record.as_ref();
         if same_record(before.as_ref(), after) {
             return;
@@ -703,7 +1106,8 @@ impl TerminalView {
         }
     }
 
-    fn copy_restored_cli_agent_session_command(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Copies the command that resumes the session this pane keeps to the clipboard.
+    pub(crate) fn copy_restored_cli_agent_session_command(&mut self, ctx: &mut ViewContext<Self>) {
         let Some(record) = self.cli_agent_session_restore.record.as_ref() else {
             return;
         };
@@ -728,37 +1132,36 @@ impl TerminalView {
 
     fn show_cli_agent_session_restore_banner(
         &mut self,
-        previous_resume_failed: bool,
+        previous_resume: PreviousResumeAttempt,
         ctx: &mut ViewContext<Self>,
     ) {
-        if self.cli_agent_session_restore.phase != RecoveryPhase::Interrupted {
+        let state = &mut self.cli_agent_session_restore;
+        if state.phase != RecoveryPhase::Interrupted {
             return;
         }
-        let Some(record) = self.cli_agent_session_restore.record.clone() else {
+        state.previous_resume = previous_resume;
+        if !state.shell_ready_handled {
+            state.show_banner_after_bootstrap = true;
+            return;
+        }
+        state.show_banner_after_bootstrap = false;
+        let Some(record) = state.record.clone() else {
             return;
         };
+        let launch_directory_missing = self.cli_agent_launch_directory_exists() == Some(false);
         self.remove_cli_agent_session_restore_banner(ctx);
 
         let banner_record = record.clone();
         let banner = ctx.add_typed_action_view(move |_| {
-            CLIAgentSessionRestoreBanner::new(banner_record, previous_resume_failed)
+            CLIAgentSessionRestoreBanner::new(
+                banner_record,
+                previous_resume,
+                launch_directory_missing,
+            )
         });
         ctx.subscribe_to_view(&banner, |me, _, event, ctx| match event {
             CLIAgentSessionRestoreBannerEvent::Resume => {
-                let message = match me.resume_restored_cli_agent_session(ctx) {
-                    CLIAgentResumeOutcome::Busy => {
-                        Some("Can't resume while something is running in this pane")
-                    }
-                    CLIAgentResumeOutcome::HasDraft => {
-                        Some("Clear the input first: resuming would replace what you typed")
-                    }
-                    CLIAgentResumeOutcome::Resumed
-                    | CLIAgentResumeOutcome::NothingToResume
-                    | CLIAgentResumeOutcome::CopyOnly => None,
-                };
-                if let Some(message) = message {
-                    me.show_error_toast(message.to_owned(), ctx);
-                }
+                me.resume_restored_cli_agent_session_with_feedback(ctx);
             }
             CLIAgentSessionRestoreBannerEvent::CopyCommand => {
                 me.copy_restored_cli_agent_session_command(ctx);
