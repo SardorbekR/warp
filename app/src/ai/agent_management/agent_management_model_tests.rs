@@ -522,6 +522,58 @@ fn mark_terminal_view_read_also_marks_notifications_read() {
 }
 
 #[test]
+fn toggling_the_focused_view_keeps_the_mark_until_the_user_comes_back() {
+    App::test((), |mut app| async move {
+        let _guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);
+        let (_history, notifications) = setup_app(&mut app);
+        let window_id = WindowId::new();
+        let focused_view = EntityId::new();
+        let other_view = EntityId::new();
+
+        // Marking the pane the user is looking at keeps it unread while it
+        // stays focused, even when its focus wasn't recorded yet...
+        notifications.update(&mut app, |model, ctx| {
+            model.toggle_focused_terminal_view_unread(window_id, focused_view, true, ctx);
+            model.handle_terminal_focus_for_read_state(window_id, Some(focused_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(focused_view));
+        });
+
+        // ...and after the user switches away...
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(other_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_manually_unread(focused_view));
+        });
+
+        // ...until they come back to it.
+        notifications.update(&mut app, |model, ctx| {
+            model.handle_terminal_focus_for_read_state(window_id, Some(focused_view), true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(focused_view));
+        });
+
+        // Toggling flips between unread and read.
+        notifications.update(&mut app, |model, ctx| {
+            model.toggle_focused_terminal_view_unread(window_id, focused_view, true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(model.is_terminal_view_unread(focused_view));
+        });
+        notifications.update(&mut app, |model, ctx| {
+            model.toggle_focused_terminal_view_unread(window_id, focused_view, true, ctx);
+        });
+        notifications.read(&app, |model, _| {
+            assert!(!model.is_terminal_view_unread(focused_view));
+            assert!(!model.is_terminal_view_unread(other_view));
+        });
+    });
+}
+
+#[test]
 fn focus_clears_manual_unread_only_when_focus_moves_to_the_view() {
     App::test((), |mut app| async move {
         let _guard = FeatureFlag::VerticalTabsStatusOrder.override_enabled(true);

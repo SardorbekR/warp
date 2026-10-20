@@ -25258,6 +25258,33 @@ impl TypedActionView for Workspace {
                 });
                 ctx.notify();
             }
+            ToggleFocusedTerminalViewUnread => {
+                let window_id = ctx.window_id();
+                let is_active_window = ctx.windows().active_window() == Some(window_id);
+                let focused_terminal_view_id = self
+                    .active_tab_pane_group()
+                    .as_ref(ctx)
+                    .focused_session_view(ctx)
+                    .map(|view| view.id());
+                // Like the row menu item: only while the panel orders rows by
+                // status, except that a pane marked as unread can always be
+                // marked read.
+                if let Some(terminal_view_id) = focused_terminal_view_id
+                    && (crate::tab::is_vertical_tabs_status_order_active(ctx)
+                        || AgentNotificationsModel::as_ref(ctx)
+                            .is_terminal_view_manually_unread(terminal_view_id))
+                {
+                    AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.toggle_focused_terminal_view_unread(
+                            window_id,
+                            terminal_view_id,
+                            is_active_window,
+                            ctx,
+                        );
+                    });
+                    ctx.notify();
+                }
+            }
             InterruptedCLIAgentSession {
                 terminal_view_id,
                 action,

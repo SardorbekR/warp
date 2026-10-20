@@ -1517,9 +1517,21 @@ pub fn init(app: &mut AppContext) {
     )
     .with_enabled(|| FeatureFlag::HOANotifications.is_enabled())
     .with_context_predicate(id!("Workspace"))
-    .with_mac_key_binding("cmd-shift-U")
+    // Fork: on macOS, Cmd-Shift-U marks the current session as unread or
+    // read instead (below). The mailbox stays in the command palette.
     .with_linux_or_windows_key_binding("ctrl-shift-U")
     .with_group(bindings::BindingGroup::WarpAi.as_str())]);
+
+    // Fork: a shortcut for the vertical tabs row menu's "Mark as unread" /
+    // "Mark as read", acting on the focused pane.
+    app.register_editable_bindings([EditableBinding::new(
+        "workspace:toggle_focused_session_unread",
+        "Mark current session as unread or read",
+        WorkspaceAction::ToggleFocusedTerminalViewUnread,
+    )
+    .with_enabled(|| FeatureFlag::VerticalTabsStatusOrder.is_enabled())
+    .with_context_predicate(id!("Workspace"))
+    .with_mac_key_binding("cmd-shift-U")]);
 
     add_open_setting_pages_as_editable_binding(app);
     add_overflow_menu_items_as_editable_binding(app);

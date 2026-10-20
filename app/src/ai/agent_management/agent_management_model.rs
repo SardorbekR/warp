@@ -161,6 +161,32 @@ impl AgentNotificationsModel {
         }
     }
 
+    /// Marks the terminal view focused in `window_id` as read if it is
+    /// unread, and as unread otherwise, like the "Mark as read" / "Mark as
+    /// unread" menu item. The focus is recorded first, so that the view isn't
+    /// later taken as newly focused, which would clear the mark right away;
+    /// the mark clears when the user comes back to the view after leaving it.
+    pub(crate) fn toggle_focused_terminal_view_unread(
+        &mut self,
+        window_id: WindowId,
+        focused_terminal_view_id: EntityId,
+        is_active_window: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let was_unread = self.is_terminal_view_unread(focused_terminal_view_id);
+        self.handle_terminal_focus_for_read_state(
+            window_id,
+            Some(focused_terminal_view_id),
+            is_active_window,
+            ctx,
+        );
+        if was_unread {
+            self.mark_terminal_view_read(focused_terminal_view_id, ctx);
+        } else {
+            self.mark_terminal_view_unread(focused_terminal_view_id, ctx);
+        }
+    }
+
     /// Drops every "Mark as unread" mark, e.g. when the sidebar stops
     /// ordering rows by status (the only place the marks are shown).
     pub(crate) fn clear_manual_unread_marks(&mut self, ctx: &mut ModelContext<Self>) {

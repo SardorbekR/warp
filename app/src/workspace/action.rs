@@ -405,6 +405,9 @@ pub enum WorkspaceAction {
     MarkTerminalViewRead {
         terminal_view_id: EntityId,
     },
+    /// Fork: marks the focused terminal pane of the active tab as unread, or
+    /// as read if it is unread (a keyboard shortcut for the row menu's item).
+    ToggleFocusedTerminalViewUnread,
     /// Fork: acts on the interrupted CLI agent session of a terminal view
     /// (e.g. from its sidebar row's context menu).
     InterruptedCLIAgentSession {
@@ -1122,6 +1125,7 @@ impl WorkspaceAction {
             | SetVerticalTabsSortMode(_)
             | MarkTerminalViewUnread { .. }
             | MarkTerminalViewRead { .. }
+            | ToggleFocusedTerminalViewUnread
             | InterruptedCLIAgentSession { .. }
             | ToggleWelcomeTips
             | CopyTextToClipboard(_)

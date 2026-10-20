@@ -106,4 +106,5 @@ fn read_state_changes_do_not_save_workspace_state() {
         !WorkspaceAction::MarkTerminalViewRead { terminal_view_id }
             .should_save_app_state_on_action()
     );
+    assert!(!WorkspaceAction::ToggleFocusedTerminalViewUnread.should_save_app_state_on_action());
 }
