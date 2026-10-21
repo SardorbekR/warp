@@ -1880,12 +1880,17 @@ fn render_vertical_tabs_panel(
         super::PanelPosition::Left => DragBarSide::Right,
         super::PanelPosition::Right => DragBarSide::Left,
     };
+    // Fork: under light glass the panel shows the window's tint as it is.
+    let panel_overlay = (!super::glass::tabs_panel_shows_light_glass(app))
+        .then(|| internal_colors::fg_overlay_1(theme));
     // Wrap the panel in a `Hoverable` so right-clicking the empty area of the
     // vertical tabs panel opens the tab configs dropdown.
     let inner = Hoverable::new(state.panel_right_click_mouse_state.clone(), |_| {
-        Container::new(panel_with_popup)
-            .with_background(internal_colors::fg_overlay_1(theme))
-            .finish()
+        let mut panel = Container::new(panel_with_popup);
+        if let Some(overlay) = panel_overlay {
+            panel = panel.with_background(overlay);
+        }
+        panel.finish()
     })
     .on_click(|ctx, _, _| {
         ctx.dispatch_typed_action(WorkspaceAction::CancelActiveRename);
@@ -1909,11 +1914,14 @@ fn render_vertical_tabs_panel(
         Some(new_tab_button) => Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_child(
-                Container::new(workspace.render_tabs_panel_top_row(new_tab_button, app))
-                    .with_background(internal_colors::fg_overlay_1(theme))
-                    .finish(),
-            )
+            .with_child({
+                let mut top_row =
+                    Container::new(workspace.render_tabs_panel_top_row(new_tab_button, app));
+                if let Some(overlay) = panel_overlay {
+                    top_row = top_row.with_background(overlay);
+                }
+                top_row.finish()
+            })
             .with_child(Expanded::new(1., inner).finish())
             .finish(),
         None => inner,

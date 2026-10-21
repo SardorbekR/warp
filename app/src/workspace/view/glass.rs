@@ -9,6 +9,7 @@
 //! opaque block, so that only the header and the tabs panel show the blur.
 
 use warp_core::features::FeatureFlag;
+use warp_core::ui::theme::{ColorScheme, WarpTheme};
 use warpui::elements::{
     Container, CornerRadius, Element, Fill as ElementFill, Flex, ParentElement, Radius, Shrinkable,
 };
@@ -25,6 +26,8 @@ use crate::workspace::util::get_terminal_background_fill;
 pub(crate) const GLASS_BLUR_RADIUS: u8 = 30;
 /// Opacity of the theme tint over the blurred desktop, in percent.
 const GLASS_TINT_OPACITY: u8 = 70;
+/// Opacity of the light glass tint (see [`is_light_glass`]), in percent.
+const LIGHT_GLASS_TINT_OPACITY: u8 = 72;
 /// Radius of the opaque block's top corner next to the tabs panel.
 const CONTENT_CORNER_RADIUS: f32 = 10.;
 
@@ -88,17 +91,33 @@ fn tabs_panel_side(
     }
 }
 
-/// The fill of the whole window under glass: the theme's surface tint, never
-/// more opaque than the user's window opacity.
+/// The fill of the whole window under glass: the theme's surface tint (its
+/// own background for light glass), never more opaque than the user's window
+/// opacity.
 pub(super) fn window_tint(window_id: WindowId, app: &AppContext) -> ElementFill {
     let background_opacity = WindowSettings::as_ref(app)
         .background_opacity
         .effective_opacity(window_id, app);
-    Appearance::as_ref(app)
-        .theme()
-        .surface_2()
-        .with_opacity(GLASS_TINT_OPACITY.min(background_opacity))
-        .into()
+    let theme = Appearance::as_ref(app).theme();
+    let (tint, opacity) = if is_light_glass(theme) {
+        (theme.background(), LIGHT_GLASS_TINT_OPACITY)
+    } else {
+        (theme.surface_2(), GLASS_TINT_OPACITY)
+    };
+    tint.with_opacity(opacity.min(background_opacity)).into()
+}
+
+/// Whether glass on `theme` is light glass: the tint is the theme's own
+/// background, and the tabs panel paints no overlay over it, so that the panel
+/// looks frosted white on a light theme rather than grey.
+pub(super) fn is_light_glass(theme: &WarpTheme) -> bool {
+    theme.inferred_color_scheme() == ColorScheme::DarkOnLight
+}
+
+/// Whether the vertical tabs panel shows the light glass tint as it is (see
+/// [`is_light_glass`]): glass is on for its window and the theme is light.
+pub(super) fn tabs_panel_shows_light_glass(app: &AppContext) -> bool {
+    glass_layout(false, app).is_some() && is_light_glass(Appearance::as_ref(app).theme())
 }
 
 /// Lays out the tabs panel (if open) next to `rest`, which holds the tab

@@ -29,3 +29,11 @@ fn default_toolbar_puts_the_tabs_panel_outermost_on_the_left() {
         Some(PanelPosition::Left)
     );
 }
+
+#[test]
+fn only_light_themes_get_light_glass() {
+    use crate::themes::default_themes::{dark_theme, light_theme};
+
+    assert!(is_light_glass(&light_theme()));
+    assert!(!is_light_glass(&dark_theme()));
+}
