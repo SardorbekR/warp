@@ -162,7 +162,10 @@ fn compute_fg_rgb(
 ) -> ColorU {
     match fg {
         Color::Spec(rgb) => match flags & Flags::DIM {
-            Flags::DIM => crate::terminal::color::dim(rgb),
+            Flags::DIM => crate::terminal::color::dim(
+                rgb,
+                get_override_color(colors, override_colors, color_index::BACKGROUND),
+            ),
             _ => rgb,
         },
         Color::Named(ansi) => {
@@ -211,3 +214,7 @@ pub fn get_override_color(
 ) -> ColorU {
     override_colors[index].unwrap_or(colors[index])
 }
+
+#[cfg(test)]
+#[path = "cell_type_tests.rs"]
+mod tests;

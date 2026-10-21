@@ -121,10 +121,11 @@ impl List {
         self[color_index::BACKGROUND] = colors.primary.background;
 
         // Dims.
+        let background = colors.primary.background;
         self[color_index::DIM_FOREGROUND] = colors
             .primary
             .dim_foreground
-            .unwrap_or_else(|| dim(colors.primary.foreground));
+            .unwrap_or_else(|| dim(colors.primary.foreground, background));
         match colors.dim {
             Some(ref dim) => {
                 self[color_index::DIM_BLACK] = dim.black;
@@ -137,14 +138,14 @@ impl List {
                 self[color_index::DIM_WHITE] = dim.white;
             }
             None => {
-                self[color_index::DIM_BLACK] = dim(colors.normal.black);
-                self[color_index::DIM_RED] = dim(colors.normal.red);
-                self[color_index::DIM_GREEN] = dim(colors.normal.green);
-                self[color_index::DIM_YELLOW] = dim(colors.normal.yellow);
-                self[color_index::DIM_BLUE] = dim(colors.normal.blue);
-                self[color_index::DIM_MAGENTA] = dim(colors.normal.magenta);
-                self[color_index::DIM_CYAN] = dim(colors.normal.cyan);
-                self[color_index::DIM_WHITE] = dim(colors.normal.white);
+                self[color_index::DIM_BLACK] = dim(colors.normal.black, background);
+                self[color_index::DIM_RED] = dim(colors.normal.red, background);
+                self[color_index::DIM_GREEN] = dim(colors.normal.green, background);
+                self[color_index::DIM_YELLOW] = dim(colors.normal.yellow, background);
+                self[color_index::DIM_BLUE] = dim(colors.normal.blue, background);
+                self[color_index::DIM_MAGENTA] = dim(colors.normal.magenta, background);
+                self[color_index::DIM_CYAN] = dim(colors.normal.cyan, background);
+                self[color_index::DIM_WHITE] = dim(colors.normal.white, background);
             }
         }
     }
@@ -612,13 +613,23 @@ impl IndexMut<u8> for OverrideList {
 
 /// Returns a dimmed version of `color` based on a fixed dim-factor
 /// that is suitable for terminal colors.
-pub(super) fn dim(color: ColorU) -> ColorU {
-    mult_coloru(color, DIM_FACTOR)
+///
+/// Fork: `color` is blended toward the terminal's `background` rather than
+/// toward black, so dim text stays faint on light themes too (multiplying a
+/// dark foreground on a white terminal made it darker, not fainter). On a
+/// black background this is the same as scaling by the dim factor.
+pub(super) fn dim(color: ColorU, background: ColorU) -> ColorU {
+    let blend = |channel: u8, background: u8| {
+        (channel as f32 * DIM_FACTOR + background as f32 * (1. - DIM_FACTOR)).clamp(0., 255.) as u8
+    };
+    ColorU::new(
+        blend(color.r, background.r),
+        blend(color.g, background.g),
+        blend(color.b, background.b),
+        color.a,
+    )
 }
 
-fn mult_coloru(color: ColorU, rhs: f32) -> ColorU {
-    let r = (color.r as f32 * rhs).clamp(0., 255.);
-    let g = (color.g as f32 * rhs).clamp(0., 255.);
-    let b = (color.b as f32 * rhs).clamp(0., 255.);
-    ColorU::new(r as u8, g as u8, b as u8, color.a)
-}
+#[cfg(test)]
+#[path = "color_tests.rs"]
+mod tests;
