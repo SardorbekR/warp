@@ -10,7 +10,6 @@ use std::hash::Hash;
 use std::time::Duration;
 
 use pathfinder_color::ColorU;
-use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::EntityId;
 
 use super::StatusRowNavigation;
@@ -277,25 +276,6 @@ pub(super) fn slide_progress(elapsed: Duration, duration: Duration) -> f32 {
     1. - (1. - linear).powi(3)
 }
 
-/// Whether text drawn on `background` (a project badge or header) should be
-/// dark rather than light, so it stays readable on light and dark project
-/// colors alike.
-pub(super) fn wants_dark_text(background: ColorU) -> bool {
-    let channel = |value: u8| {
-        let value = f32::from(value) / 255.;
-        if value <= 0.039_28 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let luminance = 0.2126 * channel(background.r)
-        + 0.7152 * channel(background.g)
-        + 0.0722 * channel(background.b);
-    // Where black and white text have the same contrast ratio.
-    luminance > 0.179
-}
-
 /// Keeps the previously displayed order while the list is frozen: rows that
 /// still exist keep their previous position, rows that disappeared are
 /// dropped, and new rows are appended in their fresh order.
@@ -449,33 +429,153 @@ pub(super) fn project_name(repo_root_name: Option<&str>, cwd: Option<&str>) -> O
         .map(str::to_owned)
 }
 
-/// Colors used for project tags, picked by a stable hash of the project name.
-pub(super) const PROJECT_PALETTE: [AnsiColorIdentifier; 6] = [
-    AnsiColorIdentifier::Red,
-    AnsiColorIdentifier::Green,
-    AnsiColorIdentifier::Yellow,
-    AnsiColorIdentifier::Blue,
-    AnsiColorIdentifier::Magenta,
-    AnsiColorIdentifier::Cyan,
-];
+/// Hues for project badges and group headers, as OKLCH hue angles in degrees
+/// (rose, clay, amber, moss, sage, teal, slate, lavender), picked by a stable
+/// hash of the project name. Every tone below has the same lightness and
+/// chroma in each hue, so no project looks louder than another, and none
+/// depends on the theme's terminal colors.
+pub(super) const PROJECT_HUES: [f64; 8] = [12., 48., 82., 122., 158., 198., 256., 300.];
 
-/// A stable (FNV-1a) palette index for `project`, always in range.
+/// A tone of a project hue: OKLCH lightness (0 to 1) and chroma.
+#[derive(Clone, Copy, Debug)]
+struct Tone {
+    lightness: f64,
+    chroma: f64,
+}
+
+impl Tone {
+    fn of(self, hue: f64) -> ColorU {
+        oklch(self.lightness, self.chroma, hue)
+    }
+}
+
+/// Text on light themes.
+const DEEP_TEXT: Tone = Tone {
+    lightness: 0.43,
+    chroma: 0.085,
+};
+/// Text on dark themes.
+const PALE_TEXT: Tone = Tone {
+    lightness: 0.895,
+    chroma: 0.042,
+};
+/// A label's fill on dark themes, top to bottom.
+const DARK_FILL: [Tone; 2] = [
+    Tone {
+        lightness: 0.42,
+        chroma: 0.05,
+    },
+    Tone {
+        lightness: 0.38,
+        chroma: 0.05,
+    },
+];
+/// A label's fill on light themes, top to bottom.
+const LIGHT_FILL: [Tone; 2] = [
+    Tone {
+        lightness: 0.945,
+        chroma: 0.028,
+    },
+    Tone {
+        lightness: 0.925,
+        chroma: 0.034,
+    },
+];
+/// The glass edge's alpha on dark themes (white), top to bottom.
+const DARK_RIM_ALPHA: [u8; 2] = [87, 15];
+/// The glass edge on light themes: white on top, fading into the deep tone at
+/// this alpha at the bottom.
+const LIGHT_RIM_TOP_ALPHA: u8 = 242;
+const LIGHT_RIM_BOTTOM_ALPHA: u8 = 61;
+
+/// A stable (FNV-1a) index into [`PROJECT_HUES`] for `project`, always in range.
 pub(super) fn project_palette_index(project: &str) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let hash = project.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     });
-    let len = PROJECT_PALETTE.len() as u64;
-    // `len` is a non-zero constant, and the remainder is always < 6.
+    let len = PROJECT_HUES.len() as u64;
+    // `len` is a non-zero constant, so the remainder is always in range.
     (hash % len) as usize
 }
 
-pub(super) fn project_palette_color(project: &str) -> AnsiColorIdentifier {
-    PROJECT_PALETTE
+/// The hue of `project`'s badge and group header.
+pub(super) fn project_hue(project: &str) -> f64 {
+    PROJECT_HUES
         .get(project_palette_index(project))
         .copied()
-        .unwrap_or(AnsiColorIdentifier::Blue)
+        .unwrap_or(PROJECT_HUES[0])
+}
+
+/// How a project label (a lone row's badge, or a group header's name) is
+/// drawn. Fills and rims are vertical gradients, top to bottom. The shadow
+/// falls one pixel down, blurred by `shadow_blur` (a Gaussian sigma).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ProjectPillStyle {
+    pub(super) fill_top: ColorU,
+    pub(super) fill_bottom: ColorU,
+    pub(super) rim_top: ColorU,
+    pub(super) rim_bottom: ColorU,
+    pub(super) text: ColorU,
+    pub(super) shadow: ColorU,
+    pub(super) shadow_blur: f32,
+}
+
+/// A solid label in a calm tone of `hue` with text in a deep (light themes) or
+/// pale (dark themes) shade of the same hue, edged with glass: a hairline that
+/// is bright on top and fades downward, over a soft shadow.
+pub(super) fn project_pill_style(hue: f64, dark_theme: bool) -> ProjectPillStyle {
+    if dark_theme {
+        ProjectPillStyle {
+            fill_top: DARK_FILL[0].of(hue),
+            fill_bottom: DARK_FILL[1].of(hue),
+            rim_top: ColorU::new(255, 255, 255, DARK_RIM_ALPHA[0]),
+            rim_bottom: ColorU::new(255, 255, 255, DARK_RIM_ALPHA[1]),
+            text: PALE_TEXT.of(hue),
+            shadow: ColorU::new(0, 0, 0, 89),
+            shadow_blur: 1.5,
+        }
+    } else {
+        let deep = DEEP_TEXT.of(hue);
+        ProjectPillStyle {
+            fill_top: LIGHT_FILL[0].of(hue),
+            fill_bottom: LIGHT_FILL[1].of(hue),
+            rim_top: ColorU::new(255, 255, 255, LIGHT_RIM_TOP_ALPHA),
+            rim_bottom: ColorU {
+                a: LIGHT_RIM_BOTTOM_ALPHA,
+                ..deep
+            },
+            text: deep,
+            shadow: ColorU::new(31, 35, 48, 36),
+            shadow_blur: 1.,
+        }
+    }
+}
+
+/// An opaque sRGB color from OKLCH (lightness 0 to 1, chroma, hue in degrees),
+/// with each channel clipped to the sRGB gamut.
+fn oklch(lightness: f64, chroma: f64, hue_degrees: f64) -> ColorU {
+    let (sin, cos) = hue_degrees.to_radians().sin_cos();
+    let (a, b) = (chroma * cos, chroma * sin);
+    let l = (lightness + 0.3963377774 * a + 0.2158037573 * b).powi(3);
+    let m = (lightness - 0.1055613458 * a - 0.0638541728 * b).powi(3);
+    let s = (lightness - 0.0894841775 * a - 1.291485548 * b).powi(3);
+    let encode = |linear: f64| {
+        let linear = linear.clamp(0., 1.);
+        let encoded = if linear <= 0.0031308 {
+            12.92 * linear
+        } else {
+            1.055 * linear.powf(1. / 2.4) - 0.055
+        };
+        (encoded * 255.).round() as u8
+    };
+    ColorU::new(
+        encode(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+        encode(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+        encode(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+        0xFF,
+    )
 }
 
 /// How long before `now_unix_ms` the change at `changed_at_unix_ms` was; zero

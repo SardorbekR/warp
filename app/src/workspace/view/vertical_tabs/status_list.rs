@@ -34,15 +34,15 @@ use warpui::event::DispatchedEvent;
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
-use warpui::{AppContext, EntityId, EventContext, SingletonEntity, TaskId, ViewHandle};
+use warpui::{AppContext, EntityId, EventContext, Gradient, SingletonEntity, TaskId, ViewHandle};
 
 use super::status_order::{
     AttentionBucket, FreezeInputs, GROUP_TRANSITION_DURATION, GroupHeaderText, GroupTransition,
     OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, StatusRowKey, StatusSortInput,
     activity_age, auto_group_by_project, compact_age_label, group_by_project, group_header_text,
-    group_transitions, is_order_frozen, project_name, project_palette_color, resolve_display_order,
-    row_attention_bucket, row_display_status, slide_progress, status_sorted_indices,
-    wants_dark_text,
+    group_transitions, is_order_frozen, project_hue, project_name, project_pill_style,
+    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
+    status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -87,12 +87,24 @@ const GROUP_ROW_INDENT: f32 = 10.;
 /// far it is inset from the row's left edge.
 const BADGE_OVERHANG: f32 = 8.;
 const BADGE_INSET: f32 = 8.;
-const BADGE_FONT_SIZE: f32 = 10.;
-const BADGE_MAX_WIDTH: f32 = 160.;
-/// The ring in the panel's color that separates a badge from the row under it.
-const BADGE_RING_WIDTH: f32 = 1.5;
-const GROUP_PILL_FONT_SIZE: f32 = 11.;
-const GROUP_PILL_MAX_WIDTH: f32 = 180.;
+/// A lone row's badge: 16 px tall, so it straddles the row's top edge.
+const BADGE_PILL: PillMetrics = PillMetrics {
+    font_size: 10.,
+    horizontal_padding: 6.,
+    vertical_padding: 1.,
+    corner_radius: 8.,
+    max_width: 160.,
+};
+/// A group header's project name: 19 px tall.
+const GROUP_PILL: PillMetrics = PillMetrics {
+    font_size: 11.,
+    horizontal_padding: 7.,
+    vertical_padding: 2.,
+    corner_radius: 10.,
+    max_width: 180.,
+};
+/// The label's glass edge, inside its padding.
+const PILL_RIM_WIDTH: f32 = 1.;
 const GROUP_CHEVRON_SIZE: f32 = 12.;
 /// How far a forming group's header rises into place, and a dissolving
 /// group's badge sinks into place.
@@ -100,13 +112,6 @@ const GROUP_HEADER_RISE: f32 = 10.;
 const BADGE_SINK: f32 = 12.;
 /// Repaint interval while something slides (about 60 fps).
 const SLIDE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-/// Text on a light project color.
-const DARK_BADGE_TEXT: ColorU = ColorU {
-    r: 0x0B,
-    g: 0x12,
-    b: 0x17,
-    a: 0xFF,
-};
 const ERROR_ICON_SIZE: f32 = 12.;
 /// Inset of the list, rows and headers from the panel's edges.
 const LIST_HORIZONTAL_PADDING: f32 = 10.;
@@ -1411,19 +1416,65 @@ fn with_full_title_tooltip(
     .finish()
 }
 
-fn project_color(project: &str, theme: &WarpTheme) -> ColorU {
-    project_palette_color(project)
-        .to_ansi_color(&theme.terminal_colors().normal)
-        .into()
+struct PillMetrics {
+    font_size: f32,
+    horizontal_padding: f32,
+    vertical_padding: f32,
+    corner_radius: f32,
+    max_width: f32,
 }
 
-/// Text color on a project-colored badge or header pill.
-fn project_text_color(color: ColorU) -> ColorU {
-    if wants_dark_text(color) {
-        DARK_BADGE_TEXT
-    } else {
-        ColorU::white()
-    }
+/// `name` on a solid label in `project`'s hue, edged with glass (see
+/// [`project_pill_style`]).
+fn render_project_pill(
+    name: String,
+    project: &str,
+    metrics: &PillMetrics,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let dark_theme = appearance.theme().inferred_color_scheme() == ColorScheme::LightOnDark;
+    let style = project_pill_style(project_hue(project), dark_theme);
+    let top = vec2f(0., 0.);
+    let bottom = vec2f(0., 1.);
+    ConstrainedBox::new(
+        Container::new(
+            Text::new_inline(name, appearance.ui_font_family(), metrics.font_size)
+                .with_clip(ClipConfig::ellipsis())
+                .with_color(style.text)
+                .with_style(Properties::default().weight(Weight::Medium))
+                .finish(),
+        )
+        .with_horizontal_padding(metrics.horizontal_padding)
+        .with_vertical_padding(metrics.vertical_padding)
+        .with_background_gradient(
+            top,
+            bottom,
+            Gradient {
+                start: style.fill_top,
+                end: style.fill_bottom,
+            },
+        )
+        .with_border(Border::all(PILL_RIM_WIDTH).with_border_gradient(
+            top,
+            bottom,
+            Gradient {
+                start: style.rim_top,
+                end: style.rim_bottom,
+            },
+        ))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+            metrics.corner_radius,
+        )))
+        .with_drop_shadow(DropShadow {
+            color: style.shadow,
+            offset: vec2f(0., 1.),
+            blur_radius: style.shadow_blur,
+            spread_radius: 0.,
+        })
+        .finish(),
+    )
+    .with_max_width(metrics.max_width)
+    .finish()
 }
 
 /// Puts a lone row's project badge on the row's top edge, like a folder tab.
@@ -1435,32 +1486,7 @@ fn with_project_badge(
     slide_started_at: Option<Instant>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    let color = project_color(project, theme);
-    let badge = ConstrainedBox::new(
-        Container::new(
-            Text::new_inline(
-                project.to_owned(),
-                appearance.ui_font_family(),
-                BADGE_FONT_SIZE,
-            )
-            .with_clip(ClipConfig::ellipsis())
-            .with_color(project_text_color(color))
-            .with_style(Properties::default().weight(Weight::Semibold))
-            .finish(),
-        )
-        .with_horizontal_padding(6.)
-        .with_vertical_padding(0.5)
-        .with_background_color(color)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-        .with_border(
-            Border::all(BADGE_RING_WIDTH)
-                .with_border_fill(WarpThemeFill::Solid(theme.background().into_solid())),
-        )
-        .finish(),
-    )
-    .with_max_width(BADGE_MAX_WIDTH)
-    .finish();
+    let badge = render_project_pill(project.to_owned(), project, &BADGE_PILL, appearance);
     let badge = match slide_started_at {
         Some(started_at) => SlideIn::new(badge, vec2f(0., -BADGE_SINK), started_at).finish(),
         None => badge,
@@ -1566,23 +1592,7 @@ fn render_group_header(
         ..
     } = header;
 
-    let color = project_color(&project, theme);
-    let pill = ConstrainedBox::new(
-        Container::new(
-            Text::new_inline(text.name, font_family, GROUP_PILL_FONT_SIZE)
-                .with_clip(ClipConfig::ellipsis())
-                .with_color(project_text_color(color))
-                .with_style(Properties::default().weight(Weight::Semibold))
-                .finish(),
-        )
-        .with_horizontal_padding(7.)
-        .with_vertical_padding(2.)
-        .with_background_color(color)
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
-        .finish(),
-    )
-    .with_max_width(GROUP_PILL_MAX_WIDTH)
-    .finish();
+    let pill = render_project_pill(text.name, &project, &GROUP_PILL, appearance);
     let name_and_count = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)

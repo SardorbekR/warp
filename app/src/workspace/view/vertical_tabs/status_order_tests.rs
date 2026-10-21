@@ -5,14 +5,14 @@ use pathfinder_color::ColorU;
 use warpui::EntityId;
 
 use super::{
-    AttentionBucket, FreezeInputs, GroupHeaderText, GroupTransition,
-    KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, OTHER_PROJECT_LABEL, POINTER_IDLE_CAP,
-    POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup, StatusRowKey, StatusRowNavigation,
-    StatusSortInput, activity_age, attention_bucket, auto_group_by_project, compact_age_label,
-    group_by_project, group_header_text, group_transitions, is_order_frozen, navigation_target,
-    project_name, project_palette_color, project_palette_index, reconcile_frozen_order,
-    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
-    status_sorted_indices, wants_dark_text,
+    AttentionBucket, DARK_FILL, DEEP_TEXT, FreezeInputs, GroupHeaderText, GroupTransition,
+    KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, LIGHT_FILL, OTHER_PROJECT_LABEL, PALE_TEXT,
+    POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_HUES, ProjectGroup, StatusRowKey,
+    StatusRowNavigation, StatusSortInput, activity_age, attention_bucket, auto_group_by_project,
+    compact_age_label, group_by_project, group_header_text, group_transitions, is_order_frozen,
+    navigation_target, oklch, project_hue, project_name, project_palette_index, project_pill_style,
+    reconcile_frozen_order, resolve_display_order, row_attention_bucket, row_display_status,
+    slide_progress, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -484,17 +484,113 @@ fn slides_ease_out_from_start_to_end() {
     assert_eq!(slide_progress(Duration::from_millis(3), Duration::ZERO), 1.);
 }
 
+/// The WCAG relative luminance of an opaque color (alpha is ignored).
+fn relative_luminance(color: ColorU) -> f32 {
+    let channel = |value: u8| {
+        let value = f32::from(value) / 255.;
+        if value <= 0.039_28 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
+}
+
+/// The WCAG contrast ratio of two opaque colors.
+fn contrast_ratio(a: ColorU, b: ColorU) -> f32 {
+    let (a, b) = (relative_luminance(a), relative_luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> ColorU {
+    ColorU::new(r, g, b, 0xFF)
+}
+
 #[test]
-fn badge_text_contrasts_with_the_project_color() {
-    let rgb = |r, g, b| ColorU::new(r, g, b, 0xFF);
-    assert!(wants_dark_text(rgb(0xFF, 0xFF, 0xFF)));
-    assert!(!wants_dark_text(rgb(0x00, 0x00, 0x00)));
-    // Light theme colors (a pale yellow, a light green).
-    assert!(wants_dark_text(rgb(0xFE, 0xFD, 0xC2)));
-    assert!(wants_dark_text(rgb(0xB4, 0xFA, 0x72)));
-    // Saturated dark ones (a deep blue, a dark red).
-    assert!(!wants_dark_text(rgb(0x1E, 0x3A, 0x8A)));
-    assert!(!wants_dark_text(rgb(0x99, 0x1B, 0x1B)));
+fn oklch_matches_known_colors() {
+    assert_eq!(oklch(1., 0., 0.), ColorU::white());
+    assert_eq!(oklch(0., 0., 0.), ColorU::black());
+    assert_eq!(DEEP_TEXT.of(12.), rgb(0x77, 0x3A, 0x43));
+    assert_eq!(PALE_TEXT.of(198.), rgb(0xBD, 0xE5, 0xE6));
+    assert_eq!(DARK_FILL[0].of(12.), rgb(0x65, 0x42, 0x46));
+    assert_eq!(LIGHT_FILL[1].of(256.), rgb(0xD8, 0xE8, 0xFD));
+    // Deep teal lies just outside sRGB; its red channel is clipped to zero.
+    assert_eq!(DEEP_TEXT.of(198.), rgb(0x00, 0x5D, 0x61));
+}
+
+#[test]
+fn project_label_text_is_readable_on_every_hue() {
+    for hue in PROJECT_HUES {
+        for dark_theme in [true, false] {
+            let style = project_pill_style(hue, dark_theme);
+            for fill in [style.fill_top, style.fill_bottom] {
+                assert_eq!(fill.a, 0xFF, "the label is solid");
+                let ratio = contrast_ratio(style.text, fill);
+                assert!(
+                    ratio >= 4.5,
+                    "hue {hue} dark_theme={dark_theme}: {ratio:.2}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn project_tones_are_equally_bright_across_hues() {
+    for tone in [
+        DEEP_TEXT,
+        PALE_TEXT,
+        DARK_FILL[0],
+        DARK_FILL[1],
+        LIGHT_FILL[0],
+        LIGHT_FILL[1],
+    ] {
+        let luminances: Vec<f32> = PROJECT_HUES
+            .iter()
+            .map(|&hue| relative_luminance(tone.of(hue)))
+            .collect();
+        let brightest = luminances.iter().copied().fold(f32::MIN, f32::max);
+        let dimmest = luminances.iter().copied().fold(f32::MAX, f32::min);
+        assert!(brightest / dimmest < 1.25, "{tone:?}: {luminances:?}");
+    }
+}
+
+#[test]
+fn project_label_style_follows_the_theme() {
+    let hue = PROJECT_HUES[5];
+    let dark = project_pill_style(hue, true);
+    assert_eq!(dark.text, PALE_TEXT.of(hue));
+    // A glass edge: white, brightest on top and fading downward.
+    assert_eq!(
+        (dark.rim_top.r, dark.rim_top.g, dark.rim_top.b),
+        (255, 255, 255)
+    );
+    assert_eq!(
+        (dark.rim_bottom.r, dark.rim_bottom.g, dark.rim_bottom.b),
+        (255, 255, 255)
+    );
+    assert!(dark.rim_top.a > dark.rim_bottom.a);
+    assert!(relative_luminance(dark.fill_top) > relative_luminance(dark.fill_bottom));
+
+    let light = project_pill_style(hue, false);
+    let deep = DEEP_TEXT.of(hue);
+    assert_eq!(light.text, deep);
+    // White on top, fading into a trace of the label's own deep tone.
+    assert_eq!(light.rim_top.r, 255);
+    assert_eq!(
+        (light.rim_bottom.r, light.rim_bottom.g, light.rim_bottom.b),
+        (deep.r, deep.g, deep.b)
+    );
+    assert!(light.rim_bottom.a < 128);
+    assert!(relative_luminance(light.fill_top) > relative_luminance(light.fill_bottom));
+}
+
+#[test]
+fn palette_hues_are_distinct_angles() {
+    let hues: HashSet<u64> = PROJECT_HUES.iter().map(|hue| hue.to_bits()).collect();
+    assert_eq!(hues.len(), PROJECT_HUES.len());
+    assert!(PROJECT_HUES.iter().all(|hue| (0. ..360.).contains(hue)));
 }
 
 #[test]
@@ -566,13 +662,9 @@ fn resolve_display_order_only_freezes_when_requested() {
 fn palette_index_is_stable_and_in_range() {
     for project in ["", "warp", "api", "Launch", "a/b", "日本語", "warp"] {
         let index = project_palette_index(project);
-        assert!(index < PROJECT_PALETTE.len(), "{project}: {index}");
+        assert!(index < PROJECT_HUES.len(), "{project}: {index}");
         assert_eq!(index, project_palette_index(project));
-        assert_eq!(
-            project_palette_color(project),
-            PROJECT_PALETTE[index],
-            "{project}"
-        );
+        assert_eq!(project_hue(project), PROJECT_HUES[index], "{project}");
     }
 }
 
