@@ -217,6 +217,7 @@ RELEASE_CHANNEL="dev"
 FEATURES="release_bundle,cocoa_sentry,extern_plist"
 REGISTER_SERVICES=true
 DEBUG=false
+FAST_BUILD=false
 ARTIFACT="app"
 CODESIGN=true
 SELFSIGN=false
@@ -230,6 +231,13 @@ while (( "$#" )); do
     # rather than a release version
     --debug)
       DEBUG=true
+      shift
+      ;;
+    # Fork: a quick optimized build for trying out small changes. It uses the
+    # `release` profile with incremental compilation instead of release-lto,
+    # and skips the dSYM and the dmg. The app lands in target/release/bundle/osx.
+    --fast)
+      FAST_BUILD=true
       shift
       ;;
     # Only run `cargo check` without producing a bundle
@@ -361,6 +369,11 @@ eval set -- "$PARAMS"
 # Infer a cargo profile from the bundle configuration.
 if [[ $DEBUG = true ]]; then
   CARGO_PROFILE="dev"
+elif [[ $FAST_BUILD = true ]]; then
+  echo "Fast build: release profile, incremental, no dSYM and no dmg."
+  CARGO_PROFILE="release"
+  export CARGO_PROFILE_RELEASE_INCREMENTAL=true
+  export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked
 elif [[ $RELEASE_CHANNEL = "local" || $RELEASE_CHANNEL = "dev" ]]; then
   # For dev bundles, we want to enable debug assertions to
   # catch violations that would otherwise silently pass in
@@ -955,7 +968,7 @@ fi
 ## Step 4: Create DMG ##
 ########################
 
-if [[ "$ARTIFACT" = app ]]; then
+if [[ "$ARTIFACT" = app && $FAST_BUILD != true ]]; then
   function create_warp_dmg() {
     echo "Creating $DMG_DIR/$DMG_NAME..."
     rm "$DMG_DIR/$DMG_NAME" || true
@@ -1049,7 +1062,9 @@ fi
 if [[ "$ARTIFACT" = app ]]; then
   echo "Copying dmg and app to $OUT_DIR"
   cp -R "$BUNDLE_DIR/$WARP_APP_NAME.app" "$OUT_DIR"
-  cp "$DMG_DIR/$DMG_NAME" "$OUT_DIR/$FINAL_DMG_NAME"
+  if [[ $FAST_BUILD != true ]]; then
+    cp "$DMG_DIR/$DMG_NAME" "$OUT_DIR/$FINAL_DMG_NAME"
+  fi
 fi
 
 # If this is being run within a GitHub action, set an output variable with the
