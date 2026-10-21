@@ -5,6 +5,7 @@ pub mod listener;
 pub(crate) mod plugin_manager;
 pub mod restore;
 pub mod restore_save;
+pub(crate) mod session_name;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -114,6 +115,9 @@ pub struct CLIAgentSessionContext {
     /// Whether the agent showed a prompt only an interactive session shows (an idle prompt or a
     /// permission request), unlike e.g. `claude -p` run by a script.
     pub showed_interactive_prompt: bool,
+    /// Fork: the first prompt this instance saw for `resume_session_id`, which names sessions of
+    /// agents that don't report a name (see `session_name`).
+    pub first_query: Option<String>,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -257,6 +261,7 @@ impl CLIAgentSessionContext {
             // session, so its state is kept.
             if previous_session_id.is_some() {
                 self.query = None;
+                self.first_query = None;
                 self.query_from_other_session = false;
                 self.response = None;
                 self.summary = None;
@@ -432,6 +437,9 @@ impl CLIAgentSession {
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
                 self.session_context.query = event.payload.query.clone();
+                if from_resumed_session && self.session_context.first_query.is_none() {
+                    self.session_context.first_query = self.session_context.latest_user_prompt();
+                }
                 self.session_context.response = None;
                 self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::InProgress

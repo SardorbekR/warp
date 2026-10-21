@@ -397,6 +397,9 @@ pub enum WorkspaceAction {
     ToggleVerticalTabsShowDetailsOnHover,
     /// Fork: sets how rows are ordered in the vertical tabs panel.
     SetVerticalTabsSortMode(VerticalTabsSortMode),
+    /// Fork: collapses the named project's group in the vertical tabs panel, or
+    /// expands it if it is collapsed.
+    ToggleVerticalTabsProjectCollapsed(String),
     /// Fork: marks a terminal view as unread until the user focuses it.
     MarkTerminalViewUnread {
         terminal_view_id: EntityId,
@@ -1123,6 +1126,7 @@ impl WorkspaceAction {
             | ToggleVerticalTabsShowDiffStats
             | ToggleVerticalTabsShowDetailsOnHover
             | SetVerticalTabsSortMode(_)
+            | ToggleVerticalTabsProjectCollapsed(_)
             | MarkTerminalViewUnread { .. }
             | MarkTerminalViewRead { .. }
             | ToggleFocusedTerminalViewUnread

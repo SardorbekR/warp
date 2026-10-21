@@ -3934,6 +3934,7 @@ impl Workspace {
             }
             | TabSettingsChangedEvent::VerticalTabsShowPrLink { .. }
             | TabSettingsChangedEvent::VerticalTabsShowDiffStats { .. }
+            | TabSettingsChangedEvent::VerticalTabsCollapsedProjects { .. }
             | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. } => {
                 ctx.notify();
             }
@@ -25225,6 +25226,20 @@ impl TypedActionView for Workspace {
                 let mode = *mode;
                 TabSettings::handle(ctx).update(ctx, |settings, ctx| {
                     let _ = settings.vertical_tabs_sort_mode.set_value(mode, ctx);
+                });
+                ctx.notify();
+            }
+            ToggleVerticalTabsProjectCollapsed(project) => {
+                TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    let mut collapsed = settings.vertical_tabs_collapsed_projects.value().clone();
+                    if !collapsed.remove(project) {
+                        collapsed.insert(project.clone());
+                    }
+                    report_if_error!(
+                        settings
+                            .vertical_tabs_collapsed_projects
+                            .set_value(collapsed, ctx)
+                    );
                 });
                 ctx.notify();
             }

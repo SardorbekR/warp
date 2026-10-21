@@ -32,6 +32,7 @@ fn record(
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
+        session_name: None,
     }
 }
 
@@ -139,6 +140,83 @@ fn last_activity_round_trips_and_does_not_count_as_content() {
     let without = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
     let json = without.to_json().expect("record should serialize");
     assert!(!json.contains("last_activity_at_unix_ms"), "{json}");
+}
+
+#[test]
+fn session_name_round_trips_cleaned_and_does_not_count_as_content() {
+    let mut original = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    original.session_name = Some("Paywall free trial A/B test".to_owned());
+    let json = original.to_json().expect("record should serialize");
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("valid record");
+    assert_eq!(
+        restored.session_name.as_deref(),
+        Some("Paywall free trial A/B test")
+    );
+    assert_eq!(
+        restored.display_name().as_deref(),
+        Some("Paywall free trial A/B test")
+    );
+
+    // A new name alone must not cause a save.
+    let mut renamed = restored.clone();
+    renamed.session_name = Some("Paywall copy".to_owned());
+    assert!(renamed.has_same_content(&restored));
+
+    // Names read back are cleaned like titles; blank ones are dropped.
+    let json = format!(
+        r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}","session_name":"a\u202eb\u0007c"}}"#
+    );
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("valid record");
+    assert_eq!(restored.session_name.as_deref(), Some("ab c"));
+    let json =
+        format!(r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}","session_name":"   "}}"#);
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("valid record");
+    assert_eq!(restored.session_name, None);
+
+    // Older records have none, and a record without one doesn't write the key.
+    let without = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    let json = without.to_json().expect("record should serialize");
+    assert!(!json.contains("session_name"), "{json}");
+    assert_eq!(
+        PersistedCLIAgentSession::from_json(&json).and_then(|record| record.session_name),
+        None
+    );
+}
+
+#[test]
+fn display_name_falls_back_to_the_title() {
+    let mut named = record(CLIAgent::Codex, Some(CODEX_ID), Some("/proj"));
+    assert_eq!(named.display_name().as_deref(), Some("fix the login bug"));
+    named.session_name = Some("Login fix".to_owned());
+    assert_eq!(named.display_name().as_deref(), Some("Login fix"));
+    named.title = None;
+    named.session_name = None;
+    assert_eq!(named.display_name(), None);
+}
+
+#[test]
+fn live_record_keeps_the_name_of_the_same_session_only() {
+    let mut restored = record(CLIAgent::Codex, Some(CODEX_ID), Some("/proj"));
+    restored.session_name = Some("fix the login bug".to_owned());
+
+    let same = live_session(
+        CLIAgent::Codex,
+        context(Some(CODEX_ID), Some("/proj"), Some("next prompt")),
+    );
+    let live =
+        PersistedCLIAgentSession::from_live_session(&same, None, Some(&restored), LOCAL_AGENT, 9)
+            .expect("Codex sessions are persisted");
+    assert_eq!(live.session_name.as_deref(), Some("fix the login bug"));
+
+    let other_id = "019a6c2e-7b1d-7e42-a5f3-2c9d8e1b4a61";
+    let other = live_session(
+        CLIAgent::Codex,
+        context(Some(other_id), Some("/proj"), Some("a new session")),
+    );
+    let live =
+        PersistedCLIAgentSession::from_live_session(&other, None, Some(&restored), LOCAL_AGENT, 9)
+            .expect("Codex sessions are persisted");
+    assert_eq!(live.session_name, None);
 }
 
 #[test]

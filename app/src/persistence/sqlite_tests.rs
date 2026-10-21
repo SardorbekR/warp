@@ -1183,6 +1183,7 @@ fn test_cli_agent_session_record() -> PersistedCLIAgentSession {
         evidently_interactive: true,
         updated_at_unix_ms: 1_760_000_000_000,
         last_activity_at_unix_ms: Some(1_759_999_000_000),
+        session_name: None,
     }
 }
 

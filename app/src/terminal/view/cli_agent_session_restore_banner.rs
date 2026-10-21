@@ -100,7 +100,7 @@ impl CLIAgentSessionRestoreBanner {
 
     fn title_text(&self) -> String {
         let agent_name = self.record.agent.display_name();
-        match self.record.display_title() {
+        match self.record.display_name() {
             Some(title) => {
                 let mut displayed: String = title.chars().take(MAX_DISPLAYED_TITLE_CHARS).collect();
                 if title.chars().count() > MAX_DISPLAYED_TITLE_CHARS {

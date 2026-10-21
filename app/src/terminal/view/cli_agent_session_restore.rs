@@ -42,6 +42,9 @@ use crate::terminal::cli_agent_sessions::restore::{
     LaunchObservation, PersistedCLIAgentSession, is_resumable_agent, reported_session_id,
 };
 use crate::terminal::cli_agent_sessions::restore_save::CLIAgentRestoreSaveScheduler;
+use crate::terminal::cli_agent_sessions::session_name::{
+    session_name_from_prompt, session_name_from_terminal_title,
+};
 use crate::terminal::cli_agent_sessions::{
     CLIAgentResumeClaim, CLIAgentResumeClaimKind, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
 };
@@ -183,8 +186,8 @@ impl TerminalView {
         self.cli_agent_session_restore.record.clone()
     }
 
-    /// [`Self::cli_agent_session_for_snapshot`] with when the session last changed status, for
-    /// the saved app state.
+    /// [`Self::cli_agent_session_for_snapshot`] with when the session last changed status and
+    /// (fork) the session's name, for the saved app state.
     pub(crate) fn cli_agent_session_for_app_state(
         &self,
         app: &AppContext,
@@ -196,7 +199,89 @@ impl TerminalView {
         {
             record.last_activity_at_unix_ms = Some(at);
         }
+        if let Some(name) = self.tracked_cli_agent_session_name(app) {
+            record.session_name = Some(name);
+        }
         Some(record)
+    }
+
+    /// Fork: the name of the CLI agent session running in this pane (see
+    /// [`crate::terminal::cli_agent_sessions::session_name`]): the one the agent puts in the
+    /// terminal title, else the one saved for the session, else the session's first prompt.
+    /// Cheap; suitable for calling while rendering.
+    pub(crate) fn live_cli_agent_session_name(&self, app: &AppContext) -> Option<String> {
+        if !app.has_singleton_model::<CLIAgentSessionsModel>() {
+            return None;
+        }
+        let session = CLIAgentSessionsModel::as_ref(app).session(self.view_id)?;
+        session_name_from_terminal_title(session.agent, &self.terminal_title)
+            .or_else(|| {
+                let record = self.cli_agent_session_restore.record.as_ref()?;
+                let is_same_session = record.agent == session.agent
+                    && reported_session_id(session).is_some()
+                    && record.session_id.as_deref() == reported_session_id(session);
+                is_same_session
+                    .then(|| record.session_name.clone())
+                    .flatten()
+            })
+            .or_else(|| {
+                session
+                    .session_context
+                    .first_query
+                    .as_deref()
+                    .and_then(session_name_from_prompt)
+            })
+    }
+
+    /// Fork: [`Self::live_cli_agent_session_name`] when the running session is the one the
+    /// record follows, which is the only time the record may take its name.
+    fn tracked_cli_agent_session_name(&self, app: &AppContext) -> Option<String> {
+        let state = &self.cli_agent_session_restore;
+        if state.phase != RecoveryPhase::Tracking || !state.record_is_live_instance {
+            return None;
+        }
+        let record = state.record.as_ref()?;
+        if !app.has_singleton_model::<CLIAgentSessionsModel>() {
+            return None;
+        }
+        let session = CLIAgentSessionsModel::as_ref(app).session(self.view_id)?;
+        let is_same_session = session.agent == record.agent
+            && reported_session_id(session).is_some()
+            && reported_session_id(session) == record.session_id.as_deref();
+        is_same_session
+            .then(|| self.live_cli_agent_session_name(app))
+            .flatten()
+    }
+
+    /// Fork: the terminal title may name the tracked session (Claude Code puts its name there).
+    pub(super) fn on_terminal_title_changed_for_cli_agent_restore(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.refresh_cli_agent_session_name(ctx);
+    }
+
+    /// Fork: keeps the record's name in step with the tracked session's, so that it outlives
+    /// the session (e.g. an agent that failed leaves the pane offering the session by its
+    /// name). A new name asks for a lazy app-state save, so that the pane restored after a
+    /// crash shows it. The title also changes while the agent works (its status glyph), which
+    /// doesn't change the name.
+    fn refresh_cli_agent_session_name(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(name) = self.tracked_cli_agent_session_name(ctx) else {
+            return;
+        };
+        let Some(record) = self.cli_agent_session_restore.record.as_mut() else {
+            return;
+        };
+        if record.session_name.as_ref() == Some(&name) {
+            return;
+        }
+        record.session_name = Some(name);
+        if ctx.has_singleton_model::<CLIAgentRestoreSaveScheduler>() {
+            CLIAgentRestoreSaveScheduler::handle(ctx).update(ctx, |scheduler, ctx| {
+                scheduler.request_lazy_save(ctx);
+            });
+        }
     }
 
     /// The interrupted CLI agent session (e.g. restored after Warp quit or crashed) that this
@@ -986,6 +1071,7 @@ impl TerminalView {
                 scheduler.request_lazy_save(ctx);
             });
         }
+        self.refresh_cli_agent_session_name(ctx);
         self.save_if_cli_agent_record_changed(before, ctx);
     }
 

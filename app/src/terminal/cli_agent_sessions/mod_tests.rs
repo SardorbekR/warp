@@ -2407,3 +2407,73 @@ fn escape_between_turns_arms_nothing() {
         });
     });
 }
+
+#[test]
+fn first_query_names_the_session_until_another_session_is_resumed() {
+    let mut session = session_mid_turn();
+    assert_eq!(
+        session.session_context.first_query.as_deref(),
+        Some("fix the build")
+    );
+
+    // A nested run's prompt describes that run, not this session.
+    for event in [
+        CLIAgentEventType::SessionStart,
+        CLIAgentEventType::PromptSubmit,
+        CLIAgentEventType::Stop,
+    ] {
+        session.apply_event(&event_from(CLIAgent::Claude, event, "nested"));
+    }
+    assert_eq!(
+        session.session_context.first_query.as_deref(),
+        Some("fix the build")
+    );
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    // Later prompts don't rename it.
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("and run the tests".to_owned()),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        session.session_context.first_query.as_deref(),
+        Some("fix the build")
+    );
+    session.apply_event(&session_event(
+        CLIAgentEventType::Stop,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+
+    // e.g. `/resume` of another session between turns.
+    session.apply_event(&session_event(
+        CLIAgentEventType::SessionStart,
+        Some("other"),
+        Some("/repo"),
+        CLIAgentEventPayload::default(),
+    ));
+    assert_eq!(session.session_context.first_query, None);
+    session.apply_event(&session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("other"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("plan the release".to_owned()),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        session.session_context.first_query.as_deref(),
+        Some("plan the release")
+    );
+}

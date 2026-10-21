@@ -95,6 +95,7 @@ fn restored_record() -> PersistedCLIAgentSession {
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
+        session_name: None,
     }
 }
 
@@ -352,6 +353,188 @@ fn restored_session_shows_banner_after_real_bootstrap() {
         assert_eq!(phase(&app, &terminal), RecoveryPhase::Interrupted);
         assert_eq!(restorable(&app, &terminal), Some(restored_record()));
         assert!(can_resume_here(&app, &terminal));
+    })
+}
+
+fn set_terminal_title(app: &mut App, terminal: &ViewHandle<TerminalView>, title: &str) {
+    terminal.update(app, |view, ctx| {
+        view.terminal_title = title.to_owned();
+        view.on_terminal_title_changed_for_cli_agent_restore(ctx);
+    });
+}
+
+fn live_session_name(app: &App, terminal: &ViewHandle<TerminalView>) -> Option<String> {
+    terminal.read(app, |view, ctx| view.live_cli_agent_session_name(ctx))
+}
+
+#[test]
+fn claude_sessions_are_named_by_their_terminal_title() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(SESSION_ID), Some("fix it")),
+        );
+
+        // A title without Claude Code's status glyph was set by something else.
+        set_terminal_title(&mut app, &terminal, "claude");
+        assert_eq!(live_session_name(&app, &terminal), None);
+
+        set_terminal_title(&mut app, &terminal, "✳ Paywall free trial A/B test");
+        assert_eq!(
+            live_session_name(&app, &terminal).as_deref(),
+            Some("Paywall free trial A/B test")
+        );
+        // The glyph changes while the agent works; the name doesn't.
+        set_terminal_title(&mut app, &terminal, "◐ Paywall free trial A/B test");
+        assert_eq!(
+            live_session_name(&app, &terminal).as_deref(),
+            Some("Paywall free trial A/B test")
+        );
+        // The record and the saved app state keep it.
+        assert_eq!(
+            snapshot(&app, &terminal)
+                .and_then(|record| record.session_name)
+                .as_deref(),
+            Some("Paywall free trial A/B test")
+        );
+        let saved = terminal.read(&app, |view, ctx| view.cli_agent_session_for_app_state(ctx));
+        assert_eq!(
+            saved.and_then(|record| record.session_name).as_deref(),
+            Some("Paywall free trial A/B test")
+        );
+
+        // A rename replaces it.
+        set_terminal_title(&mut app, &terminal, "✳ Paywall copy");
+        assert_eq!(
+            snapshot(&app, &terminal)
+                .and_then(|record| record.session_name)
+                .as_deref(),
+            Some("Paywall copy")
+        );
+
+        // Once the session is gone, the pane has no live name.
+        end_live_session(&mut app, view_id);
+        assert_eq!(live_session_name(&app, &terminal), None);
+    })
+}
+
+#[test]
+fn codex_sessions_are_named_after_their_first_prompt() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        let mut session = live_session(
+            CLIAgent::Codex,
+            true,
+            Some(SESSION_ID),
+            Some("and now the tests"),
+        );
+        session.session_context.first_query = Some("refactor the parser\nthen".to_owned());
+        start_live_session(&mut app, view_id, session);
+        // Codex titles aren't names.
+        set_terminal_title(&mut app, &terminal, "✳ Working");
+        assert_eq!(
+            live_session_name(&app, &terminal).as_deref(),
+            Some("refactor the parser")
+        );
+        assert_eq!(
+            snapshot(&app, &terminal)
+                .and_then(|record| record.session_name)
+                .as_deref(),
+            Some("refactor the parser")
+        );
+    })
+}
+
+#[test]
+fn a_failed_session_is_offered_by_its_name() {
+    App::test((), |mut app| async move {
+        let terminal = bootstrapped_terminal(&mut app).await;
+        let view_id = terminal.id();
+        simulate_running_command(&mut app, &terminal, "claude");
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(SESSION_ID), Some("fix it")),
+        );
+        set_terminal_title(&mut app, &terminal, "✳ Login bug");
+        end_live_session(&mut app, view_id);
+        complete_agent_block(&mut app, &terminal, false);
+
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::Interrupted);
+        let restorable = restorable(&app, &terminal).expect("the session can be offered");
+        assert_eq!(restorable.display_name().as_deref(), Some("Login bug"));
+    })
+}
+
+#[test]
+fn a_restored_session_keeps_its_name_when_resumed() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        let mut record = restored_record();
+        record.agent = CLIAgent::Codex;
+        record.session_name = Some("Login bug".to_owned());
+        restore(&mut app, &terminal, record);
+        assert_eq!(
+            restorable(&app, &terminal)
+                .and_then(|record| record.display_name())
+                .as_deref(),
+            Some("Login bug")
+        );
+        mark_resume_sent(&mut app, &terminal);
+
+        // The resumed agent reports the same session, with a new first prompt.
+        let mut session = live_session(CLIAgent::Codex, true, Some(SESSION_ID), Some("keep going"));
+        session.session_context.first_query = Some("keep going".to_owned());
+        start_live_session(&mut app, view_id, session);
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::Tracking);
+        assert_eq!(
+            live_session_name(&app, &terminal).as_deref(),
+            Some("Login bug")
+        );
+    })
+}
+
+#[test]
+fn a_resumed_claude_session_keeps_its_name_until_claude_titles_it() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        let mut record = restored_record();
+        record.session_name = Some("Login bug".to_owned());
+        restore(&mut app, &terminal, record);
+        mark_resume_sent(&mut app, &terminal);
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(SESSION_ID), Some("keep going")),
+        );
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::Tracking);
+
+        // Claude Code's title before it names the session isn't a name.
+        set_terminal_title(&mut app, &terminal, "✳ Claude Code");
+        assert_eq!(
+            live_session_name(&app, &terminal).as_deref(),
+            Some("Login bug")
+        );
+        assert_eq!(
+            snapshot(&app, &terminal)
+                .and_then(|record| record.session_name)
+                .as_deref(),
+            Some("Login bug")
+        );
+
+        set_terminal_title(&mut app, &terminal, "✳ Login bug, part two");
+        assert_eq!(
+            snapshot(&app, &terminal)
+                .and_then(|record| record.session_name)
+                .as_deref(),
+            Some("Login bug, part two")
+        );
     })
 }
 

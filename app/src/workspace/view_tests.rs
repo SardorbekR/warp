@@ -3139,6 +3139,7 @@ fn interrupted_cli_agent_session(
         evidently_interactive: true,
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
+        session_name: None,
     }
 }
 

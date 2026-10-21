@@ -1,14 +1,18 @@
+use std::collections::HashSet;
 use std::time::Duration;
 
+use pathfinder_color::ColorU;
 use warpui::EntityId;
 
 use super::{
-    AttentionBucket, FreezeInputs, GroupHeaderText, KEYBOARD_NAVIGATION_FREEZE_TIMEOUT,
-    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup,
-    StatusRowKey, StatusRowNavigation, StatusSortInput, activity_age, attention_bucket,
-    compact_age_label, group_by_project, group_header_text, is_order_frozen, navigation_target,
+    AttentionBucket, FreezeInputs, GroupHeaderText, GroupTransition,
+    KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, OTHER_PROJECT_LABEL, POINTER_IDLE_CAP,
+    POINTER_IDLE_RELEASE, PROJECT_PALETTE, ProjectGroup, StatusRowKey, StatusRowNavigation,
+    StatusSortInput, activity_age, attention_bucket, auto_group_by_project, compact_age_label,
+    group_by_project, group_header_text, group_transitions, is_order_frozen, navigation_target,
     project_name, project_palette_color, project_palette_index, reconcile_frozen_order,
-    resolve_display_order, row_attention_bucket, row_display_status, status_sorted_indices,
+    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
+    status_sorted_indices, wants_dark_text,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -371,6 +375,126 @@ fn group_by_project_skips_out_of_range_indices() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].row_indices, vec![0]);
     assert!(group_by_project(&rows, &[]).is_empty());
+}
+
+#[test]
+fn auto_grouping_never_groups_rows_of_an_unknown_project() {
+    let rows = vec![
+        StatusSortInput {
+            project: Some("warp"),
+            ..row(key(1), AttentionBucket::NeedsYou)
+        },
+        row(key(2), AttentionBucket::Unread),
+        StatusSortInput {
+            project: Some("api"),
+            ..row(key(3), AttentionBucket::Running)
+        },
+        StatusSortInput {
+            project: Some("warp"),
+            ..row(key(4), AttentionBucket::Idle)
+        },
+        row(key(5), AttentionBucket::Idle),
+    ];
+    let order = vec![0, 1, 2, 3, 4];
+    let groups = auto_group_by_project(&rows, &order);
+    assert_eq!(
+        groups,
+        vec![
+            // The most urgent row's group comes first and pulls its later row
+            // up with it.
+            ProjectGroup {
+                project: Some("warp"),
+                row_indices: vec![0, 3],
+                needs_you_count: 1,
+            },
+            ProjectGroup {
+                project: None,
+                row_indices: vec![1],
+                needs_you_count: 0,
+            },
+            ProjectGroup {
+                project: Some("api"),
+                row_indices: vec![2],
+                needs_you_count: 0,
+            },
+            ProjectGroup {
+                project: None,
+                row_indices: vec![4],
+                needs_you_count: 0,
+            },
+        ]
+    );
+    // Grouping by project puts the unknown rows together, after the first
+    // one's position.
+    let by_project = group_by_project(&rows, &order);
+    assert_eq!(by_project.len(), 3);
+    assert_eq!(by_project[1].project, None);
+    assert_eq!(by_project[1].row_indices, vec![1, 4]);
+}
+
+fn projects(names: &[&str]) -> HashSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[test]
+fn group_transitions_report_groups_that_formed_or_dissolved() {
+    let previous = projects(&["warp", "api"]);
+    let transitions = group_transitions(
+        Some(&previous),
+        // "api" is still grouped, "docs" just formed.
+        &projects(&["api", "docs"]),
+        // "warp" is down to one session; "web" had no group before.
+        &projects(&["warp", "web"]),
+    );
+    assert_eq!(
+        transitions,
+        vec![
+            ("docs".to_owned(), GroupTransition::Formed),
+            ("warp".to_owned(), GroupTransition::Dissolved),
+        ]
+    );
+}
+
+#[test]
+fn a_group_whose_sessions_all_closed_did_not_dissolve() {
+    let previous = projects(&["warp"]);
+    assert!(group_transitions(Some(&previous), &projects(&[]), &projects(&[])).is_empty());
+}
+
+#[test]
+fn an_incomparable_previous_frame_never_animates() {
+    assert!(group_transitions(None, &projects(&["warp"]), &projects(&["api"])).is_empty());
+}
+
+#[test]
+fn slides_ease_out_from_start_to_end() {
+    let duration = Duration::from_millis(160);
+    assert_eq!(slide_progress(Duration::ZERO, duration), 0.);
+    assert_eq!(slide_progress(duration, duration), 1.);
+    assert_eq!(slide_progress(Duration::from_secs(5), duration), 1.);
+    let halfway = slide_progress(Duration::from_millis(80), duration);
+    // Eased out: past the middle at half time.
+    assert!(halfway > 0.5 && halfway < 1., "{halfway}");
+    let mut last = 0.;
+    for ms in 0..=160 {
+        let progress = slide_progress(Duration::from_millis(ms), duration);
+        assert!(progress >= last, "{ms} ms");
+        last = progress;
+    }
+    assert_eq!(slide_progress(Duration::from_millis(3), Duration::ZERO), 1.);
+}
+
+#[test]
+fn badge_text_contrasts_with_the_project_color() {
+    let rgb = |r, g, b| ColorU::new(r, g, b, 0xFF);
+    assert!(wants_dark_text(rgb(0xFF, 0xFF, 0xFF)));
+    assert!(!wants_dark_text(rgb(0x00, 0x00, 0x00)));
+    // Light theme colors (a pale yellow, a light green).
+    assert!(wants_dark_text(rgb(0xFE, 0xFD, 0xC2)));
+    assert!(wants_dark_text(rgb(0xB4, 0xFA, 0x72)));
+    // Saturated dark ones (a deep blue, a dark red).
+    assert!(!wants_dark_text(rgb(0x1E, 0x3A, 0x8A)));
+    assert!(!wants_dark_text(rgb(0x99, 0x1B, 0x1B)));
 }
 
 #[test]

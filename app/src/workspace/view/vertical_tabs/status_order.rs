@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::time::Duration;
 
+use pathfinder_color::ColorU;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::EntityId;
 
@@ -153,22 +154,45 @@ pub(super) fn group_by_project<'a>(
     rows: &[StatusSortInput<'a>],
     order: &[usize],
 ) -> Vec<ProjectGroup<'a>> {
+    group_rows_by_project(rows, order, true)
+}
+
+/// The status order's grouping: like [`group_by_project`], except that rows
+/// whose project is unknown are never grouped, so each is a group of its own.
+/// The caller shows a header only for groups of two or more rows.
+pub(super) fn auto_group_by_project<'a>(
+    rows: &[StatusSortInput<'a>],
+    order: &[usize],
+) -> Vec<ProjectGroup<'a>> {
+    group_rows_by_project(rows, order, false)
+}
+
+fn group_rows_by_project<'a>(
+    rows: &[StatusSortInput<'a>],
+    order: &[usize],
+    group_unknown_projects: bool,
+) -> Vec<ProjectGroup<'a>> {
     let mut groups: Vec<ProjectGroup<'a>> = Vec::new();
     let mut group_index_by_project: HashMap<Option<&'a str>, usize> = HashMap::new();
     for &row_index in order {
         let Some(row) = rows.get(row_index) else {
             continue;
         };
-        let group_index = *group_index_by_project
-            .entry(row.project)
-            .or_insert_with(|| {
-                groups.push(ProjectGroup {
-                    project: row.project,
-                    row_indices: Vec::new(),
-                    needs_you_count: 0,
-                });
-                groups.len().saturating_sub(1)
+        let mut new_group = || {
+            groups.push(ProjectGroup {
+                project: row.project,
+                row_indices: Vec::new(),
+                needs_you_count: 0,
             });
+            groups.len().saturating_sub(1)
+        };
+        let group_index = if row.project.is_none() && !group_unknown_projects {
+            new_group()
+        } else {
+            *group_index_by_project
+                .entry(row.project)
+                .or_insert_with(new_group)
+        };
         if let Some(group) = groups.get_mut(group_index) {
             group.row_indices.push(row_index);
             if row.bucket == AttentionBucket::NeedsYou {
@@ -198,6 +222,78 @@ pub(super) fn group_header_text(group: &ProjectGroup<'_>) -> GroupHeaderText {
         needs_you: (group.needs_you_count > 0)
             .then(|| format!("{} needs you", group.needs_you_count)),
     }
+}
+
+/// How a project's rows changed between two renders of the status order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum GroupTransition {
+    /// A second session joined the project, so its badge became a group
+    /// header.
+    Formed,
+    /// The project's group shrank to one session, so its header became that
+    /// session's badge.
+    Dissolved,
+}
+
+/// The project groups that formed or dissolved since the previous render, by
+/// project name. `previous` holds the projects that had a group header then,
+/// or is `None` when that render can't be compared (there was none yet, or
+/// it used another order or a search), which never counts as a change.
+/// `grouped` and `lone` hold the projects shown now with a header and as a
+/// single badged row; a group whose rows all went away didn't dissolve.
+pub(super) fn group_transitions(
+    previous: Option<&HashSet<String>>,
+    grouped: &HashSet<String>,
+    lone: &HashSet<String>,
+) -> Vec<(String, GroupTransition)> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    let mut transitions: Vec<(String, GroupTransition)> = grouped
+        .difference(previous)
+        .map(|project| (project.clone(), GroupTransition::Formed))
+        .chain(
+            previous
+                .difference(grouped)
+                .filter(|project| lone.contains(*project))
+                .map(|project| (project.clone(), GroupTransition::Dissolved)),
+        )
+        .collect();
+    transitions.sort();
+    transitions
+}
+
+/// How long a group header or badge slides into place when a group forms or
+/// dissolves.
+pub(super) const GROUP_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+
+/// How far along a slide lasting `duration` is after `elapsed`, eased out
+/// (fast, then settling): 0 at the start, 1 once it's done.
+pub(super) fn slide_progress(elapsed: Duration, duration: Duration) -> f32 {
+    if duration.is_zero() {
+        return 1.;
+    }
+    let linear = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0., 1.);
+    1. - (1. - linear).powi(3)
+}
+
+/// Whether text drawn on `background` (a project badge or header) should be
+/// dark rather than light, so it stays readable on light and dark project
+/// colors alike.
+pub(super) fn wants_dark_text(background: ColorU) -> bool {
+    let channel = |value: u8| {
+        let value = f32::from(value) / 255.;
+        if value <= 0.039_28 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(background.r)
+        + 0.7152 * channel(background.g)
+        + 0.0722 * channel(background.b);
+    // Where black and white text have the same contrast ratio.
+    luminance > 0.179
 }
 
 /// Keeps the previously displayed order while the list is frozen: rows that

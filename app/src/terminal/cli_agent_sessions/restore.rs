@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::session_name::clean_session_name;
 use super::{CLIAgentSession, CLIAgentSessionStatus};
 use crate::terminal::CLIAgent;
 use crate::terminal::shell::{ShellType, shell_quote_arg};
@@ -81,6 +82,11 @@ pub struct PersistedCLIAgentSession {
     /// cause saves. Missing in older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at_unix_ms: Option<i64>,
+    /// Fork: the session's name (see [`super::session_name`]), so that the restored pane's
+    /// banner and its row in the vertical tabs panel show it. Kept in step with the live session
+    /// by the pane, and not compared by [`Self::has_same_content`]. Missing in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 /// What a pane saw of how the agent session reporting through it was started.
@@ -240,6 +246,7 @@ impl PersistedCLIAgentSession {
             evidently_interactive: self.evidently_interactive,
             updated_at_unix_ms: self.updated_at_unix_ms,
             last_activity_at_unix_ms: self.last_activity_at_unix_ms.filter(|at| *at > 0),
+            session_name: self.session_name.as_deref().and_then(clean_session_name),
         })
     }
 
@@ -322,6 +329,8 @@ impl PersistedCLIAgentSession {
             // Taken from the live activity when the app state is saved.
             last_activity_at_unix_ms: previous_same_session
                 .and_then(|previous| previous.last_activity_at_unix_ms),
+            // Kept in step with the live session by the pane.
+            session_name: previous_same_session.and_then(|previous| previous.session_name.clone()),
         };
         if let Some(previous) = previous
             && previous.has_same_content(&record)
@@ -353,6 +362,14 @@ impl PersistedCLIAgentSession {
     /// the command.
     pub fn can_resume_here(&self) -> bool {
         !self.is_remote() && self.launched_locally
+    }
+
+    /// Fork: what to call the session: its name, else [`Self::display_title`].
+    pub fn display_name(&self) -> Option<String> {
+        self.session_name
+            .as_deref()
+            .and_then(clean_session_name)
+            .or_else(|| self.display_title())
     }
 
     /// Single-line title for display, if the session has one, without control characters.

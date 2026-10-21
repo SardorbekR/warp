@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use settings::macros::define_settings_group;
@@ -408,7 +408,8 @@ settings::macros::implement_setting_for_enum!(
     rename_all = "snake_case"
 )]
 pub enum VerticalTabsSortMode {
-    /// A flat list of every session, sorted by how urgently it needs attention.
+    /// Every session, sorted by how urgently it needs attention. A project's
+    /// sessions gather under a collapsible header once there are two of them.
     #[default]
     Status,
     /// Sessions grouped by project, groups ordered by their most urgent session.
@@ -627,6 +628,17 @@ define_settings_group!(TabSettings, settings: [
         private: false,
         toml_path: "appearance.vertical_tabs.glass",
         description: "Whether the vertical tabs panel and the window header are translucent over a blurred desktop.",
+    },
+    // Fork feature: the project groups collapsed in the vertical tabs panel, by project name.
+    // Saved on every change, so collapsed groups stay collapsed after a restart or a crash.
+    vertical_tabs_collapsed_projects: VerticalTabsCollapsedProjects {
+        type: HashSet<String>,
+        default: HashSet::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        // Fork-only setting: never synced to the user's Warp account.
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: true,
     },
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,

@@ -792,6 +792,8 @@ pub(super) struct VerticalTabsPanelState {
     status_list_pointer: Rc<status_list::StatusListPointerActivity>,
     /// Status order: the row order displayed last frame, reused while frozen.
     status_list_last_order: RefCell<Vec<StatusRowKey>>,
+    /// Status order: what the project groups remember between frames.
+    status_list_groups: status_list::StatusListGroups,
     status_sort_option_mouse_state: MouseStateHandle,
     group_by_project_sort_option_mouse_state: MouseStateHandle,
     manual_sort_option_mouse_state: MouseStateHandle,
@@ -847,6 +849,7 @@ impl Default for VerticalTabsPanelState {
             status_list_hover_state: Default::default(),
             status_list_pointer: Rc::default(),
             status_list_last_order: RefCell::default(),
+            status_list_groups: Default::default(),
             status_sort_option_mouse_state: Default::default(),
             group_by_project_sort_option_mouse_state: Default::default(),
             manual_sort_option_mouse_state: Default::default(),
@@ -7140,10 +7143,22 @@ fn render_terminal_detail_section(
         terminal_view.last_completed_command_text(),
     );
 
+    // Fork: the agent session's whole name, which its row may cut off.
+    let session_name = status_list::terminal_session_name(terminal_view, app);
+
     let mut section = Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::Start)
         .with_spacing(DETAIL_SIDECAR_SECTION_GAP);
 
+    if let Some(session_name) = session_name.as_ref() {
+        section.add_child(render_detail_wrapping_text(
+            session_name.clone(),
+            13.,
+            text_colors.main,
+            Some(Properties::default().weight(Weight::Semibold)),
+            appearance,
+        ));
+    }
     if let Some(status) = status.as_ref() {
         section.add_child(render_detail_status_pill(status, appearance));
     }
@@ -7164,11 +7179,20 @@ fn render_terminal_detail_section(
             appearance,
         ));
     }
-    section.add_child(render_terminal_detail_primary_line(
-        &primary_line,
-        text_colors.sub,
-        appearance,
-    ));
+    // With a session name, the terminal title only repeats it; what the agent
+    // reports (e.g. what it asks permission for) is still worth showing.
+    let primary_line_adds_to_name = match (&primary_line, session_name.as_deref()) {
+        (_, None) => true,
+        (TerminalPrimaryLineData::StatusText { text }, Some(name)) => text.trim() != name,
+        (TerminalPrimaryLineData::Text { .. }, Some(_)) => false,
+    };
+    if primary_line_adds_to_name {
+        section.add_child(render_terminal_detail_primary_line(
+            &primary_line,
+            text_colors.sub,
+            appearance,
+        ));
+    }
 
     let mut metadata_row = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)

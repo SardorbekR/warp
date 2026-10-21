@@ -12594,6 +12594,7 @@ impl TerminalView {
                 } else {
                     self.update_pane_configuration(ctx);
                 }
+                self.on_terminal_title_changed_for_cli_agent_restore(ctx);
             }
             ModelEvent::ClipboardStore(_, contents) => {
                 let access = *TerminalSettings::as_ref(ctx).osc52_clipboard_access;

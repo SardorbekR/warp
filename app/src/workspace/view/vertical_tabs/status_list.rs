@@ -1,42 +1,48 @@
 //! Renders the vertical tabs panel when rows are ordered by status (fork
-//! feature): a flat, status-sorted list of every pane, or the same rows grouped
-//! by project. Manual order keeps using the upstream renderer in the parent
-//! module.
+//! feature): a status-sorted list of every pane in which a project's sessions
+//! gather under a collapsible header once there are two of them (a lone
+//! session wears its project as a badge on its top edge), or the same rows with
+//! every project under a header. Manual order keeps using the upstream renderer
+//! in the parent module.
 //!
 //! Row data is gathered once per render, sorted by the pure helpers in
 //! [`super::status_order`], and rendered through the shared pane-row shell so
 //! hover, selection, rename, context menus and the detail sidecar behave like
 //! the manual list.
 
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 use instant::Instant;
 use pathfinder_color::ColorU;
-use pathfinder_geometry::vector::vec2f;
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::Setting as _;
 use warp_core::ui::Icon as WarpIcon;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{ColorScheme, Fill as WarpThemeFill, WarpTheme};
 use warpui::elements::{
-    Align, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult,
-    DropShadow, Element, Empty, EventHandler, Expanded, Flex, Hoverable, Icon, MainAxisSize,
-    MouseInBehavior, MouseStateHandle, Padding, ParentElement, Radius, SavePosition, Shrinkable,
-    Text,
+    AfterLayoutContext, Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, DispatchEventResult, DropShadow, Element, Empty, EventHandler, Expanded,
+    Flex, Hoverable, Icon, LayoutContext, MainAxisSize, MouseInBehavior, MouseStateHandle,
+    OffsetPositioning, Padding, PaintContext, ParentAnchor, ParentElement, ParentOffsetBounds,
+    Point, Radius, SavePosition, Shrinkable, SizeConstraint, Stack, Text,
 };
+use warpui::event::DispatchedEvent;
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::text_layout::ClipConfig;
 use warpui::{AppContext, EntityId, EventContext, SingletonEntity, TaskId, ViewHandle};
 
 use super::status_order::{
-    AttentionBucket, FreezeInputs, GroupHeaderText, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE,
-    StatusRowKey, StatusSortInput, activity_age, compact_age_label, group_by_project,
-    group_header_text, is_order_frozen, project_name, project_palette_color, resolve_display_order,
-    row_attention_bucket, row_display_status, status_sorted_indices,
+    AttentionBucket, FreezeInputs, GROUP_TRANSITION_DURATION, GroupHeaderText, GroupTransition,
+    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, StatusRowKey, StatusSortInput,
+    activity_age, auto_group_by_project, compact_age_label, group_by_project, group_header_text,
+    group_transitions, is_order_frozen, project_name, project_palette_color, resolve_display_order,
+    row_attention_bucket, row_display_status, slide_progress, status_sorted_indices,
+    wants_dark_text,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -55,6 +61,7 @@ use crate::pane_group::PaneGroup;
 use crate::tab::tab_position_id;
 use crate::terminal::TerminalView;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession;
 use crate::terminal::view::TerminalViewState;
 use crate::ui_components::icon_with_status::IconWithStatusVariant;
 use crate::workspace::action::WorkspaceAction;
@@ -67,12 +74,39 @@ use crate::workspace::{PaneViewLocator, Workspace};
 const STATUS_GLYPH_SIZE: f32 = 16.;
 const ROW_TITLE_FONT_SIZE: f32 = 13.;
 const ROW_META_FONT_SIZE: f32 = 12.;
-/// Width of the age slot, so that project tags line up across rows.
+/// Width of the age slot, so that ages line up across rows.
 const ROW_AGE_WIDTH: f32 = 28.;
-const PROJECT_TAG_FONT_SIZE: f32 = 11.;
-const PROJECT_TAG_MAX_WIDTH: f32 = 78.;
 const GROUP_HEADER_FONT_SIZE: f32 = 12.;
 const ROW_SPACING: f32 = 2.;
+/// Extra space above a section that starts with a group header or a badged
+/// row, and after a group, on top of [`ROW_SPACING`].
+const SECTION_GAP: f32 = 12.;
+/// How far the rows of a group are inset from its header.
+const GROUP_ROW_INDENT: f32 = 10.;
+/// A lone row's project badge: how far it sticks out above the row, and how
+/// far it is inset from the row's left edge.
+const BADGE_OVERHANG: f32 = 8.;
+const BADGE_INSET: f32 = 8.;
+const BADGE_FONT_SIZE: f32 = 10.;
+const BADGE_MAX_WIDTH: f32 = 160.;
+/// The ring in the panel's color that separates a badge from the row under it.
+const BADGE_RING_WIDTH: f32 = 1.5;
+const GROUP_PILL_FONT_SIZE: f32 = 11.;
+const GROUP_PILL_MAX_WIDTH: f32 = 180.;
+const GROUP_CHEVRON_SIZE: f32 = 12.;
+/// How far a forming group's header rises into place, and a dissolving
+/// group's badge sinks into place.
+const GROUP_HEADER_RISE: f32 = 10.;
+const BADGE_SINK: f32 = 12.;
+/// Repaint interval while something slides (about 60 fps).
+const SLIDE_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Text on a light project color.
+const DARK_BADGE_TEXT: ColorU = ColorU {
+    r: 0x0B,
+    g: 0x12,
+    b: 0x17,
+    a: 0xFF,
+};
 const ERROR_ICON_SIZE: f32 = 12.;
 /// Inset of the list, rows and headers from the panel's edges.
 const LIST_HORIZONTAL_PADDING: f32 = 10.;
@@ -110,6 +144,8 @@ const NEEDS_YOU_TEXT_LIGHT: ColorU = ColorU {
 struct StatusRow<'a> {
     key: StatusRowKey,
     tab_index: usize,
+    /// Whether this is the focused pane of the active tab.
+    is_selected: bool,
     props: PaneProps<'a>,
     status: Option<ConversationStatus>,
     terminal_view_id: Option<EntityId>,
@@ -159,17 +195,113 @@ enum StatusRowTitle {
 
 struct SectionHeader {
     text: GroupHeaderText,
+    /// The project's name, which keys the group's collapse state.
+    project: String,
+    is_collapsed: bool,
+    /// The group's most urgent row, whose age and status a collapsed header
+    /// shows.
+    lead_row_index: usize,
 }
 
-/// A run of rows, optionally preceded by a project header.
+/// A run of rows: a project's group under its header, or a single row.
 struct ListSection {
     header: Option<SectionHeader>,
+    /// The rows shown, in order. A collapsed group shows only its selected
+    /// row, if it has it.
     row_indices: Vec<usize>,
+    /// The project of a lone row in status order, shown as a badge on the
+    /// row's top edge.
+    badge: Option<String>,
+}
+
+/// What a collapsed header shows of its group's most urgent row.
+struct HeaderRollUp {
+    status: Option<ConversationStatus>,
+    is_unread: bool,
+    age: Option<Duration>,
+}
+
+/// Status order: what the project groups remember between frames.
+#[derive(Default)]
+pub(super) struct StatusListGroups {
+    /// Hover states of the group headers, by project.
+    header_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    /// Rows of collapsed groups shown last frame because they were selected.
+    /// While the order is frozen they stay, so that selecting another row
+    /// doesn't move the rows under the pointer.
+    shown_collapsed_rows: RefCell<Vec<StatusRowKey>>,
+    /// The projects that had a group header in the last status-order frame,
+    /// or `None` when that frame can't be compared (see [`group_transitions`]).
+    grouped_projects: RefCell<Option<HashSet<String>>>,
+    /// Projects whose group formed or dissolved recently, and when.
+    transitions: RefCell<HashMap<String, (GroupTransition, Instant)>>,
+}
+
+impl StatusListGroups {
+    fn header_mouse_state(&self, project: &str) -> MouseStateHandle {
+        let Ok(mut mouse_states) = self.header_mouse_states.try_borrow_mut() else {
+            return MouseStateHandle::default();
+        };
+        mouse_states.entry(project.to_owned()).or_default().clone()
+    }
+
+    fn retain_header_mouse_states(&self, projects: &HashSet<&str>) {
+        if let Ok(mut mouse_states) = self.header_mouse_states.try_borrow_mut() {
+            mouse_states.retain(|project, _| projects.contains(project.as_str()));
+        }
+    }
+
+    fn shown_collapsed_rows(&self) -> HashSet<StatusRowKey> {
+        self.shown_collapsed_rows
+            .try_borrow()
+            .map(|rows| rows.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn store_shown_collapsed_rows(&self, rows: Vec<StatusRowKey>) {
+        if let Ok(mut shown) = self.shown_collapsed_rows.try_borrow_mut() {
+            *shown = rows;
+        }
+    }
+
+    /// Records which projects are grouped now, and returns the recent
+    /// transitions (started now or still sliding) to show. `grouping` is
+    /// `None` when this frame isn't comparable with the next one.
+    fn update_transitions(
+        &self,
+        grouping: Option<(HashSet<String>, HashSet<String>)>,
+        now: Instant,
+    ) -> HashMap<String, (GroupTransition, Instant)> {
+        let (Ok(mut grouped_projects), Ok(mut transitions)) = (
+            self.grouped_projects.try_borrow_mut(),
+            self.transitions.try_borrow_mut(),
+        ) else {
+            return HashMap::new();
+        };
+        transitions.retain(|_, (_, started_at)| {
+            now.saturating_duration_since(*started_at) < GROUP_TRANSITION_DURATION
+        });
+        match grouping {
+            Some((grouped, lone)) => {
+                for (project, transition) in
+                    group_transitions(grouped_projects.as_ref(), &grouped, &lone)
+                {
+                    transitions.insert(project, (transition, now));
+                }
+                *grouped_projects = Some(grouped);
+            }
+            None => {
+                *grouped_projects = None;
+                transitions.clear();
+            }
+        }
+        transitions.clone()
+    }
 }
 
 /// Renders the status-ordered list. `mode` is the effective sort mode and is
 /// never `Manual` in practice (the caller renders manual order itself); a
-/// `Manual` value is rendered as the flat list.
+/// `Manual` value is rendered like `Status`.
 pub(super) fn render_status_ordered_list(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -181,6 +313,9 @@ pub(super) fn render_status_ordered_list(
     let rows = collect_status_rows(state, workspace, app);
 
     if rows.is_empty() {
+        state
+            .status_list_groups
+            .update_transitions(None, Instant::now());
         if state.search_query.is_empty() {
             return Empty::new().finish();
         }
@@ -197,37 +332,120 @@ pub(super) fn render_status_ordered_list(
         .finish();
     }
 
-    let (sections, display_keys) = layout_sections(state, workspace, mode, &rows, app);
-    store_last_order(state, display_keys);
+    let sections = layout_sections(state, workspace, mode, &rows, app);
+    let transitions = state
+        .status_list_groups
+        .update_transitions(comparable_grouping(state, mode, &sections), Instant::now());
+    let header_projects: HashSet<&str> = sections
+        .iter()
+        .filter_map(|section| section.header.as_ref())
+        .map(|header| header.project.as_str())
+        .collect();
+    state
+        .status_list_groups
+        .retain_header_mouse_states(&header_projects);
+    let roll_ups: Vec<Option<HeaderRollUp>> = sections
+        .iter()
+        .map(|section| {
+            let header = section
+                .header
+                .as_ref()
+                .filter(|header| header.is_collapsed)?;
+            let lead = rows.get(header.lead_row_index)?;
+            Some(HeaderRollUp {
+                status: lead.status.clone(),
+                is_unread: lead.is_unread,
+                age: lead.age,
+            })
+        })
+        .collect();
+    let show_title_tooltips = !*TabSettings::as_ref(app)
+        .vertical_tabs_show_details_on_hover
+        .value();
 
     // Rows are moved into their elements in display order.
     let mut slots: Vec<Option<StatusRow<'_>>> = rows.into_iter().map(Some).collect();
-    let show_project_tag = !matches!(mode, VerticalTabsSortMode::GroupByProject);
     let palette = StatusPalette::new(theme);
     let mut list = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_spacing(ROW_SPACING);
-    for (section_index, section) in sections.into_iter().enumerate() {
-        if let Some(header) = section.header {
-            list.add_child(render_group_header(
-                &header,
-                section_index == 0,
-                &palette,
-                appearance,
-            ));
-        }
-        for row_index in section.row_indices {
+    let mut follows_group = false;
+    for (section_index, (section, roll_up)) in sections.into_iter().zip(roll_ups).enumerate() {
+        let ListSection {
+            header,
+            row_indices,
+            badge,
+        } = section;
+        let top_gap = if section_index == 0 {
+            if badge.is_some() { BADGE_OVERHANG } else { 0. }
+        } else if header.is_some() || badge.is_some() || follows_group {
+            SECTION_GAP
+        } else {
+            0.
+        };
+        follows_group = header.is_some();
+        let mut section_rows = Vec::with_capacity(row_indices.len());
+        for row_index in row_indices {
             let Some(row) = slots.get_mut(row_index).and_then(Option::take) else {
                 continue;
             };
-            list.add_child(render_status_row(
+            let title_tooltip_mouse_state = show_title_tooltips.then(|| {
+                state
+                    .pane_title_mouse_states
+                    .try_borrow_mut()
+                    .map(|mut mouse_states| {
+                        mouse_states.entry(row.key.pane_id).or_default().clone()
+                    })
+                    .unwrap_or_default()
+            });
+            section_rows.push(render_status_row(
                 row,
-                show_project_tag,
+                title_tooltip_mouse_state,
                 &palette,
                 appearance,
                 app,
             ));
+        }
+        let mut section_elements: Vec<Box<dyn Element>> = Vec::new();
+        if let Some(header) = header {
+            let transition = transitions
+                .get(&header.project)
+                .filter(|(transition, _)| *transition == GroupTransition::Formed)
+                .map(|(_, started_at)| *started_at);
+            let mouse_state = state.status_list_groups.header_mouse_state(&header.project);
+            section_elements.push(render_group_header(
+                header,
+                roll_up,
+                mouse_state,
+                transition,
+                &palette,
+                appearance,
+            ));
+            section_elements.extend(section_rows.into_iter().map(|row| {
+                Container::new(row)
+                    .with_margin_left(GROUP_ROW_INDENT)
+                    .finish()
+            }));
+        } else {
+            for row in section_rows {
+                let Some(project) = badge.as_deref() else {
+                    section_elements.push(row);
+                    continue;
+                };
+                let transition = transitions
+                    .get(project)
+                    .filter(|(transition, _)| *transition == GroupTransition::Dissolved)
+                    .map(|(_, started_at)| *started_at);
+                section_elements.push(with_project_badge(row, project, transition, appearance));
+            }
+        }
+        for (element_index, element) in section_elements.into_iter().enumerate() {
+            if element_index == 0 && top_gap > 0. {
+                list.add_child(Container::new(element).with_margin_top(top_gap).finish());
+            } else {
+                list.add_child(element);
+            }
         }
     }
 
@@ -242,11 +460,35 @@ pub(super) fn render_status_ordered_list(
         .finish()
 }
 
+/// The projects shown with a group header and as a badged row, when this
+/// frame can be compared with the next to animate groups forming and
+/// dissolving: in status order without a search.
+fn comparable_grouping(
+    state: &VerticalTabsPanelState,
+    mode: VerticalTabsSortMode,
+    sections: &[ListSection],
+) -> Option<(HashSet<String>, HashSet<String>)> {
+    if mode == VerticalTabsSortMode::GroupByProject || !state.search_query.is_empty() {
+        return None;
+    }
+    let grouped = sections
+        .iter()
+        .filter_map(|section| section.header.as_ref())
+        .map(|header| header.project.clone())
+        .collect();
+    let lone = sections
+        .iter()
+        .filter_map(|section| section.badge.clone())
+        .collect();
+    Some((grouped, lone))
+}
+
 /// The rows in the order the panel shows them: search-filtered, sorted, with
-/// the freeze rule applied and (in group-by-project mode) grouped. Keyboard
-/// navigation walks this, so it visits rows exactly as they are rendered.
-/// The order is remembered like a render's, so that repeated navigation
-/// steps while the order is frozen keep walking the same list.
+/// the freeze rule applied and grouped by project, without the rows hidden in
+/// collapsed groups. Keyboard navigation walks this, so it visits rows
+/// exactly as they are rendered. The order is remembered like a render's, so
+/// that repeated navigation steps while the order is frozen keep walking the
+/// same list.
 pub(super) fn displayed_row_locators(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -254,8 +496,7 @@ pub(super) fn displayed_row_locators(
     app: &AppContext,
 ) -> Vec<PaneViewLocator> {
     let rows = collect_status_rows(state, workspace, app);
-    let (sections, display_keys) = layout_sections(state, workspace, mode, &rows, app);
-    store_last_order(state, display_keys);
+    let sections = layout_sections(state, workspace, mode, &rows, app);
     sections
         .into_iter()
         .flat_map(|section| section.row_indices)
@@ -267,15 +508,20 @@ pub(super) fn displayed_row_locators(
         .collect()
 }
 
-/// Sorts the rows, applies the freeze rule, and splits them into sections.
-/// Also returns the row order to remember for the freeze rule.
+/// Sorts the rows, applies the freeze rule, and splits them into sections:
+/// in status order, a project's rows form a group once there are two of them
+/// (rows of an unknown project never do); grouped by project, every project
+/// has a group. A collapsed group shows only its selected row, and while the
+/// order is frozen, the rows it showed last frame. A search shows every
+/// group expanded. Remembers the row order and the rows shown in collapsed
+/// groups for the next frame.
 fn layout_sections(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
     mode: VerticalTabsSortMode,
     rows: &[StatusRow<'_>],
     app: &AppContext,
-) -> (Vec<ListSection>, Vec<StatusRowKey>) {
+) -> Vec<ListSection> {
     let sort_inputs: Vec<StatusSortInput<'_>> = rows.iter().map(StatusRow::sort_input).collect();
     let fresh_keys: Vec<StatusRowKey> = status_sorted_indices(&sort_inputs)
         .into_iter()
@@ -294,23 +540,69 @@ fn layout_sections(
         .iter()
         .filter_map(|key| index_by_key.get(key).copied())
         .collect();
+    store_last_order(state, display_keys);
 
-    let sections = match mode {
-        VerticalTabsSortMode::GroupByProject => group_by_project(&sort_inputs, &display_order)
-            .into_iter()
-            .map(|group| ListSection {
-                header: Some(SectionHeader {
-                    text: group_header_text(&group),
-                }),
-                row_indices: group.row_indices,
-            })
-            .collect(),
-        VerticalTabsSortMode::Status | VerticalTabsSortMode::Manual => vec![ListSection {
-            header: None,
-            row_indices: display_order,
-        }],
+    let every_project_grouped = mode == VerticalTabsSortMode::GroupByProject;
+    let groups = if every_project_grouped {
+        group_by_project(&sort_inputs, &display_order)
+    } else {
+        auto_group_by_project(&sort_inputs, &display_order)
     };
-    (sections, display_keys)
+    let collapsed_projects = TabSettings::as_ref(app)
+        .vertical_tabs_collapsed_projects
+        .value();
+    let is_searching = !state.search_query.is_empty();
+    let kept_rows = if frozen {
+        state.status_list_groups.shown_collapsed_rows()
+    } else {
+        HashSet::new()
+    };
+
+    let mut shown_collapsed_rows = Vec::new();
+    let mut sections = Vec::with_capacity(groups.len());
+    for group in groups {
+        let Some(&lead_row_index) = group.row_indices.first() else {
+            continue;
+        };
+        if !every_project_grouped && group.row_indices.len() < 2 {
+            sections.push(ListSection {
+                header: None,
+                badge: group.project.map(str::to_owned),
+                row_indices: group.row_indices,
+            });
+            continue;
+        }
+        let project = group.project.unwrap_or(OTHER_PROJECT_LABEL).to_owned();
+        let is_collapsed = !is_searching && collapsed_projects.contains(&project);
+        let text = group_header_text(&group);
+        let mut row_indices = group.row_indices;
+        if is_collapsed {
+            row_indices.retain(|&row_index| {
+                rows.get(row_index)
+                    .is_some_and(|row| row.is_selected || kept_rows.contains(&row.key))
+            });
+            shown_collapsed_rows.extend(
+                row_indices
+                    .iter()
+                    .filter_map(|&row_index| rows.get(row_index))
+                    .map(|row| row.key),
+            );
+        }
+        sections.push(ListSection {
+            header: Some(SectionHeader {
+                text,
+                project,
+                is_collapsed,
+                lead_row_index,
+            }),
+            row_indices,
+            badge: None,
+        });
+    }
+    state
+        .status_list_groups
+        .store_shown_collapsed_rows(shown_collapsed_rows);
+    sections
 }
 
 /// Whether the row order is frozen right now; see [`is_order_frozen`].
@@ -594,16 +886,12 @@ fn collect_status_rows<'a>(
             let project = terminal_view.and_then(terminal_project_name);
             let interrupted_record =
                 terminal_view.and_then(TerminalView::restorable_cli_agent_session);
-            let interrupted_title = interrupted_record.map(|record| {
-                record
-                    .display_title()
-                    .unwrap_or_else(|| format!("{} session", record.agent.display_name()))
-            });
+            let session_name = terminal_view.and_then(|view| terminal_session_name(view, app));
             if let Some(query_lower) = query_lower.as_deref()
                 && !row_matches_query(&props, project.as_deref(), query_lower, app)
-                && !interrupted_title
+                && !session_name
                     .as_ref()
-                    .is_some_and(|title| title.to_lowercase().contains(query_lower))
+                    .is_some_and(|name| name.to_lowercase().contains(query_lower))
             {
                 continue;
             }
@@ -636,7 +924,7 @@ fn collect_status_rows<'a>(
                 .map(|changed_at| activity_age(now_unix_ms, changed_at));
             let is_errored = terminal_view
                 .is_some_and(|view| view.current_state().state == TerminalViewState::Errored);
-            let title = status_row_title(&props, terminal_view, interrupted_title, app);
+            let title = status_row_title(&props, terminal_view, session_name, app);
             let interrupted = interrupted_record.map(|record| InterruptedSession {
                 is_remote: record.is_remote(),
             });
@@ -647,6 +935,7 @@ fn collect_status_rows<'a>(
                     pane_id,
                 },
                 tab_index,
+                is_selected: props.is_active_tab && props.is_focused,
                 bucket: row_attention_bucket(status.as_ref(), is_unread, interrupted.is_some()),
                 status,
                 terminal_view_id,
@@ -678,14 +967,34 @@ fn icon_status(variant: IconWithStatusVariant) -> Option<ConversationStatus> {
     }
 }
 
-/// The row's title, using the same precedence as the manual list: an active
-/// rename editor, then a custom pane or tab name, then (for an interrupted
-/// agent session) the session's title, then the terminal's primary line
-/// (agent title, running command, ...), then the pane's own title.
+/// The name of the agent session a terminal pane shows: the interrupted
+/// session it offers, else the one running in it (see
+/// [`TerminalView::live_cli_agent_session_name`]).
+pub(super) fn terminal_session_name(
+    terminal_view: &TerminalView,
+    app: &AppContext,
+) -> Option<String> {
+    match terminal_view.restorable_cli_agent_session() {
+        Some(record) => Some(interrupted_session_name(record)),
+        None => terminal_view.live_cli_agent_session_name(app),
+    }
+}
+
+fn interrupted_session_name(record: &PersistedCLIAgentSession) -> String {
+    record
+        .display_name()
+        .unwrap_or_else(|| format!("{} session", record.agent.display_name()))
+}
+
+/// The row's title: an active rename editor, then a custom pane or tab name,
+/// then the name of the agent session in the pane (see
+/// [`terminal_session_name`]), then, like the manual list, the terminal's
+/// primary line (agent title, running command, ...), then the pane's own
+/// title.
 fn status_row_title(
     props: &PaneProps<'_>,
     terminal_view: Option<&TerminalView>,
-    interrupted_title: Option<String>,
+    session_name: Option<String>,
     app: &AppContext,
 ) -> StatusRowTitle {
     if props.is_tab_being_renamed
@@ -708,7 +1017,7 @@ fn status_row_title(
             font: TerminalPrimaryLineFont::Ui,
         };
     }
-    if let Some(text) = interrupted_title {
+    if let Some(text) = session_name {
         return StatusRowTitle::Text {
             text,
             font: TerminalPrimaryLineFont::Ui,
@@ -831,9 +1140,12 @@ pub(super) fn status_row_look(
     }
 }
 
+/// A row: its title, then what it needs, its age and its status glyph.
+/// `title_tooltip_mouse_state` is set when the row shows its full title on
+/// hover itself, because the detail sidecar (which shows it) is turned off.
 fn render_status_row(
     row: StatusRow<'_>,
-    show_project_tag: bool,
+    title_tooltip_mouse_state: Option<MouseStateHandle>,
     palette: &StatusPalette,
     appearance: &Appearance,
     app: &AppContext,
@@ -847,7 +1159,6 @@ fn render_status_row(
         is_unread,
         is_errored,
         interrupted,
-        project,
         age,
         title,
         saves_tab_position,
@@ -873,7 +1184,14 @@ fn render_status_row(
     title_line.add_child(
         Shrinkable::new(
             1.,
-            render_row_title(title, is_unread, palette, appearance, app),
+            render_row_title(
+                title,
+                is_unread,
+                title_tooltip_mouse_state,
+                palette,
+                appearance,
+                app,
+            ),
         )
         .finish(),
     );
@@ -885,9 +1203,6 @@ fn render_status_row(
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(8.);
-    if show_project_tag && let Some(project) = project.as_deref() {
-        trailing.add_child(render_project_tag(project, appearance));
-    }
     if let Some(interrupted) = interrupted {
         // Muted: the row already sorts with the sessions that need the user.
         let label = if interrupted.is_remote {
@@ -902,7 +1217,7 @@ fn render_status_row(
         );
     }
     if let Some(age) = age {
-        // Right-aligned in a fixed slot, so the tags before it line up.
+        // Right-aligned in a fixed slot, so ages line up across rows.
         trailing.add_child(
             ConstrainedBox::new(
                 Align::new(
@@ -922,12 +1237,10 @@ fn render_status_row(
             .finish(),
         );
     }
-    trailing.add_child(render_status_glyph(
-        status.as_ref(),
-        is_unread,
-        palette,
-        theme,
-    ));
+    // No empty slot when there's no status: the title gets the room.
+    if let Some(glyph) = render_status_glyph(status.as_ref(), is_unread, palette, theme) {
+        trailing.add_child(glyph);
+    }
 
     let content = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
@@ -941,10 +1254,10 @@ fn render_status_row(
         mark_read_terminal_view_id: terminal_view_id.filter(|_| is_unread),
     });
     // With the 1px border the shell always reserves, rows are 30px tall and
-    // inset 10px on the left and 9px on the right.
+    // inset 10px on the left and 6px on the right.
     let row = render_pane_row_element(
         props,
-        Padding::uniform(6.).with_left(9.).with_right(8.),
+        Padding::uniform(6.).with_left(9.).with_right(5.),
         true,
         content,
         theme,
@@ -959,6 +1272,7 @@ fn render_status_row(
 fn render_row_title(
     title: StatusRowTitle,
     is_unread: bool,
+    tooltip_mouse_state: Option<MouseStateHandle>,
     palette: &StatusPalette,
     appearance: &Appearance,
     app: &AppContext,
@@ -970,15 +1284,70 @@ fn render_row_title(
                 TerminalPrimaryLineFont::Ui => appearance.ui_font_family(),
                 TerminalPrimaryLineFont::Monospace => appearance.monospace_font_family(),
             };
-            let mut text = Text::new_inline(text, font_family, ROW_TITLE_FONT_SIZE)
-                .with_clip(ClipConfig::ellipsis())
+            // Long titles fade out at the end; the full title shows on hover.
+            let mut title = Text::new_inline(text.clone(), font_family, ROW_TITLE_FONT_SIZE)
+                .with_clip(ClipConfig::end())
                 .with_color(palette.text_main);
             if is_unread {
-                text = text.with_style(Properties::default().weight(Weight::Semibold));
+                title = title.with_style(Properties::default().weight(Weight::Semibold));
             }
-            text.finish()
+            match tooltip_mouse_state {
+                Some(mouse_state) => {
+                    with_full_title_tooltip(title.finish(), text, mouse_state, appearance)
+                }
+                None => title.finish(),
+            }
         }
     }
+}
+
+/// Shows `text` (the row's whole title) in a tooltip under `title` while the
+/// pointer is on it, wrapped so that a long name stays inside the window.
+fn with_full_title_tooltip(
+    title: Box<dyn Element>,
+    text: String,
+    mouse_state: MouseStateHandle,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    const TOOLTIP_MAX_WIDTH: f32 = 280.;
+    let theme = appearance.theme();
+    let font_family = appearance.ui_font_family();
+    let background = theme.tooltip_background();
+    let text_color = theme.background().into_solid();
+    let border = theme.outline();
+    Hoverable::new(mouse_state, move |hover_state| {
+        if !hover_state.is_hovered() {
+            return title;
+        }
+        let tooltip = Container::new(
+            ConstrainedBox::new(
+                Text::new(text, font_family, ROW_META_FONT_SIZE)
+                    .soft_wrap(true)
+                    .with_color(text_color)
+                    .finish(),
+            )
+            .with_max_width(TOOLTIP_MAX_WIDTH)
+            .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(4.)
+        .with_background(background)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_border(Border::all(1.).with_border_fill(border))
+        .finish();
+        let mut stack = Stack::new().with_child(title);
+        stack.add_positioned_overlay_child(
+            tooltip,
+            OffsetPositioning::offset_from_parent(
+                vec2f(0., 6.),
+                ParentOffsetBounds::WindowByPosition,
+                ParentAnchor::BottomLeft,
+                ChildAnchor::TopLeft,
+            ),
+        );
+        stack.finish()
+    })
+    .finish()
 }
 
 fn project_color(project: &str, theme: &WarpTheme) -> ColorU {
@@ -987,27 +1356,65 @@ fn project_color(project: &str, theme: &WarpTheme) -> ColorU {
         .into()
 }
 
-fn render_project_tag(project: &str, appearance: &Appearance) -> Box<dyn Element> {
-    let color = project_color(project, appearance.theme());
-    ConstrainedBox::new(
+/// Text color on a project-colored badge or header pill.
+fn project_text_color(color: ColorU) -> ColorU {
+    if wants_dark_text(color) {
+        DARK_BADGE_TEXT
+    } else {
+        ColorU::white()
+    }
+}
+
+/// Puts a lone row's project badge on the row's top edge, like a folder tab.
+/// `slide_started_at` is set while the badge sinks into place out of the
+/// group header it was.
+fn with_project_badge(
+    row: Box<dyn Element>,
+    project: &str,
+    slide_started_at: Option<Instant>,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let color = project_color(project, theme);
+    let badge = ConstrainedBox::new(
         Container::new(
             Text::new_inline(
                 project.to_owned(),
                 appearance.ui_font_family(),
-                PROJECT_TAG_FONT_SIZE,
+                BADGE_FONT_SIZE,
             )
             .with_clip(ClipConfig::ellipsis())
-            .with_color(color)
+            .with_color(project_text_color(color))
+            .with_style(Properties::default().weight(Weight::Semibold))
             .finish(),
         )
         .with_horizontal_padding(6.)
-        .with_vertical_padding(1.)
-        .with_background_color(coloru_with_opacity(color, 14))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .with_vertical_padding(0.5)
+        .with_background_color(color)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .with_border(
+            Border::all(BADGE_RING_WIDTH)
+                .with_border_fill(WarpThemeFill::Solid(theme.background().into_solid())),
+        )
         .finish(),
     )
-    .with_max_width(PROJECT_TAG_MAX_WIDTH)
-    .finish()
+    .with_max_width(BADGE_MAX_WIDTH)
+    .finish();
+    let badge = match slide_started_at {
+        Some(started_at) => SlideIn::new(badge, vec2f(0., -BADGE_SINK), started_at).finish(),
+        None => badge,
+    };
+    let mut stack = Stack::new().with_child(row);
+    stack.add_positioned_child(
+        badge,
+        OffsetPositioning::offset_from_parent(
+            vec2f(BADGE_INSET, -BADGE_OVERHANG),
+            ParentOffsetBounds::Unbounded,
+            ParentAnchor::TopLeft,
+            ChildAnchor::TopLeft,
+        ),
+    );
+    stack.finish()
 }
 
 /// A glyph centered in the fixed-size status slot.
@@ -1036,40 +1443,33 @@ fn status_glyph(path: &'static str, color: ColorU) -> Box<dyn Element> {
 }
 
 /// The status at the end of a row: ring = needs you, open arc = running,
-/// filled check = done and unread, faint check = done and read.
+/// filled check = done and unread, faint check = done and read. `None`
+/// without a status.
 fn render_status_glyph(
     status: Option<&ConversationStatus>,
     is_unread: bool,
     palette: &StatusPalette,
     theme: &WarpTheme,
-) -> Box<dyn Element> {
-    match status {
-        None => ConstrainedBox::new(Empty::new().finish())
-            .with_width(STATUS_GLYPH_SIZE)
-            .with_height(STATUS_GLYPH_SIZE)
-            .finish(),
-        Some(ConversationStatus::Blocked { .. }) => {
-            status_glyph(NEEDS_YOU_GLYPH_PATH, palette.needs_you)
-        }
+) -> Option<Box<dyn Element>> {
+    let glyph = match status? {
+        ConversationStatus::Blocked { .. } => status_glyph(NEEDS_YOU_GLYPH_PATH, palette.needs_you),
         // Static on purpose: an animated spinner would redraw the window
         // continuously while any agent runs.
-        Some(ConversationStatus::InProgress) => status_glyph(RUNNING_GLYPH_PATH, palette.running),
-        Some(
-            status @ (ConversationStatus::TransientError
-            | ConversationStatus::WaitingForEvents
-            | ConversationStatus::Cancelled),
-        ) => {
+        ConversationStatus::InProgress => status_glyph(RUNNING_GLYPH_PATH, palette.running),
+        status @ (ConversationStatus::TransientError
+        | ConversationStatus::WaitingForEvents
+        | ConversationStatus::Cancelled) => {
             let (icon, color) = status.status_icon_and_color(theme, StatusColorStyle::Standard);
             status_icon(icon, color, 13.)
         }
-        Some(ConversationStatus::Success) => {
+        ConversationStatus::Success => {
             if is_unread {
                 status_glyph(DONE_UNREAD_GLYPH_PATH, palette.text_main)
             } else {
                 status_glyph(DONE_READ_GLYPH_PATH, palette.text_faint)
             }
         }
-        Some(ConversationStatus::Error) => {
+        ConversationStatus::Error => {
             let red = theme.ansi_fg_red();
             let color = if is_unread {
                 red
@@ -1078,46 +1478,59 @@ fn render_status_glyph(
             };
             status_icon(WarpIcon::Triangle, color, 13.)
         }
-    }
+    };
+    Some(glyph)
 }
 
-/// "project  N ............ k needs you"
+/// "[project] N ........ k needs you  ⌄": the project in a pill of its color,
+/// how many sessions it has, and how many need the user. A collapsed header
+/// also shows the age and status of its most urgent session (`roll_up`).
+/// Clicking it collapses or expands the group. `rise_started_at` is set while
+/// the header rises into place out of the badge it was.
 fn render_group_header(
-    header: &SectionHeader,
-    is_first: bool,
+    header: SectionHeader,
+    roll_up: Option<HeaderRollUp>,
+    mouse_state: MouseStateHandle,
+    rise_started_at: Option<Instant>,
     palette: &StatusPalette,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
+    let theme = appearance.theme();
     let font_family = appearance.ui_font_family();
     let medium = Properties::default().weight(Weight::Medium);
+    let SectionHeader {
+        text,
+        project,
+        is_collapsed,
+        ..
+    } = header;
 
+    let color = project_color(&project, theme);
+    let pill = ConstrainedBox::new(
+        Container::new(
+            Text::new_inline(text.name, font_family, GROUP_PILL_FONT_SIZE)
+                .with_clip(ClipConfig::ellipsis())
+                .with_color(project_text_color(color))
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .finish(),
+        )
+        .with_horizontal_padding(7.)
+        .with_vertical_padding(2.)
+        .with_background_color(color)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(9.)))
+        .finish(),
+    )
+    .with_max_width(GROUP_PILL_MAX_WIDTH)
+    .finish();
     let name_and_count = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(6.)
+        .with_spacing(7.)
+        .with_child(Shrinkable::new(1., pill).finish())
         .with_child(
-            Shrinkable::new(
-                1.,
-                Text::new_inline(
-                    header.text.name.clone(),
-                    font_family,
-                    GROUP_HEADER_FONT_SIZE,
-                )
-                .with_clip(ClipConfig::ellipsis())
-                .with_color(palette.text_sub)
-                .with_style(medium)
+            Text::new_inline(text.count, font_family, GROUP_HEADER_FONT_SIZE)
+                .with_color(palette.text_faint)
                 .finish(),
-            )
-            .finish(),
-        )
-        .with_child(
-            Text::new_inline(
-                header.text.count.clone(),
-                font_family,
-                GROUP_HEADER_FONT_SIZE,
-            )
-            .with_color(palette.text_faint)
-            .finish(),
         );
 
     let mut row = Flex::row()
@@ -1125,24 +1538,148 @@ fn render_group_header(
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(8.)
         .with_child(Expanded::new(1., name_and_count.finish()).finish());
-    if let Some(needs_you) = header.text.needs_you.as_ref() {
+    if let Some(needs_you) = text.needs_you {
         row.add_child(
-            Text::new_inline(needs_you.clone(), font_family, GROUP_HEADER_FONT_SIZE)
+            Text::new_inline(needs_you, font_family, GROUP_HEADER_FONT_SIZE)
                 .with_color(palette.needs_you_text)
                 .with_style(medium)
                 .finish(),
         );
     }
-
-    Container::new(row.finish())
-        .with_padding(
-            Padding::uniform(0.)
-                .with_top(if is_first { 10. } else { 16. })
-                .with_bottom(6.)
-                .with_left(10.)
-                .with_right(10.),
+    if let Some(roll_up) = roll_up {
+        if let Some(age) = roll_up.age {
+            row.add_child(
+                ConstrainedBox::new(
+                    Align::new(
+                        Text::new_inline(compact_age_label(age), font_family, ROW_META_FONT_SIZE)
+                            .with_color(palette.text_sub)
+                            .finish(),
+                    )
+                    .right()
+                    .finish(),
+                )
+                .with_width(ROW_AGE_WIDTH)
+                .with_height(STATUS_GLYPH_SIZE)
+                .finish(),
+            );
+        }
+        if let Some(glyph) =
+            render_status_glyph(roll_up.status.as_ref(), roll_up.is_unread, palette, theme)
+        {
+            row.add_child(glyph);
+        }
+    }
+    let chevron = if is_collapsed {
+        WarpIcon::ChevronRight
+    } else {
+        WarpIcon::ChevronDown
+    };
+    row.add_child(
+        ConstrainedBox::new(
+            chevron
+                .to_warpui_icon(WarpThemeFill::Solid(palette.text_sub))
+                .finish(),
         )
-        .finish()
+        .with_width(GROUP_CHEVRON_SIZE)
+        .with_height(GROUP_CHEVRON_SIZE)
+        .finish(),
+    );
+    let row = row.finish();
+
+    let header = Hoverable::new(mouse_state, move |hover_state| {
+        let mut container = Container::new(row)
+            .with_padding(Padding::uniform(4.).with_left(8.).with_right(8.))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                STATUS_ROW_CORNER_RADIUS,
+            )));
+        if hover_state.is_hovered() {
+            container = container.with_background(internal_colors::fg_overlay_1(theme));
+        }
+        container.finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleVerticalTabsProjectCollapsed(
+            project.clone(),
+        ));
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+    match rise_started_at {
+        Some(started_at) => SlideIn::new(header, vec2f(0., GROUP_HEADER_RISE), started_at).finish(),
+        None => header,
+    }
+}
+
+/// Paints its child offset by `from` when the slide starts, easing into its
+/// laid-out position over [`GROUP_TRANSITION_DURATION`]: a group header rising
+/// out of the badge it was, or a badge sinking back out of a header. Layout
+/// always uses the final position, so nothing around it moves.
+struct SlideIn {
+    child: Box<dyn Element>,
+    from: Vector2F,
+    started_at: Instant,
+    origin: Option<Point>,
+}
+
+impl SlideIn {
+    fn new(child: Box<dyn Element>, from: Vector2F, started_at: Instant) -> Self {
+        Self {
+            child,
+            from,
+            started_at,
+            origin: None,
+        }
+    }
+}
+
+impl Element for SlideIn {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        self.child.layout(constraint, ctx, app)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        let progress = slide_progress(
+            Instant::now().saturating_duration_since(self.started_at),
+            GROUP_TRANSITION_DURATION,
+        );
+        self.child
+            .paint(origin + self.from * (1. - progress), ctx, app);
+        if progress < 1. {
+            ctx.repaint_after(SLIDE_FRAME_INTERVAL);
+        }
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.child.size()
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn debug_text_content(&self) -> Option<String> {
+        self.child.debug_text_content()
+    }
 }
 
 /// The "Order" section of the vertical tabs settings popup.
