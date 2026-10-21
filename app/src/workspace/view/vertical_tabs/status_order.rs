@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use pathfinder_color::ColorU;
 use warpui::EntityId;
+use warpui::elements::DEFAULT_UI_LINE_HEIGHT_RATIO;
 
 use super::StatusRowNavigation;
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::PaneId;
+use crate::workspace::project_labels::{ProjectLabelTone, VerticalTabsProjectLabels};
 
 /// How urgently a session wants the user's attention. Lower sorts first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -433,7 +435,9 @@ pub(super) fn project_name(repo_root_name: Option<&str>, cwd: Option<&str>) -> O
 /// (rose, clay, amber, moss, sage, teal, slate, lavender), picked by a stable
 /// hash of the project name. Every tone below has the same lightness and
 /// chroma in each hue, so no project looks louder than another, and none
-/// depends on the theme's terminal colors.
+/// depends on the theme's terminal colors. These and the tones below are the
+/// built-in look; the settings file can override each of them
+/// ([`VerticalTabsProjectLabels`]).
 pub(super) const PROJECT_HUES: [f64; 8] = [12., 48., 82., 122., 158., 198., 256., 300.];
 
 /// A tone of a project hue: OKLCH lightness (0 to 1) and chroma.
@@ -488,24 +492,94 @@ const DARK_RIM_ALPHA: [u8; 2] = [87, 15];
 const LIGHT_RIM_TOP_ALPHA: u8 = 242;
 const LIGHT_RIM_BOTTOM_ALPHA: u8 = 61;
 
-/// A stable (FNV-1a) index into [`PROJECT_HUES`] for `project`, always in range.
-pub(super) fn project_palette_index(project: &str) -> usize {
+/// The shadow's alpha on dark themes (black).
+const DARK_SHADOW_ALPHA: u8 = 89;
+const DARK_SHADOW_BLUR: f64 = 1.5;
+/// The shadow on light themes: a cool near-black at this alpha.
+const LIGHT_SHADOW_ALPHA: u8 = 36;
+const LIGHT_SHADOW_BLUR: f64 = 1.;
+/// Upper bounds for values from the settings file. OKLCH chroma beyond this
+/// is outside sRGB for every hue.
+const MAX_CHROMA: f64 = 0.4;
+const MAX_SHADOW_BLUR: f64 = 8.;
+
+/// A stable (FNV-1a) slot for `project` in a palette of `len` hues, always in
+/// range (zero for an empty palette).
+pub(super) fn project_palette_index(project: &str, len: usize) -> usize {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let hash = project.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
     });
-    let len = PROJECT_HUES.len() as u64;
-    // `len` is a non-zero constant, so the remainder is always in range.
-    (hash % len) as usize
+    if len == 0 {
+        return 0;
+    }
+    (hash % len as u64) as usize
 }
 
-/// The hue of `project`'s badge and group header.
-pub(super) fn project_hue(project: &str) -> f64 {
-    PROJECT_HUES
-        .get(project_palette_index(project))
+/// The hue of `project`'s badge and group header: its hue from the settings
+/// file if it has one, else its slot in the settings file's palette, else its
+/// slot in [`PROJECT_HUES`]. Non-finite hues are skipped, and every hue is
+/// wrapped into 0 to 360.
+pub(super) fn project_hue(project: &str, labels: &VerticalTabsProjectLabels) -> f64 {
+    if let Some(hue) = labels
+        .project_hues
+        .get(project)
+        .copied()
+        .filter(|hue| hue.is_finite())
+    {
+        return hue.rem_euclid(360.);
+    }
+    let custom: Vec<f64> = labels
+        .hues
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|hue| hue.is_finite())
+        .map(|hue| hue.rem_euclid(360.))
+        .collect();
+    let palette: &[f64] = if custom.is_empty() {
+        &PROJECT_HUES
+    } else {
+        &custom
+    };
+    palette
+        .get(project_palette_index(project, palette.len()))
         .copied()
         .unwrap_or(PROJECT_HUES[0])
+}
+
+/// `value` from the settings file clamped to `min..=max`, or `default` when it
+/// is unset or not finite.
+pub(super) fn bounded_setting(value: Option<f64>, default: f64, min: f64, max: f64) -> f64 {
+    value
+        .filter(|value| value.is_finite())
+        .map_or(default, |value| value.clamp(min, max))
+}
+
+/// How far a lone row's badge sticks out above the row: half the badge's
+/// height (its text line, padding and edge), so it straddles the row's top
+/// edge.
+pub(super) fn badge_overhang(font_size: f32, vertical_padding: f32, edge_width: f32) -> f32 {
+    (font_size * DEFAULT_UI_LINE_HEIGHT_RATIO + 2. * (vertical_padding + edge_width)) / 2.
+}
+
+/// An alpha from a 0-to-1 strength in the settings file, or `default`.
+fn alpha_setting(value: Option<f64>, default: u8) -> u8 {
+    value
+        .filter(|value| value.is_finite())
+        .map_or(default, |value| (value.clamp(0., 1.) * 255.).round() as u8)
+}
+
+/// `default` with whatever the settings file overrides of it.
+fn tone_setting(value: Option<ProjectLabelTone>, default: Tone) -> Tone {
+    let Some(value) = value else {
+        return default;
+    };
+    Tone {
+        lightness: bounded_setting(value.lightness, default.lightness, 0., 1.),
+        chroma: bounded_setting(value.chroma, default.chroma, 0., MAX_CHROMA),
+    }
 }
 
 /// How a project label (a lone row's badge, or a group header's name) is
@@ -524,31 +598,55 @@ pub(super) struct ProjectPillStyle {
 
 /// A solid label in a calm tone of `hue` with text in a deep (light themes) or
 /// pale (dark themes) shade of the same hue, edged with glass: a hairline that
-/// is bright on top and fades downward, over a soft shadow.
-pub(super) fn project_pill_style(hue: f64, dark_theme: bool) -> ProjectPillStyle {
+/// is bright on top and fades downward, over a soft shadow. `labels` holds the
+/// settings file's overrides for the theme's kind.
+pub(super) fn project_pill_style(
+    hue: f64,
+    dark_theme: bool,
+    labels: &VerticalTabsProjectLabels,
+) -> ProjectPillStyle {
     if dark_theme {
+        let tones = &labels.dark;
         ProjectPillStyle {
-            fill_top: DARK_FILL[0].of(hue),
-            fill_bottom: DARK_FILL[1].of(hue),
-            rim_top: ColorU::new(255, 255, 255, DARK_RIM_ALPHA[0]),
-            rim_bottom: ColorU::new(255, 255, 255, DARK_RIM_ALPHA[1]),
-            text: PALE_TEXT.of(hue),
-            shadow: ColorU::new(0, 0, 0, 89),
-            shadow_blur: 1.5,
+            fill_top: tone_setting(tones.fill_top, DARK_FILL[0]).of(hue),
+            fill_bottom: tone_setting(tones.fill_bottom, DARK_FILL[1]).of(hue),
+            rim_top: ColorU::new(
+                255,
+                255,
+                255,
+                alpha_setting(tones.edge_top, DARK_RIM_ALPHA[0]),
+            ),
+            rim_bottom: ColorU::new(
+                255,
+                255,
+                255,
+                alpha_setting(tones.edge_bottom, DARK_RIM_ALPHA[1]),
+            ),
+            text: tone_setting(tones.text, PALE_TEXT).of(hue),
+            shadow: ColorU::new(0, 0, 0, alpha_setting(tones.shadow, DARK_SHADOW_ALPHA)),
+            shadow_blur: bounded_setting(tones.shadow_blur, DARK_SHADOW_BLUR, 0., MAX_SHADOW_BLUR)
+                as f32,
         }
     } else {
-        let deep = DEEP_TEXT.of(hue);
+        let tones = &labels.light;
+        let deep = tone_setting(tones.text, DEEP_TEXT).of(hue);
         ProjectPillStyle {
-            fill_top: LIGHT_FILL[0].of(hue),
-            fill_bottom: LIGHT_FILL[1].of(hue),
-            rim_top: ColorU::new(255, 255, 255, LIGHT_RIM_TOP_ALPHA),
+            fill_top: tone_setting(tones.fill_top, LIGHT_FILL[0]).of(hue),
+            fill_bottom: tone_setting(tones.fill_bottom, LIGHT_FILL[1]).of(hue),
+            rim_top: ColorU::new(
+                255,
+                255,
+                255,
+                alpha_setting(tones.edge_top, LIGHT_RIM_TOP_ALPHA),
+            ),
             rim_bottom: ColorU {
-                a: LIGHT_RIM_BOTTOM_ALPHA,
+                a: alpha_setting(tones.edge_bottom, LIGHT_RIM_BOTTOM_ALPHA),
                 ..deep
             },
             text: deep,
-            shadow: ColorU::new(31, 35, 48, 36),
-            shadow_blur: 1.,
+            shadow: ColorU::new(31, 35, 48, alpha_setting(tones.shadow, LIGHT_SHADOW_ALPHA)),
+            shadow_blur: bounded_setting(tones.shadow_blur, LIGHT_SHADOW_BLUR, 0., MAX_SHADOW_BLUR)
+                as f32,
         }
     }
 }

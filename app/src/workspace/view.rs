@@ -3937,6 +3937,7 @@ impl Workspace {
             | TabSettingsChangedEvent::VerticalTabsShowDiffStats { .. }
             | TabSettingsChangedEvent::VerticalTabsCollapsedProjects { .. }
             | TabSettingsChangedEvent::VerticalTabsHideTopBar { .. }
+            | TabSettingsChangedEvent::VerticalTabsProjectLabels { .. }
             | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. } => {
                 ctx.notify();
             }

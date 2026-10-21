@@ -39,10 +39,10 @@ use warpui::{AppContext, EntityId, EventContext, Gradient, SingletonEntity, Task
 use super::status_order::{
     AttentionBucket, FreezeInputs, GROUP_TRANSITION_DURATION, GroupHeaderText, GroupTransition,
     OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, StatusRowKey, StatusSortInput,
-    activity_age, auto_group_by_project, compact_age_label, group_by_project, group_header_text,
-    group_transitions, is_order_frozen, project_hue, project_name, project_pill_style,
-    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
-    status_sorted_indices,
+    activity_age, auto_group_by_project, badge_overhang, bounded_setting, compact_age_label,
+    group_by_project, group_header_text, group_transitions, is_order_frozen, project_hue,
+    project_name, project_pill_style, resolve_display_order, row_attention_bucket,
+    row_display_status, slide_progress, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -65,6 +65,7 @@ use crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession;
 use crate::terminal::view::TerminalViewState;
 use crate::ui_components::icon_with_status::IconWithStatusVariant;
 use crate::workspace::action::WorkspaceAction;
+use crate::workspace::project_labels::{ProjectLabelShape, VerticalTabsProjectLabels};
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsDisplayGranularity, VerticalTabsSortMode,
 };
@@ -83,10 +84,10 @@ const ROW_SPACING: f32 = 2.;
 const SECTION_GAP: f32 = 12.;
 /// How far the rows of a group are inset from its header.
 const GROUP_ROW_INDENT: f32 = 10.;
-/// A lone row's project badge: how far it sticks out above the row, and how
-/// far it is inset from the row's left edge.
-const BADGE_OVERHANG: f32 = 8.;
+/// How far a lone row's project badge is inset from the row's left edge.
 const BADGE_INSET: f32 = 8.;
+/// The least space between a lone row's badge and the row above it.
+const BADGE_CLEARANCE: f32 = 4.;
 /// A lone row's badge: 16 px tall, so it straddles the row's top edge.
 const BADGE_PILL: PillMetrics = PillMetrics {
     font_size: 10.,
@@ -105,6 +106,13 @@ const GROUP_PILL: PillMetrics = PillMetrics {
 };
 /// The label's glass edge, inside its padding.
 const PILL_RIM_WIDTH: f32 = 1.;
+/// Bounds for the label sizes from the settings file, in pixels.
+const MIN_PILL_FONT_SIZE: f64 = 6.;
+const MAX_PILL_FONT_SIZE: f64 = 20.;
+const MAX_PILL_HORIZONTAL_PADDING: f64 = 16.;
+const MAX_PILL_VERTICAL_PADDING: f64 = 8.;
+const MAX_PILL_CORNER_RADIUS: f64 = 20.;
+const MAX_PILL_RIM_WIDTH: f64 = 3.;
 const GROUP_CHEVRON_SIZE: f32 = 12.;
 /// How far a forming group's header rises into place, and a dissolving
 /// group's badge sinks into place.
@@ -315,6 +323,12 @@ pub(super) fn render_status_ordered_list(
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
+    let label_look = ProjectLabelLook::new(
+        TabSettings::as_ref(app)
+            .vertical_tabs_project_labels
+            .value(),
+        appearance,
+    );
     let rows = collect_status_rows(state, workspace, app);
 
     if rows.is_empty() {
@@ -383,8 +397,15 @@ pub(super) fn render_status_ordered_list(
             badge,
         } = section;
         let top_gap = if section_index == 0 {
-            if badge.is_some() { BADGE_OVERHANG } else { 0. }
-        } else if header.is_some() || badge.is_some() || follows_group {
+            if badge.is_some() {
+                label_look.badge_overhang()
+            } else {
+                0.
+            }
+        } else if badge.is_some() {
+            // Room for a badge made taller in the settings file.
+            SECTION_GAP.max(label_look.badge_overhang() + BADGE_CLEARANCE)
+        } else if header.is_some() || follows_group {
             SECTION_GAP
         } else {
             0.
@@ -425,6 +446,7 @@ pub(super) fn render_status_ordered_list(
                 mouse_state,
                 transition,
                 &palette,
+                &label_look,
                 appearance,
             ));
             section_elements.extend(section_rows.into_iter().map(|row| {
@@ -442,7 +464,13 @@ pub(super) fn render_status_ordered_list(
                     .get(project)
                     .filter(|(transition, _)| *transition == GroupTransition::Dissolved)
                     .map(|(_, started_at)| *started_at);
-                section_elements.push(with_project_badge(row, project, transition, appearance));
+                section_elements.push(with_project_badge(
+                    row,
+                    project,
+                    transition,
+                    &label_look,
+                    appearance,
+                ));
             }
         }
         for (element_index, element) in section_elements.into_iter().enumerate() {
@@ -1424,16 +1452,91 @@ struct PillMetrics {
     max_width: f32,
 }
 
+impl PillMetrics {
+    /// These metrics with the settings file's sizes, clamped to sane bounds.
+    fn with_overrides(&self, shape: &ProjectLabelShape) -> Self {
+        let size = |value: Option<f64>, default: f32, min: f64, max: f64| {
+            bounded_setting(value, f64::from(default), min, max) as f32
+        };
+        Self {
+            font_size: size(
+                shape.font_size,
+                self.font_size,
+                MIN_PILL_FONT_SIZE,
+                MAX_PILL_FONT_SIZE,
+            ),
+            horizontal_padding: size(
+                shape.padding_x,
+                self.horizontal_padding,
+                0.,
+                MAX_PILL_HORIZONTAL_PADDING,
+            ),
+            vertical_padding: size(
+                shape.padding_y,
+                self.vertical_padding,
+                0.,
+                MAX_PILL_VERTICAL_PADDING,
+            ),
+            corner_radius: size(
+                shape.corner_radius,
+                self.corner_radius,
+                0.,
+                MAX_PILL_CORNER_RADIUS,
+            ),
+            max_width: self.max_width,
+        }
+    }
+}
+
+/// The project labels' look for this render: the built-in look with the
+/// settings file's overrides (`appearance.vertical_tabs.project_labels`).
+struct ProjectLabelLook<'a> {
+    labels: &'a VerticalTabsProjectLabels,
+    dark_theme: bool,
+    badge: PillMetrics,
+    header: PillMetrics,
+    rim_width: f32,
+}
+
+impl<'a> ProjectLabelLook<'a> {
+    fn new(labels: &'a VerticalTabsProjectLabels, appearance: &Appearance) -> Self {
+        Self {
+            labels,
+            dark_theme: appearance.theme().inferred_color_scheme() == ColorScheme::LightOnDark,
+            badge: BADGE_PILL.with_overrides(&labels.badge),
+            header: GROUP_PILL.with_overrides(&labels.header),
+            rim_width: bounded_setting(
+                labels.edge_width,
+                f64::from(PILL_RIM_WIDTH),
+                0.,
+                MAX_PILL_RIM_WIDTH,
+            ) as f32,
+        }
+    }
+
+    fn badge_overhang(&self) -> f32 {
+        badge_overhang(
+            self.badge.font_size,
+            self.badge.vertical_padding,
+            self.rim_width,
+        )
+    }
+}
+
 /// `name` on a solid label in `project`'s hue, edged with glass (see
 /// [`project_pill_style`]).
 fn render_project_pill(
     name: String,
     project: &str,
     metrics: &PillMetrics,
+    look: &ProjectLabelLook<'_>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
-    let dark_theme = appearance.theme().inferred_color_scheme() == ColorScheme::LightOnDark;
-    let style = project_pill_style(project_hue(project), dark_theme);
+    let style = project_pill_style(
+        project_hue(project, look.labels),
+        look.dark_theme,
+        look.labels,
+    );
     let top = vec2f(0., 0.);
     let bottom = vec2f(0., 1.);
     ConstrainedBox::new(
@@ -1454,7 +1557,7 @@ fn render_project_pill(
                 end: style.fill_bottom,
             },
         )
-        .with_border(Border::all(PILL_RIM_WIDTH).with_border_gradient(
+        .with_border(Border::all(look.rim_width).with_border_gradient(
             top,
             bottom,
             Gradient {
@@ -1484,9 +1587,10 @@ fn with_project_badge(
     row: Box<dyn Element>,
     project: &str,
     slide_started_at: Option<Instant>,
+    look: &ProjectLabelLook<'_>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
-    let badge = render_project_pill(project.to_owned(), project, &BADGE_PILL, appearance);
+    let badge = render_project_pill(project.to_owned(), project, &look.badge, look, appearance);
     let badge = match slide_started_at {
         Some(started_at) => SlideIn::new(badge, vec2f(0., -BADGE_SINK), started_at).finish(),
         None => badge,
@@ -1495,7 +1599,7 @@ fn with_project_badge(
     stack.add_positioned_child(
         badge,
         OffsetPositioning::offset_from_parent(
-            vec2f(BADGE_INSET, -BADGE_OVERHANG),
+            vec2f(BADGE_INSET, -look.badge_overhang()),
             ParentOffsetBounds::Unbounded,
             ParentAnchor::TopLeft,
             ChildAnchor::TopLeft,
@@ -1580,6 +1684,7 @@ fn render_group_header(
     mouse_state: MouseStateHandle,
     rise_started_at: Option<Instant>,
     palette: &StatusPalette,
+    look: &ProjectLabelLook<'_>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
@@ -1592,7 +1697,7 @@ fn render_group_header(
         ..
     } = header;
 
-    let pill = render_project_pill(text.name, &project, &GROUP_PILL, appearance);
+    let pill = render_project_pill(text.name, &project, &look.header, look, appearance);
     let name_and_count = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)

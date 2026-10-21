@@ -8,14 +8,18 @@ use super::{
     AttentionBucket, DARK_FILL, DEEP_TEXT, FreezeInputs, GroupHeaderText, GroupTransition,
     KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, LIGHT_FILL, OTHER_PROJECT_LABEL, PALE_TEXT,
     POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_HUES, ProjectGroup, StatusRowKey,
-    StatusRowNavigation, StatusSortInput, activity_age, attention_bucket, auto_group_by_project,
-    compact_age_label, group_by_project, group_header_text, group_transitions, is_order_frozen,
-    navigation_target, oklch, project_hue, project_name, project_palette_index, project_pill_style,
-    reconcile_frozen_order, resolve_display_order, row_attention_bucket, row_display_status,
-    slide_progress, status_sorted_indices,
+    StatusRowNavigation, StatusSortInput, Tone, activity_age, attention_bucket,
+    auto_group_by_project, badge_overhang, bounded_setting, compact_age_label, group_by_project,
+    group_header_text, group_transitions, is_order_frozen, navigation_target, oklch, project_hue,
+    project_name, project_palette_index, project_pill_style, reconcile_frozen_order,
+    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
+    status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
+use crate::workspace::project_labels::{
+    ProjectLabelTone, ProjectLabelTones, VerticalTabsProjectLabels,
+};
 
 fn pane_id() -> PaneId {
     TerminalPaneId::dummy_terminal_pane_id().into()
@@ -507,6 +511,11 @@ fn rgb(r: u8, g: u8, b: u8) -> ColorU {
     ColorU::new(r, g, b, 0xFF)
 }
 
+/// No `appearance.vertical_tabs.project_labels` in the settings file.
+fn built_in() -> VerticalTabsProjectLabels {
+    VerticalTabsProjectLabels::default()
+}
+
 #[test]
 fn oklch_matches_known_colors() {
     assert_eq!(oklch(1., 0., 0.), ColorU::white());
@@ -523,7 +532,7 @@ fn oklch_matches_known_colors() {
 fn project_label_text_is_readable_on_every_hue() {
     for hue in PROJECT_HUES {
         for dark_theme in [true, false] {
-            let style = project_pill_style(hue, dark_theme);
+            let style = project_pill_style(hue, dark_theme, &built_in());
             for fill in [style.fill_top, style.fill_bottom] {
                 assert_eq!(fill.a, 0xFF, "the label is solid");
                 let ratio = contrast_ratio(style.text, fill);
@@ -559,7 +568,7 @@ fn project_tones_are_equally_bright_across_hues() {
 #[test]
 fn project_label_style_follows_the_theme() {
     let hue = PROJECT_HUES[5];
-    let dark = project_pill_style(hue, true);
+    let dark = project_pill_style(hue, true, &built_in());
     assert_eq!(dark.text, PALE_TEXT.of(hue));
     // A glass edge: white, brightest on top and fading downward.
     assert_eq!(
@@ -573,7 +582,7 @@ fn project_label_style_follows_the_theme() {
     assert!(dark.rim_top.a > dark.rim_bottom.a);
     assert!(relative_luminance(dark.fill_top) > relative_luminance(dark.fill_bottom));
 
-    let light = project_pill_style(hue, false);
+    let light = project_pill_style(hue, false, &built_in());
     let deep = DEEP_TEXT.of(hue);
     assert_eq!(light.text, deep);
     // White on top, fading into a trace of the label's own deep tone.
@@ -584,6 +593,205 @@ fn project_label_style_follows_the_theme() {
     );
     assert!(light.rim_bottom.a < 128);
     assert!(relative_luminance(light.fill_top) > relative_luminance(light.fill_bottom));
+}
+
+#[test]
+fn built_in_project_labels_keep_their_look() {
+    // The v6 look, value for value, when the settings file overrides nothing.
+    let hue = PROJECT_HUES[2];
+    assert_eq!(
+        project_pill_style(hue, true, &built_in()),
+        super::ProjectPillStyle {
+            fill_top: DARK_FILL[0].of(hue),
+            fill_bottom: DARK_FILL[1].of(hue),
+            rim_top: ColorU::new(255, 255, 255, 87),
+            rim_bottom: ColorU::new(255, 255, 255, 15),
+            text: PALE_TEXT.of(hue),
+            shadow: ColorU::new(0, 0, 0, 89),
+            shadow_blur: 1.5,
+        }
+    );
+    let deep = DEEP_TEXT.of(hue);
+    assert_eq!(
+        project_pill_style(hue, false, &built_in()),
+        super::ProjectPillStyle {
+            fill_top: LIGHT_FILL[0].of(hue),
+            fill_bottom: LIGHT_FILL[1].of(hue),
+            rim_top: ColorU::new(255, 255, 255, 242),
+            rim_bottom: ColorU { a: 61, ..deep },
+            text: deep,
+            shadow: ColorU::new(31, 35, 48, 36),
+            shadow_blur: 1.,
+        }
+    );
+    // A lone row's 16 px badge straddles the row's top edge.
+    assert_eq!(badge_overhang(10., 1., 1.), 8.);
+    // Sardor's projects keep the slots they had.
+    for (project, slot) in [
+        ("Shipzen", 0),
+        ("Lucid Notes", 7),
+        ("Coach-Journal", 3),
+        ("warp-custom", 5),
+        ("resume", 2),
+    ] {
+        assert_eq!(
+            project_hue(project, &built_in()),
+            PROJECT_HUES[slot],
+            "{project}"
+        );
+    }
+}
+
+#[test]
+fn settings_file_hues_replace_the_palette() {
+    let palette = |hues: Vec<f64>| VerticalTabsProjectLabels {
+        hues: Some(hues),
+        ..Default::default()
+    };
+    // Hues wrap into 0 to 360.
+    let wrapped = palette(vec![390., -60.]);
+    for project in ["Shipzen", "Lucid Notes", "warp", ""] {
+        let expected = [30., 300.][project_palette_index(project, 2)];
+        assert_eq!(project_hue(project, &wrapped), expected, "{project}");
+    }
+    // Non-finite hues are skipped; an empty palette falls back to the built-in one.
+    let only_bad = palette(vec![f64::NAN, f64::INFINITY]);
+    let empty = palette(Vec::new());
+    for project in ["Shipzen", "resume"] {
+        let built_in_hue = project_hue(project, &built_in());
+        assert_eq!(project_hue(project, &only_bad), built_in_hue, "{project}");
+        assert_eq!(project_hue(project, &empty), built_in_hue, "{project}");
+    }
+    assert_eq!(
+        project_hue("x", &palette(vec![f64::NAN, 42.])),
+        42.,
+        "the one finite hue is the whole palette"
+    );
+}
+
+#[test]
+fn settings_file_project_hues_win() {
+    let mut labels = VerticalTabsProjectLabels {
+        hues: Some(vec![10., 20.]),
+        ..Default::default()
+    };
+    labels.project_hues.insert("Shipzen".to_owned(), 725.);
+    labels.project_hues.insert("resume".to_owned(), f64::NAN);
+    assert_eq!(project_hue("Shipzen", &labels), 5.);
+    // A non-finite pick is ignored, so the project keeps its palette slot.
+    assert_eq!(
+        project_hue("resume", &labels),
+        [10., 20.][project_palette_index("resume", 2)]
+    );
+    // Names match exactly.
+    assert_eq!(
+        project_hue("shipzen", &labels),
+        [10., 20.][project_palette_index("shipzen", 2)]
+    );
+}
+
+#[test]
+fn settings_file_tones_override_the_built_in_ones_within_bounds() {
+    let hue = PROJECT_HUES[6];
+    let labels = VerticalTabsProjectLabels {
+        dark: ProjectLabelTones {
+            // Only the lightness, and too high: clamped to 1, chroma kept.
+            text: Some(ProjectLabelTone {
+                lightness: Some(2.),
+                chroma: None,
+            }),
+            fill_top: Some(ProjectLabelTone {
+                lightness: Some(0.5),
+                chroma: Some(1.),
+            }),
+            fill_bottom: Some(ProjectLabelTone {
+                lightness: Some(f64::NAN),
+                chroma: Some(-1.),
+            }),
+            edge_top: Some(0.5),
+            edge_bottom: Some(-3.),
+            shadow: Some(7.),
+            shadow_blur: Some(100.),
+        },
+        light: ProjectLabelTones {
+            text: Some(ProjectLabelTone {
+                lightness: None,
+                chroma: Some(0.1),
+            }),
+            edge_bottom: Some(1.),
+            shadow_blur: Some(f64::INFINITY),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let dark = project_pill_style(hue, true, &labels);
+    let built_in_dark = project_pill_style(hue, true, &built_in());
+    assert_eq!(
+        dark.text,
+        Tone {
+            lightness: 1.,
+            chroma: PALE_TEXT.chroma,
+        }
+        .of(hue)
+    );
+    assert_eq!(
+        dark.fill_top,
+        Tone {
+            lightness: 0.5,
+            chroma: 0.4,
+        }
+        .of(hue)
+    );
+    assert_eq!(
+        dark.fill_bottom,
+        Tone {
+            lightness: DARK_FILL[1].lightness,
+            chroma: 0.,
+        }
+        .of(hue)
+    );
+    assert_eq!(dark.rim_top, ColorU::new(255, 255, 255, 128));
+    assert_eq!(dark.rim_bottom, ColorU::new(255, 255, 255, 0));
+    assert_eq!(dark.shadow, ColorU::new(0, 0, 0, 255));
+    assert_eq!(dark.shadow_blur, 8.);
+    // The light theme's look is separate.
+    assert_eq!(
+        project_pill_style(hue, false, &labels).fill_top,
+        project_pill_style(hue, false, &built_in()).fill_top
+    );
+    assert_ne!(dark, built_in_dark);
+
+    let light = project_pill_style(hue, false, &labels);
+    let deep = Tone {
+        lightness: DEEP_TEXT.lightness,
+        chroma: 0.1,
+    }
+    .of(hue);
+    assert_eq!(light.text, deep);
+    assert_eq!(light.rim_bottom, ColorU { a: 255, ..deep });
+    assert_eq!(
+        light.shadow_blur, 1.,
+        "a non-finite blur keeps the built-in one"
+    );
+}
+
+#[test]
+fn bounded_setting_clamps_and_falls_back() {
+    assert_eq!(bounded_setting(None, 3., 0., 10.), 3.);
+    assert_eq!(bounded_setting(Some(4.5), 3., 0., 10.), 4.5);
+    assert_eq!(bounded_setting(Some(-1.), 3., 0., 10.), 0.);
+    assert_eq!(bounded_setting(Some(11.), 3., 0., 10.), 10.);
+    assert_eq!(bounded_setting(Some(f64::NAN), 3., 0., 10.), 3.);
+    assert_eq!(bounded_setting(Some(f64::INFINITY), 3., 0., 10.), 3.);
+    assert_eq!(bounded_setting(Some(f64::NEG_INFINITY), 3., 0., 10.), 3.);
+}
+
+#[test]
+fn badge_overhang_is_half_the_badge_height() {
+    assert_eq!(badge_overhang(10., 1., 1.), 8.);
+    assert_eq!(badge_overhang(20., 0., 0.), 12.);
+    assert_eq!(badge_overhang(10., 3., 2.), 11.);
 }
 
 #[test]
@@ -661,10 +869,21 @@ fn resolve_display_order_only_freezes_when_requested() {
 #[test]
 fn palette_index_is_stable_and_in_range() {
     for project in ["", "warp", "api", "Launch", "a/b", "日本語", "warp"] {
-        let index = project_palette_index(project);
+        let index = project_palette_index(project, PROJECT_HUES.len());
         assert!(index < PROJECT_HUES.len(), "{project}: {index}");
-        assert_eq!(index, project_palette_index(project));
-        assert_eq!(project_hue(project), PROJECT_HUES[index], "{project}");
+        assert_eq!(index, project_palette_index(project, PROJECT_HUES.len()));
+        assert_eq!(
+            project_hue(project, &built_in()),
+            PROJECT_HUES[index],
+            "{project}"
+        );
+        for len in 1..=20 {
+            assert!(
+                project_palette_index(project, len) < len,
+                "{project}: {len}"
+            );
+        }
+        assert_eq!(project_palette_index(project, 0), 0, "{project}");
     }
 }
 
@@ -673,8 +892,10 @@ fn palette_spreads_distinct_projects() {
     let names = [
         "warp", "api", "web", "infra", "docs", "mobile", "cli", "sdk",
     ];
-    let distinct: std::collections::HashSet<usize> =
-        names.into_iter().map(project_palette_index).collect();
+    let distinct: std::collections::HashSet<usize> = names
+        .into_iter()
+        .map(|name| project_palette_index(name, PROJECT_HUES.len()))
+        .collect();
     assert!(distinct.len() > 1);
 }
 
