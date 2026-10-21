@@ -8,6 +8,7 @@ pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
 pub(crate) mod feature_intro_modal;
+mod frameless;
 pub(crate) mod free_ai_removal_modal;
 pub(crate) mod glass;
 pub mod global_search;
@@ -3935,6 +3936,7 @@ impl Workspace {
             | TabSettingsChangedEvent::VerticalTabsShowPrLink { .. }
             | TabSettingsChangedEvent::VerticalTabsShowDiffStats { .. }
             | TabSettingsChangedEvent::VerticalTabsCollapsedProjects { .. }
+            | TabSettingsChangedEvent::VerticalTabsHideTopBar { .. }
             | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. } => {
                 ctx.notify();
             }
@@ -14612,6 +14614,12 @@ impl Workspace {
             return ShowTabBar::Stacked;
         }
 
+        // Fork: without the top bar, its buttons always show in the tabs
+        // panel and the session header, like a bar that's always shown.
+        if self.hides_top_bar(app) {
+            return ShowTabBar::Stacked;
+        }
+
         if !FeatureFlag::FullScreenZenMode.is_enabled() {
             return ShowTabBar::default();
         }
@@ -23615,6 +23623,9 @@ impl Workspace {
         if glass::is_glass_enabled(app) {
             context.set.insert(flags::VERTICAL_TABS_GLASS_FLAG);
         }
+        if cfg!(target_os = "macos") && *tab_settings.vertical_tabs_hide_top_bar.value() {
+            context.set.insert(flags::VERTICAL_TABS_HIDE_TOP_BAR_FLAG);
+        }
         if *tab_settings.preserve_active_tab_color.value() {
             context.set.insert(flags::PRESERVE_ACTIVE_TAB_COLOR_FLAG);
         }
@@ -27180,11 +27191,19 @@ impl View for Workspace {
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()
         } else {
+            // Fork: without the top bar, the tab content gets the session
+            // header (see `frameless`).
+            let hides_top_bar = self.hides_top_bar(app);
             let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
+            if tab_bar_mode == ShowTabBar::Stacked && !hides_top_bar {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
             let content = self.render_banner_and_active_tab(app, appearance);
+            let content = if hides_top_bar {
+                self.with_session_header(content, appearance, app)
+            } else {
+                content
+            };
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
             // Fork: with glass, the terminal background is painted only

@@ -6543,3 +6543,35 @@ fn test_tab_group_rename_blur_does_not_commit_unfinished_name() {
         });
     });
 }
+
+#[test]
+fn test_top_bar_hides_only_while_the_tabs_panel_is_open_on_the_left() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            });
+        });
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.vertical_tabs_panel_open = true;
+            // Only macOS has native traffic lights in the top-left corner.
+            assert_eq!(workspace.hides_top_bar(ctx), cfg!(target_os = "macos"));
+            if workspace.hides_top_bar(ctx) {
+                assert_eq!(workspace.tab_bar_mode(ctx), ShowTabBar::Stacked);
+            }
+
+            workspace.vertical_tabs_panel_open = false;
+            assert!(!workspace.hides_top_bar(ctx));
+
+            workspace.vertical_tabs_panel_open = true;
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.vertical_tabs_hide_top_bar.set_value(false, ctx));
+            });
+            assert!(!workspace.hides_top_bar(ctx));
+        });
+    });
+}

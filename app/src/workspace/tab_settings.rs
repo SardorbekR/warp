@@ -629,6 +629,19 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "appearance.vertical_tabs.glass",
         description: "Whether the vertical tabs panel and the window header are translucent over a blurred desktop.",
     },
+    // Fork feature: no bar across the top of the window while the vertical tabs panel is open
+    // on the left; its controls move into the panel's top row and the session's header.
+    vertical_tabs_hide_top_bar: VerticalTabsHideTopBar {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::MAC,
+        // Fork-only setting: never synced to the user's Warp account.
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.vertical_tabs.hide_top_bar",
+        description: "Whether the bar across the top of the window is hidden while the vertical tabs panel is open on the left. Its controls move into the panel's top row and the session's header.",
+    },
     // Fork feature: the project groups collapsed in the vertical tabs panel, by project name.
     // Saved on every change, so collapsed groups stay collapsed after a restart or a crash.
     vertical_tabs_collapsed_projects: VerticalTabsCollapsedProjects {

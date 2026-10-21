@@ -1029,6 +1029,16 @@ fn status_row_title(
             font: TerminalPrimaryLineFont::Ui,
         };
     };
+    let (text, font) = terminal_primary_title(terminal_view, app);
+    StatusRowTitle::Text { text, font }
+}
+
+/// The terminal's primary line, like the manual list shows it: the agent's
+/// title, the running command, the last command, ...
+fn terminal_primary_title(
+    terminal_view: &TerminalView,
+    app: &AppContext,
+) -> (String, TerminalPrimaryLineFont) {
     // Each of these reads takes the terminal model lock on its own; none of
     // them is nested inside another.
     let terminal_title = terminal_view.terminal_title_from_shell();
@@ -1046,12 +1056,63 @@ fn status_row_title(
         terminal_title_fallback_font(&agent_text),
         terminal_view.last_completed_command_text(),
     ) {
-        TerminalPrimaryLineData::StatusText { text } => StatusRowTitle::Text {
-            text,
-            font: TerminalPrimaryLineFont::Ui,
-        },
-        TerminalPrimaryLineData::Text { text, font } => StatusRowTitle::Text { text, font },
+        TerminalPrimaryLineData::StatusText { text } => (text, TerminalPrimaryLineFont::Ui),
+        TerminalPrimaryLineData::Text { text, font } => (text, font),
     }
+}
+
+/// What the session header shows for a tab when the window has no top bar
+/// (fork feature).
+pub(in crate::workspace::view) struct SessionHeaderText {
+    pub(in crate::workspace::view) title: String,
+    /// The title is a command, shown in the terminal font.
+    pub(in crate::workspace::view) is_monospace: bool,
+    pub(in crate::workspace::view) folder: Option<String>,
+}
+
+/// The title of the row of the tab's focused pane (its custom name, else its
+/// session's name, else the terminal's primary line) and the pane's folder,
+/// unless the title already is the folder.
+pub(in crate::workspace::view) fn session_header_text(
+    pane_group: &PaneGroup,
+    app: &AppContext,
+) -> Option<SessionHeaderText> {
+    let pane_id = pane_group.focused_pane_id(app);
+    // Like the row, a temporary replacement (e.g. an expanded code diff)
+    // shows the pane it replaces.
+    let display_pane_id = pane_group
+        .original_pane_for_replacement(pane_id)
+        .unwrap_or(pane_id);
+    let pane = pane_group.pane_by_id(display_pane_id)?;
+    let pane_configuration = pane.pane_configuration();
+    let pane_configuration = pane_configuration.as_ref(app);
+    let terminal_view_handle = pane_group.terminal_view_from_pane_id(display_pane_id, app);
+    let terminal_view = terminal_view_handle
+        .as_ref()
+        .map(|handle| handle.as_ref(app));
+    let custom_title = pane_configuration
+        .custom_vertical_tabs_title()
+        .map(str::to_owned)
+        .or_else(|| tab_title_override(pane_group, pane_group.visible_pane_ids().len(), app));
+    let (title, font) = match (custom_title, terminal_view) {
+        (Some(title), _) => (title, TerminalPrimaryLineFont::Ui),
+        (None, Some(terminal_view)) => match terminal_session_name(terminal_view, app) {
+            Some(name) => (name, TerminalPrimaryLineFont::Ui),
+            None => terminal_primary_title(terminal_view, app),
+        },
+        (None, None) => (
+            pane_configuration.title().trim().to_owned(),
+            TerminalPrimaryLineFont::Ui,
+        ),
+    };
+    let folder = terminal_view
+        .and_then(|terminal_view| resolved_terminal_working_directory(terminal_view, app))
+        .filter(|folder| folder.trim() != title.trim());
+    Some(SessionHeaderText {
+        title,
+        is_monospace: matches!(font, TerminalPrimaryLineFont::Monospace),
+        folder,
+    })
 }
 
 /// Colors of the status list that depend on whether the theme is dark.

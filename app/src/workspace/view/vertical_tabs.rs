@@ -1,5 +1,7 @@
 mod status_list;
 mod status_order;
+
+pub(super) use status_list::{SessionHeaderText, session_header_text};
 pub mod telemetry;
 
 use std::cell::{Cell, RefCell};
@@ -1522,10 +1524,12 @@ fn add_vertical_tab_insertion_target_overlay(
     );
 }
 
+/// The search field and the panel's buttons. `new_tab_button` is `None` when
+/// the panel's top row shows it instead (fork: no top bar).
 fn render_control_bar(
     state: &VerticalTabsPanelState,
-    workspace: &Workspace,
     search_editor: &ViewHandle<EditorView>,
+    new_tab_button: Option<Box<dyn Element>>,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -1556,24 +1560,24 @@ fn render_control_bar(
         .finish();
 
     let settings_button = render_settings_button(state, appearance);
-    let new_tab_button = render_new_tab_button(state, workspace, appearance, app);
 
-    Container::new(
-        Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(CONTROL_BAR_SPACING)
-            .with_child(Shrinkable::new(1., search_bar).finish())
-            .with_child(settings_button)
-            .with_child(new_tab_button)
-            .finish(),
-    )
-    .with_padding(
-        Padding::uniform(CONTROL_BAR_VERTICAL_PADDING)
-            .with_left(GROUP_HORIZONTAL_PADDING)
-            .with_right(GROUP_HORIZONTAL_PADDING),
-    )
-    .finish()
+    let mut row = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(CONTROL_BAR_SPACING)
+        .with_child(Shrinkable::new(1., search_bar).finish())
+        .with_child(settings_button);
+    if let Some(new_tab_button) = new_tab_button {
+        row.add_child(new_tab_button);
+    }
+
+    Container::new(row.finish())
+        .with_padding(
+            Padding::uniform(CONTROL_BAR_VERTICAL_PADDING)
+                .with_left(GROUP_HORIZONTAL_PADDING)
+                .with_right(GROUP_HORIZONTAL_PADDING),
+        )
+        .finish()
 }
 
 fn render_detail_kind_badge_icon(
@@ -1828,13 +1832,21 @@ fn render_vertical_tabs_panel(
         scrollable_groups
     };
 
+    // Fork: without the top bar, the panel's top row holds the new tab button.
+    let hides_top_bar = workspace.hides_top_bar(app);
+    let new_tab_button = render_new_tab_button(state, workspace, appearance, app);
+    let (control_bar_new_tab_button, top_row_new_tab_button) = if hides_top_bar {
+        (None, Some(new_tab_button))
+    } else {
+        (Some(new_tab_button), None)
+    };
     let panel_content = Flex::column()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
         .with_child(render_control_bar(
             state,
-            workspace,
             &workspace.vertical_tabs_search_input,
+            control_bar_new_tab_button,
             app,
         ))
         .with_child(Shrinkable::new(1., scrollable_groups).finish())
@@ -1890,6 +1902,22 @@ fn render_vertical_tabs_panel(
     })
     .with_defer_events_to_children()
     .finish();
+    // Fork: the top row sits outside the `Hoverable` above, whose clicks would
+    // otherwise keep its empty space from dragging the window (and a
+    // double-click from zooming it).
+    let inner = match top_row_new_tab_button {
+        Some(new_tab_button) => Flex::column()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(
+                Container::new(workspace.render_tabs_panel_top_row(new_tab_button, app))
+                    .with_background(internal_colors::fg_overlay_1(theme))
+                    .finish(),
+            )
+            .with_child(Expanded::new(1., inner).finish())
+            .finish(),
+        None => inner,
+    };
 
     Resizable::new(state.resizable_state.clone(), inner)
         .with_dragbar_side(drag_side)

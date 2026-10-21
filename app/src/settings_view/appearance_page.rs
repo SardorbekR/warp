@@ -95,8 +95,8 @@ use crate::workspace::tab_settings::{
     DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
     ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
     TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
-    UseVerticalTabs, VerticalTabsGlass, VerticalTabsSortMode, WorkspaceDecorationVisibility,
-    canonical_directory_key,
+    UseVerticalTabs, VerticalTabsGlass, VerticalTabsHideTopBar, VerticalTabsSortMode,
+    WorkspaceDecorationVisibility, canonical_directory_key,
 };
 use crate::workspace::view::glass;
 use crate::{send_telemetry_from_ctx, themes};
@@ -414,6 +414,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                 context,
                 flags::VERTICAL_TABS_GLASS_FLAG,
             ));
+            toggle_binding_pairs.push(ToggleSettingActionPair::new(
+                "hide the top bar with the vertical tabs panel",
+                builder(SettingsAction::AppearancePageToggle(
+                    AppearancePageAction::ToggleVerticalTabsHideTopBar,
+                )),
+                context,
+                flags::VERTICAL_TABS_HIDE_TOP_BAR_FLAG,
+            ));
         }
     }
 
@@ -535,6 +543,7 @@ pub enum AppearancePageAction {
     ToggleHideTitleBarSearchBarInVerticalTabs,
     ToggleUseLatestUserPromptAsConversationTitleInTabNames,
     ToggleVerticalTabsGlass,
+    ToggleVerticalTabsHideTopBar,
     ToggleLigatureRendering,
     SetWindowBackdrop(WindowBackdrop),
     ToggleLeftPanelVisibility,
@@ -727,6 +736,7 @@ impl TypedActionView for AppearanceSettingsPageView {
                 self.toggle_use_latest_user_prompt_as_conversation_title_in_tab_names(ctx)
             }
             ToggleVerticalTabsGlass => self.toggle_vertical_tabs_glass(ctx),
+            ToggleVerticalTabsHideTopBar => self.toggle_vertical_tabs_hide_top_bar(ctx),
             ToggleLigatureRendering => self.toggle_ligature_rendering(ctx),
             ToggleFocusPaneOnHover => {
                 PaneSettings::handle(ctx).update(ctx, |pane_settings, ctx| {
@@ -1571,6 +1581,7 @@ impl AppearanceSettingsPageView {
             }
             if cfg!(target_os = "macos") {
                 tab_settings_widgets.push(Box::new(VerticalTabsGlassWidget::default()));
+                tab_settings_widgets.push(Box::new(VerticalTabsHideTopBarWidget::default()));
             }
             tab_settings_widgets.push(Box::new(
                 ShowVerticalTabPanelInRestoredWindowsWidget::default(),
@@ -2597,6 +2608,17 @@ impl AppearanceSettingsPageView {
     fn toggle_vertical_tabs_glass(&mut self, ctx: &mut ViewContext<Self>) {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             report_if_error!(settings.vertical_tabs_glass.toggle_and_save_value(ctx));
+        });
+        ctx.notify();
+    }
+
+    fn toggle_vertical_tabs_hide_top_bar(&mut self, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(
+                settings
+                    .vertical_tabs_hide_top_bar
+                    .toggle_and_save_value(ctx)
+            );
         });
         ctx.notify();
     }
@@ -4995,6 +5017,55 @@ impl SettingsWidget for VerticalTabsGlassWidget {
                 "With vertical tabs, show the tabs panel and the window header over a blurred desktop, with the tab content opaque. The window blur is at least {} while this is on. Themes with a background image keep their usual look.",
                 glass::GLASS_BLUR_RADIUS
             )),
+        )
+    }
+}
+
+/// Fork: no top bar while the vertical tabs panel is open on the left.
+#[derive(Default)]
+struct VerticalTabsHideTopBarWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for VerticalTabsHideTopBarWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "vertical tabs hide top bar title bar header toolbar traffic lights sidebar"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Hide the top bar".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                VerticalTabsHideTopBar::storage_key(),
+                VerticalTabsHideTopBar::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.vertical_tabs_hide_top_bar)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleVerticalTabsHideTopBar);
+                })
+                .finish(),
+            Some(
+                "While the vertical tabs panel is open on the left, it runs to the top of the window with the traffic lights and the bar's buttons, and each tab gets a slim header with its name, folder and code review. Hiding the panel brings the bar back."
+                    .to_owned(),
+            ),
         )
     }
 }

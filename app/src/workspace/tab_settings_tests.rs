@@ -140,6 +140,34 @@ fn fork_vertical_tabs_settings_are_never_synced_to_cloud() {
         VerticalTabsGlass::sync_to_cloud(),
         SyncToCloud::Never
     ));
+    assert!(matches!(
+        VerticalTabsHideTopBar::sync_to_cloud(),
+        SyncToCloud::Never
+    ));
+    assert!(matches!(
+        VerticalTabsCollapsedProjects::sync_to_cloud(),
+        SyncToCloud::Never
+    ));
+}
+
+#[test]
+fn vertical_tabs_hide_top_bar_defaults_to_true() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(*settings.vertical_tabs_hide_top_bar);
+        });
+    });
+}
+
+#[test]
+fn vertical_tabs_hide_top_bar_uses_vertical_tabs_path() {
+    assert_eq!(
+        VerticalTabsHideTopBar::toml_path(),
+        Some("appearance.vertical_tabs.hide_top_bar")
+    );
+    assert_eq!(VerticalTabsHideTopBar::toml_key(), "hide_top_bar");
 }
 
 #[test]
