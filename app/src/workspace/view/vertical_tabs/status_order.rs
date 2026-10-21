@@ -16,7 +16,9 @@ use warpui::elements::DEFAULT_UI_LINE_HEIGHT_RATIO;
 use super::StatusRowNavigation;
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::PaneId;
-use crate::workspace::project_labels::{ProjectLabelTone, VerticalTabsProjectLabels};
+use crate::workspace::project_labels::{
+    ProjectLabelTone, VerticalTabsProjectColors, VerticalTabsProjectLabels,
+};
 
 /// How urgently a session wants the user's attention. Lower sorts first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -433,12 +435,18 @@ pub(super) fn project_name(repo_root_name: Option<&str>, cwd: Option<&str>) -> O
 
 /// Hues for project badges and group headers, as OKLCH hue angles in degrees
 /// (rose, clay, amber, moss, sage, teal, slate, lavender), picked by a stable
-/// hash of the project name. Every tone below has the same lightness and
-/// chroma in each hue, so no project looks louder than another, and none
-/// depends on the theme's terminal colors. These and the tones below are the
-/// built-in look; the settings file can override each of them
-/// ([`VerticalTabsProjectLabels`]).
+/// hash of the project name unless the user picked one from the label's menu.
+/// Every tone below has the same lightness and chroma in each hue, so no
+/// project looks louder than another, and none depends on the theme's
+/// terminal colors. These and the tones below are the built-in look; the
+/// settings file can override each of them ([`VerticalTabsProjectLabels`]).
 pub(super) const PROJECT_HUES: [f64; 8] = [12., 48., 82., 122., 158., 198., 256., 300.];
+
+/// The names of [`PROJECT_HUES`], in the same order, as the settings file
+/// saves them ([`VerticalTabsProjectColors`]).
+pub(super) const PROJECT_COLOR_NAMES: [&str; 8] = [
+    "rose", "clay", "amber", "moss", "sage", "teal", "slate", "lavender",
+];
 
 /// A tone of a project hue: OKLCH lightness (0 to 1) and chroma.
 #[derive(Clone, Copy, Debug)]
@@ -453,50 +461,54 @@ impl Tone {
     }
 }
 
-/// Text on light themes.
+/// Text on light themes, and a group header's name.
 const DEEP_TEXT: Tone = Tone {
-    lightness: 0.43,
-    chroma: 0.085,
+    lightness: 0.45,
+    chroma: 0.1,
 };
-/// Text on dark themes.
+/// Text on dark themes, and a group header's name.
 const PALE_TEXT: Tone = Tone {
-    lightness: 0.895,
-    chroma: 0.042,
+    lightness: 0.84,
+    chroma: 0.08,
 };
-/// A label's fill on dark themes, top to bottom.
+/// A label's fill on dark themes, top to bottom: a quiet tint that nearly
+/// blends into the panel, so the color shows in the text.
 const DARK_FILL: [Tone; 2] = [
     Tone {
-        lightness: 0.42,
-        chroma: 0.05,
+        lightness: 0.37,
+        chroma: 0.04,
     },
     Tone {
-        lightness: 0.38,
-        chroma: 0.05,
+        lightness: 0.37,
+        chroma: 0.04,
     },
 ];
 /// A label's fill on light themes, top to bottom.
 const LIGHT_FILL: [Tone; 2] = [
     Tone {
-        lightness: 0.945,
-        chroma: 0.028,
+        lightness: 0.93,
+        chroma: 0.03,
     },
     Tone {
-        lightness: 0.925,
-        chroma: 0.034,
+        lightness: 0.93,
+        chroma: 0.03,
     },
 ];
-/// The glass edge's alpha on dark themes (white), top to bottom.
-const DARK_RIM_ALPHA: [u8; 2] = [87, 15];
+/// The glass edge's alpha on dark themes (white), top to bottom. Off unless
+/// the settings file turns it on.
+const DARK_RIM_ALPHA: [u8; 2] = [0, 0];
 /// The glass edge on light themes: white on top, fading into the deep tone at
-/// this alpha at the bottom.
-const LIGHT_RIM_TOP_ALPHA: u8 = 242;
-const LIGHT_RIM_BOTTOM_ALPHA: u8 = 61;
+/// this alpha at the bottom. Off unless the settings file turns it on.
+const LIGHT_RIM_TOP_ALPHA: u8 = 0;
+const LIGHT_RIM_BOTTOM_ALPHA: u8 = 0;
 
-/// The shadow's alpha on dark themes (black).
-const DARK_SHADOW_ALPHA: u8 = 89;
+/// The shadow's alpha on dark themes (black). Off unless the settings file
+/// turns it on.
+const DARK_SHADOW_ALPHA: u8 = 0;
 const DARK_SHADOW_BLUR: f64 = 1.5;
-/// The shadow on light themes: a cool near-black at this alpha.
-const LIGHT_SHADOW_ALPHA: u8 = 36;
+/// The shadow on light themes: a cool near-black at this alpha. Off unless the
+/// settings file turns it on.
+const LIGHT_SHADOW_ALPHA: u8 = 0;
 const LIGHT_SHADOW_BLUR: f64 = 1.;
 /// Upper bounds for values from the settings file. OKLCH chroma beyond this
 /// is outside sRGB for every hue.
@@ -517,11 +529,51 @@ pub(super) fn project_palette_index(project: &str, len: usize) -> usize {
     (hash % len as u64) as usize
 }
 
-/// The hue of `project`'s badge and group header: its hue from the settings
+/// The slot in [`PROJECT_HUES`] of a color name from the settings file,
+/// ignoring case and surrounding spaces. `None` for any other name.
+pub(super) fn project_color_index(name: &str) -> Option<usize> {
+    let name = name.trim();
+    PROJECT_COLOR_NAMES
+        .iter()
+        .position(|known| known.eq_ignore_ascii_case(name))
+}
+
+/// The slot in [`PROJECT_HUES`] of the color picked for `project` from its
+/// label's menu. `None` when it has none, or the file names an unknown color.
+pub(super) fn picked_project_color(
+    project: &str,
+    colors: &VerticalTabsProjectColors,
+) -> Option<usize> {
+    colors.color_name(project).and_then(project_color_index)
+}
+
+/// The slot in [`PROJECT_HUES`] whose hue is `hue`, if any: how the color menu
+/// marks and names an automatic color.
+pub(super) fn project_color_of_hue(hue: f64) -> Option<usize> {
+    PROJECT_HUES
+        .iter()
+        .position(|known| (known - hue).abs() < 1e-9)
+}
+
+/// The hue of `project`'s badge and group header: the color picked from its
+/// label's menu if it has one, else its automatic hue
+/// ([`automatic_project_hue`]).
+pub(super) fn project_hue(
+    project: &str,
+    labels: &VerticalTabsProjectLabels,
+    colors: &VerticalTabsProjectColors,
+) -> f64 {
+    match picked_project_color(project, colors).and_then(|index| PROJECT_HUES.get(index)) {
+        Some(hue) => *hue,
+        None => automatic_project_hue(project, labels),
+    }
+}
+
+/// The hue `project` gets without a picked color: its hue from the settings
 /// file if it has one, else its slot in the settings file's palette, else its
 /// slot in [`PROJECT_HUES`]. Non-finite hues are skipped, and every hue is
 /// wrapped into 0 to 360.
-pub(super) fn project_hue(project: &str, labels: &VerticalTabsProjectLabels) -> f64 {
+pub(super) fn automatic_project_hue(project: &str, labels: &VerticalTabsProjectLabels) -> f64 {
     if let Some(hue) = labels
         .project_hues
         .get(project)
@@ -564,6 +616,32 @@ pub(super) fn badge_overhang(font_size: f32, vertical_padding: f32, edge_width: 
     (font_size * DEFAULT_UI_LINE_HEIGHT_RATIO + 2. * (vertical_padding + edge_width)) / 2.
 }
 
+/// The dashes of a dashed line `length` long, as (offset, length) runs from
+/// its start. Like a browser's dashed border, it starts and ends with a full
+/// dash and evens out the gaps, keeping them as close to `gap` as it can. A
+/// line too short for two dashes is one solid run, and an empty or broken
+/// length has no dashes.
+pub(super) fn dash_runs(length: f32, dash: f32, gap: f32) -> Vec<(f32, f32)> {
+    if !length.is_finite() || length <= 0. {
+        return Vec::new();
+    }
+    if !(dash > 0. && gap > 0.) || length < 2. * dash + gap {
+        return vec![(0., length)];
+    }
+    let gap_for = |count: f32| (length - count * dash) / (count - 1.);
+    let fewer = (length / (dash + gap)).floor().max(2.);
+    let more = fewer + 1.;
+    let (count, spacing) =
+        if gap_for(more) > 0. && (gap_for(more) - gap).abs() < (gap_for(fewer) - gap).abs() {
+            (more, gap_for(more))
+        } else {
+            (fewer, gap_for(fewer))
+        };
+    (0..count as usize)
+        .map(|index| (index as f32 * (dash + spacing), dash))
+        .collect()
+}
+
 /// An alpha from a 0-to-1 strength in the settings file, or `default`.
 fn alpha_setting(value: Option<f64>, default: u8) -> u8 {
     value
@@ -596,10 +674,12 @@ pub(super) struct ProjectPillStyle {
     pub(super) shadow_blur: f32,
 }
 
-/// A solid label in a calm tone of `hue` with text in a deep (light themes) or
-/// pale (dark themes) shade of the same hue, edged with glass: a hairline that
-/// is bright on top and fades downward, over a soft shadow. `labels` holds the
-/// settings file's overrides for the theme's kind.
+/// A flat label in a quiet tint of `hue`, with its text in a deep (light
+/// themes) or bright (dark themes) shade of the same hue, which is also the
+/// color of a group header's name. The settings file can add a glass edge (a
+/// hairline that is bright on top and fades downward) and a soft shadow; both
+/// are off by default. `labels` holds the settings file's overrides for the
+/// theme's kind.
 pub(super) fn project_pill_style(
     hue: f64,
     dark_theme: bool,

@@ -1078,6 +1078,11 @@ pub struct Workspace {
     show_tab_group_right_click_menu: Option<(TabGroupId, TabContextMenuAnchor)>,
     /// Open multi-tab selection menu (right-click on any tab in a multi-tab selection).
     show_tab_selection_right_click_menu: Option<(usize, TabContextMenuAnchor)>,
+    /// Fork: the color menu of a project's label in the vertical tabs panel.
+    project_color_menu: ViewHandle<Menu<WorkspaceAction>>,
+    /// The project whose color menu is open, and where it opened (window
+    /// coordinates).
+    show_project_color_menu: Option<(String, Vector2F)>,
     // TODO(CORE-2300): this used to be add_tab_dropdown_menu.
     // Because we are rolling out the change behind a feature flag,
     // keep this comment here until the feature flag is removed.
@@ -2036,6 +2041,21 @@ impl Workspace {
         tab_bar_overflow_menu
     }
 
+    /// Fork: the menu that picks a project label's color. Like the tab menus,
+    /// a click outside only dismisses it.
+    fn build_project_color_menu(ctx: &mut ViewContext<Self>) -> ViewHandle<Menu<WorkspaceAction>> {
+        let project_color_menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .with_width(vertical_tabs::PROJECT_COLOR_MENU_WIDTH)
+                .with_drop_shadow()
+                .prevent_interaction_with_other_elements()
+        });
+        ctx.subscribe_to_view(&project_color_menu, move |me, _, event, ctx| {
+            me.handle_project_color_menu_event(event, ctx);
+        });
+        project_color_menu
+    }
+
     fn build_menus(ctx: &mut ViewContext<Self>) -> WorkspaceMenuHandles {
         // `prevent_interaction_with_other_elements` so that a click outside
         // the menu only dismisses it instead of also firing handlers on
@@ -2930,6 +2950,7 @@ impl Workspace {
         terminal::platform::init().expect("Terminal platform initialized");
 
         let tab_bar_overflow_menu = Self::build_tab_bar_overflow_menu(ctx);
+        let project_color_menu = Self::build_project_color_menu(ctx);
         let (
             tab_right_click_menu,
             new_session_dropdown_menu,
@@ -3477,6 +3498,8 @@ impl Workspace {
             show_tab_right_click_menu: None,
             show_tab_group_right_click_menu: None,
             show_tab_selection_right_click_menu: None,
+            project_color_menu,
+            show_project_color_menu: None,
             new_session_dropdown_menu,
             show_new_session_dropdown_menu: None,
             changelog_model,
@@ -3938,6 +3961,7 @@ impl Workspace {
             | TabSettingsChangedEvent::VerticalTabsCollapsedProjects { .. }
             | TabSettingsChangedEvent::VerticalTabsHideTopBar { .. }
             | TabSettingsChangedEvent::VerticalTabsProjectLabels { .. }
+            | TabSettingsChangedEvent::VerticalTabsProjectColors { .. }
             | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. } => {
                 ctx.notify();
             }
@@ -10256,6 +10280,68 @@ impl Workspace {
                     resource_center_view.set_action_target(ctx.window_id(), input_id, ctx)
                 });
         }
+    }
+
+    fn handle_project_color_menu_event(&mut self, event: &MenuEvent, ctx: &mut ViewContext<Self>) {
+        if let MenuEvent::Close { .. } = event {
+            self.show_project_color_menu = None;
+            if !self.current_workspace_state.is_tab_being_renamed()
+                && !self.current_workspace_state.is_any_pane_being_renamed()
+                && !self
+                    .current_workspace_state
+                    .is_any_tab_group_being_renamed()
+            {
+                self.focus_active_tab(ctx);
+            }
+            ctx.notify();
+        }
+    }
+
+    /// Fork: opens the color menu of `project`'s label at `position`, or
+    /// closes it if it is open.
+    fn toggle_project_color_menu(
+        &mut self,
+        project: String,
+        position: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.show_project_color_menu.take().is_some() {
+            ctx.notify();
+            return;
+        }
+        let items = {
+            let tab_settings = TabSettings::as_ref(ctx);
+            vertical_tabs::project_color_menu_items(
+                &project,
+                tab_settings.vertical_tabs_project_labels.value(),
+                tab_settings.vertical_tabs_project_colors.value(),
+                Appearance::as_ref(ctx),
+            )
+        };
+        self.project_color_menu.update(ctx, |menu, menu_ctx| {
+            menu.set_items(items, menu_ctx);
+        });
+        self.show_project_color_menu = Some((project, position));
+        ctx.focus(&self.project_color_menu);
+        ctx.notify();
+    }
+
+    /// Fork: saves `color` as `project`'s label color, or drops its pick for
+    /// `None`. Only that project's entry changes, and the table goes away with
+    /// its last entry.
+    fn set_project_color(project: &str, color: Option<&str>, ctx: &mut ViewContext<Self>) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            let current = settings.vertical_tabs_project_colors.value();
+            if current.color_name(project) == color {
+                return;
+            }
+            let colors = current.with_color(project, color);
+            if colors.0.is_empty() {
+                report_if_error!(settings.vertical_tabs_project_colors.clear_value(ctx));
+            } else {
+                report_if_error!(settings.vertical_tabs_project_colors.set_value(colors, ctx));
+            }
+        });
     }
 
     fn handle_tab_right_click_menu_event(
@@ -25241,6 +25327,13 @@ impl TypedActionView for Workspace {
                 });
                 ctx.notify();
             }
+            OpenProjectColorMenu { project, position } => {
+                self.toggle_project_color_menu(project.clone(), *position, ctx);
+            }
+            SetProjectColor { project, color } => {
+                Self::set_project_color(project, color.as_deref(), ctx);
+                ctx.notify();
+            }
             ToggleVerticalTabsProjectCollapsed(project) => {
                 TabSettings::handle(ctx).update(ctx, |settings, ctx| {
                     let mut collapsed = settings.vertical_tabs_collapsed_projects.value().clone();
@@ -27581,6 +27674,24 @@ impl View for Workspace {
                     positioning,
                 );
             }
+        }
+
+        // Fork: a project label's color menu, opened at the pointer in the
+        // vertical tabs panel.
+        if let Some((_, position)) = &self.show_project_color_menu
+            && FeatureFlag::VerticalTabs.is_enabled()
+            && *TabSettings::as_ref(app).use_vertical_tabs
+            && self.vertical_tabs_panel_open
+        {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.project_color_menu).finish(),
+                OffsetPositioning::offset_from_parent(
+                    *position,
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
         }
 
         // Render the new session dropdown menu. This is outside the tab bar visibility

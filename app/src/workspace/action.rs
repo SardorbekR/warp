@@ -400,6 +400,18 @@ pub enum WorkspaceAction {
     /// Fork: collapses the named project's group in the vertical tabs panel, or
     /// expands it if it is collapsed.
     ToggleVerticalTabsProjectCollapsed(String),
+    /// Fork: opens the color menu of the named project's label in the vertical
+    /// tabs panel, at `position` in the window.
+    OpenProjectColorMenu {
+        project: String,
+        position: Vector2F,
+    },
+    /// Fork: gives the named project's label the named color, or its automatic
+    /// color for `None`.
+    SetProjectColor {
+        project: String,
+        color: Option<String>,
+    },
     /// Fork: marks a terminal view as unread until the user focuses it.
     MarkTerminalViewUnread {
         terminal_view_id: EntityId,
@@ -1127,6 +1139,8 @@ impl WorkspaceAction {
             | ToggleVerticalTabsShowDetailsOnHover
             | SetVerticalTabsSortMode(_)
             | ToggleVerticalTabsProjectCollapsed(_)
+            | OpenProjectColorMenu { .. }
+            | SetProjectColor { .. }
             | MarkTerminalViewUnread { .. }
             | MarkTerminalViewRead { .. }
             | ToggleFocusedTerminalViewUnread

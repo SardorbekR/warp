@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use instant::Instant;
 use pathfinder_color::ColorU;
+use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::Setting as _;
 use warp_core::ui::Icon as WarpIcon;
@@ -38,11 +39,11 @@ use warpui::{AppContext, EntityId, EventContext, Gradient, SingletonEntity, Task
 
 use super::status_order::{
     AttentionBucket, FreezeInputs, GROUP_TRANSITION_DURATION, GroupHeaderText, GroupTransition,
-    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, StatusRowKey, StatusSortInput,
-    activity_age, auto_group_by_project, badge_overhang, bounded_setting, compact_age_label,
-    group_by_project, group_header_text, group_transitions, is_order_frozen, project_hue,
-    project_name, project_pill_style, resolve_display_order, row_attention_bucket,
-    row_display_status, slide_progress, status_sorted_indices,
+    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, ProjectPillStyle, StatusRowKey,
+    StatusSortInput, activity_age, auto_group_by_project, badge_overhang, bounded_setting,
+    compact_age_label, dash_runs, group_by_project, group_header_text, group_transitions,
+    is_order_frozen, project_hue, project_name, project_pill_style, resolve_display_order,
+    row_attention_bucket, row_display_status, slide_progress, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -65,7 +66,9 @@ use crate::terminal::cli_agent_sessions::restore::PersistedCLIAgentSession;
 use crate::terminal::view::TerminalViewState;
 use crate::ui_components::icon_with_status::IconWithStatusVariant;
 use crate::workspace::action::WorkspaceAction;
-use crate::workspace::project_labels::{ProjectLabelShape, VerticalTabsProjectLabels};
+use crate::workspace::project_labels::{
+    ProjectLabelShape, VerticalTabsProjectColors, VerticalTabsProjectLabels,
+};
 use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsDisplayGranularity, VerticalTabsSortMode,
 };
@@ -83,7 +86,16 @@ const ROW_SPACING: f32 = 2.;
 /// row, and after a group, on top of [`ROW_SPACING`].
 const SECTION_GAP: f32 = 12.;
 /// How far the rows of a group are inset from its header.
-const GROUP_ROW_INDENT: f32 = 10.;
+const GROUP_ROW_INDENT: f32 = 24.;
+/// Where a grouped row's dashed branch runs down, from the list's edge, and
+/// how far it reaches toward the row.
+const GROUP_BRANCH_X: f32 = 14.;
+const GROUP_BRANCH_STUB: f32 = 8.;
+/// The dashes of the branches.
+const GROUP_BRANCH_DASH: f32 = 3.;
+const GROUP_BRANCH_GAP: f32 = 2.;
+/// A group header's project name, in the project's color.
+const GROUP_NAME_FONT_SIZE: f32 = 12.;
 /// How far a lone row's project badge is inset from the row's left edge.
 const BADGE_INSET: f32 = 8.;
 /// The least space between a lone row's badge and the row above it.
@@ -95,14 +107,6 @@ const BADGE_PILL: PillMetrics = PillMetrics {
     vertical_padding: 1.,
     corner_radius: 8.,
     max_width: 160.,
-};
-/// A group header's project name: 19 px tall.
-const GROUP_PILL: PillMetrics = PillMetrics {
-    font_size: 11.,
-    horizontal_padding: 7.,
-    vertical_padding: 2.,
-    corner_radius: 10.,
-    max_width: 180.,
 };
 /// The label's glass edge, inside its padding.
 const PILL_RIM_WIDTH: f32 = 1.;
@@ -237,8 +241,8 @@ struct HeaderRollUp {
 /// Status order: what the project groups remember between frames.
 #[derive(Default)]
 pub(super) struct StatusListGroups {
-    /// Hover states of the group headers, by project.
-    header_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    /// Mouse states of the group headers and lone rows' badges, by project.
+    label_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
     /// Rows of collapsed groups shown last frame because they were selected.
     /// While the order is frozen they stay, so that selecting another row
     /// doesn't move the rows under the pointer.
@@ -251,15 +255,15 @@ pub(super) struct StatusListGroups {
 }
 
 impl StatusListGroups {
-    fn header_mouse_state(&self, project: &str) -> MouseStateHandle {
-        let Ok(mut mouse_states) = self.header_mouse_states.try_borrow_mut() else {
+    fn label_mouse_state(&self, project: &str) -> MouseStateHandle {
+        let Ok(mut mouse_states) = self.label_mouse_states.try_borrow_mut() else {
             return MouseStateHandle::default();
         };
         mouse_states.entry(project.to_owned()).or_default().clone()
     }
 
-    fn retain_header_mouse_states(&self, projects: &HashSet<&str>) {
-        if let Ok(mut mouse_states) = self.header_mouse_states.try_borrow_mut() {
+    fn retain_label_mouse_states(&self, projects: &HashSet<&str>) {
+        if let Ok(mut mouse_states) = self.label_mouse_states.try_borrow_mut() {
             mouse_states.retain(|project, _| projects.contains(project.as_str()));
         }
     }
@@ -323,10 +327,10 @@ pub(super) fn render_status_ordered_list(
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
+    let tab_settings = TabSettings::as_ref(app);
     let label_look = ProjectLabelLook::new(
-        TabSettings::as_ref(app)
-            .vertical_tabs_project_labels
-            .value(),
+        tab_settings.vertical_tabs_project_labels.value(),
+        tab_settings.vertical_tabs_project_colors.value(),
         appearance,
     );
     let rows = collect_status_rows(state, workspace, app);
@@ -355,14 +359,19 @@ pub(super) fn render_status_ordered_list(
     let transitions = state
         .status_list_groups
         .update_transitions(comparable_grouping(state, mode, &sections), Instant::now());
-    let header_projects: HashSet<&str> = sections
+    let labeled_projects: HashSet<&str> = sections
         .iter()
-        .filter_map(|section| section.header.as_ref())
-        .map(|header| header.project.as_str())
+        .filter_map(|section| {
+            section
+                .header
+                .as_ref()
+                .map(|header| header.project.as_str())
+                .or(section.badge.as_deref())
+        })
         .collect();
     state
         .status_list_groups
-        .retain_header_mouse_states(&header_projects);
+        .retain_label_mouse_states(&labeled_projects);
     let roll_ups: Vec<Option<HeaderRollUp>> = sections
         .iter()
         .map(|section| {
@@ -439,7 +448,7 @@ pub(super) fn render_status_ordered_list(
                 .get(&header.project)
                 .filter(|(transition, _)| *transition == GroupTransition::Formed)
                 .map(|(_, started_at)| *started_at);
-            let mouse_state = state.status_list_groups.header_mouse_state(&header.project);
+            let mouse_state = state.status_list_groups.label_mouse_state(&header.project);
             section_elements.push(render_group_header(
                 header,
                 roll_up,
@@ -449,10 +458,9 @@ pub(super) fn render_status_ordered_list(
                 &label_look,
                 appearance,
             ));
-            section_elements.extend(section_rows.into_iter().map(|row| {
-                Container::new(row)
-                    .with_margin_left(GROUP_ROW_INDENT)
-                    .finish()
+            let last_row_index = section_rows.len().saturating_sub(1);
+            section_elements.extend(section_rows.into_iter().enumerate().map(|(index, row)| {
+                GroupBranch::new(row, index == last_row_index, palette.branch).finish()
             }));
         } else {
             for row in section_rows {
@@ -467,6 +475,7 @@ pub(super) fn render_status_ordered_list(
                 section_elements.push(with_project_badge(
                     row,
                     project,
+                    state.status_list_groups.label_mouse_state(project),
                     transition,
                     &label_look,
                     appearance,
@@ -1160,16 +1169,18 @@ struct StatusPalette {
     /// "k needs you" in group headers (darker on light themes, to stay
     /// readable as text).
     needs_you_text: ColorU,
+    /// The dashed branches joining a group's rows to its header.
+    branch: ColorU,
 }
 
 impl StatusPalette {
     fn new(theme: &WarpTheme) -> Self {
         let is_dark = theme.inferred_color_scheme() == ColorScheme::LightOnDark;
         let font_color = theme.font_color(theme.background()).into_solid();
-        let (needs_you, needs_you_text) = if is_dark {
-            (NEEDS_YOU_AMBER_DARK, NEEDS_YOU_AMBER_DARK)
+        let (needs_you, needs_you_text, branch_opacity) = if is_dark {
+            (NEEDS_YOU_AMBER_DARK, NEEDS_YOU_AMBER_DARK, 28)
         } else {
-            (NEEDS_YOU_AMBER_LIGHT, NEEDS_YOU_TEXT_LIGHT)
+            (NEEDS_YOU_AMBER_LIGHT, NEEDS_YOU_TEXT_LIGHT, 22)
         };
         Self {
             text_main: coloru_with_opacity(font_color, 90),
@@ -1178,6 +1189,7 @@ impl StatusPalette {
             running: coloru_with_opacity(font_color, 78),
             needs_you,
             needs_you_text,
+            branch: coloru_with_opacity(font_color, branch_opacity),
         }
     }
 }
@@ -1489,22 +1501,37 @@ impl PillMetrics {
 }
 
 /// The project labels' look for this render: the built-in look with the
-/// settings file's overrides (`appearance.vertical_tabs.project_labels`).
+/// settings file's overrides (`appearance.vertical_tabs.project_labels`) and
+/// the colors picked from the labels' menus
+/// (`appearance.vertical_tabs.project_colors`).
 struct ProjectLabelLook<'a> {
     labels: &'a VerticalTabsProjectLabels,
+    colors: &'a VerticalTabsProjectColors,
     dark_theme: bool,
     badge: PillMetrics,
-    header: PillMetrics,
+    /// A group header's project name. Of the header's sizes in the settings
+    /// file, only its font size applies: the name is plain colored text.
+    header_font_size: f32,
     rim_width: f32,
 }
 
 impl<'a> ProjectLabelLook<'a> {
-    fn new(labels: &'a VerticalTabsProjectLabels, appearance: &Appearance) -> Self {
+    fn new(
+        labels: &'a VerticalTabsProjectLabels,
+        colors: &'a VerticalTabsProjectColors,
+        appearance: &Appearance,
+    ) -> Self {
         Self {
             labels,
+            colors,
             dark_theme: appearance.theme().inferred_color_scheme() == ColorScheme::LightOnDark,
             badge: BADGE_PILL.with_overrides(&labels.badge),
-            header: GROUP_PILL.with_overrides(&labels.header),
+            header_font_size: bounded_setting(
+                labels.header.font_size,
+                f64::from(GROUP_NAME_FONT_SIZE),
+                MIN_PILL_FONT_SIZE,
+                MAX_PILL_FONT_SIZE,
+            ) as f32,
             rim_width: bounded_setting(
                 labels.edge_width,
                 f64::from(PILL_RIM_WIDTH),
@@ -1521,9 +1548,17 @@ impl<'a> ProjectLabelLook<'a> {
             self.rim_width,
         )
     }
+
+    fn style(&self, project: &str) -> ProjectPillStyle {
+        project_pill_style(
+            project_hue(project, self.labels, self.colors),
+            self.dark_theme,
+            self.labels,
+        )
+    }
 }
 
-/// `name` on a solid label in `project`'s hue, edged with glass (see
+/// `name` on a label in a quiet tint of `project`'s color (see
 /// [`project_pill_style`]).
 fn render_project_pill(
     name: String,
@@ -1532,65 +1567,73 @@ fn render_project_pill(
     look: &ProjectLabelLook<'_>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
-    let style = project_pill_style(
-        project_hue(project, look.labels),
-        look.dark_theme,
-        look.labels,
-    );
+    let style = look.style(project);
     let top = vec2f(0., 0.);
     let bottom = vec2f(0., 1.);
-    ConstrainedBox::new(
-        Container::new(
-            Text::new_inline(name, appearance.ui_font_family(), metrics.font_size)
-                .with_clip(ClipConfig::ellipsis())
-                .with_color(style.text)
-                .with_style(Properties::default().weight(Weight::Medium))
-                .finish(),
-        )
-        .with_horizontal_padding(metrics.horizontal_padding)
-        .with_vertical_padding(metrics.vertical_padding)
-        .with_background_gradient(
-            top,
-            bottom,
-            Gradient {
-                start: style.fill_top,
-                end: style.fill_bottom,
-            },
-        )
-        .with_border(Border::all(look.rim_width).with_border_gradient(
-            top,
-            bottom,
-            Gradient {
-                start: style.rim_top,
-                end: style.rim_bottom,
-            },
-        ))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
-            metrics.corner_radius,
-        )))
-        .with_drop_shadow(DropShadow {
+    let mut label = Container::new(
+        Text::new_inline(name, appearance.ui_font_family(), metrics.font_size)
+            .with_clip(ClipConfig::ellipsis())
+            .with_color(style.text)
+            .with_style(Properties::default().weight(Weight::Medium))
+            .finish(),
+    )
+    .with_horizontal_padding(metrics.horizontal_padding)
+    .with_vertical_padding(metrics.vertical_padding)
+    .with_background_gradient(
+        top,
+        bottom,
+        Gradient {
+            start: style.fill_top,
+            end: style.fill_bottom,
+        },
+    )
+    .with_border(Border::all(look.rim_width).with_border_gradient(
+        top,
+        bottom,
+        Gradient {
+            start: style.rim_top,
+            end: style.rim_bottom,
+        },
+    ))
+    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+        metrics.corner_radius,
+    )));
+    // No shadow unless the settings file sets one.
+    if style.shadow.a > 0 {
+        label = label.with_drop_shadow(DropShadow {
             color: style.shadow,
             offset: vec2f(0., 1.),
             blur_radius: style.shadow_blur,
             spread_radius: 0.,
-        })
-        .finish(),
-    )
-    .with_max_width(metrics.max_width)
-    .finish()
+        });
+    }
+    ConstrainedBox::new(label.finish())
+        .with_max_width(metrics.max_width)
+        .finish()
 }
 
 /// Puts a lone row's project badge on the row's top edge, like a folder tab.
-/// `slide_started_at` is set while the badge sinks into place out of the
-/// group header it was.
+/// Right-clicking the badge opens the project's color menu; the rest of the
+/// row keeps its own menu. `slide_started_at` is set while the badge sinks
+/// into place out of the group header it was.
 fn with_project_badge(
     row: Box<dyn Element>,
     project: &str,
+    mouse_state: MouseStateHandle,
     slide_started_at: Option<Instant>,
     look: &ProjectLabelLook<'_>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let badge = render_project_pill(project.to_owned(), project, &look.badge, look, appearance);
+    let menu_project = project.to_owned();
+    let badge = Hoverable::new(mouse_state, move |_| badge)
+        .on_right_click(move |ctx, _, position| {
+            ctx.dispatch_typed_action(WorkspaceAction::OpenProjectColorMenu {
+                project: menu_project.clone(),
+                position,
+            });
+        })
+        .finish();
     let badge = match slide_started_at {
         Some(started_at) => SlideIn::new(badge, vec2f(0., -BADGE_SINK), started_at).finish(),
         None => badge,
@@ -1673,11 +1716,12 @@ fn render_status_glyph(
     Some(glyph)
 }
 
-/// "[project] N ........ k needs you  ⌄": the project in a pill of its color,
-/// how many sessions it has, and how many need the user. A collapsed header
-/// also shows the age and status of its most urgent session (`roll_up`).
-/// Clicking it collapses or expands the group. `rise_started_at` is set while
-/// the header rises into place out of the badge it was.
+/// "project N ........ k needs you  ⌄": the project's name in its color, how
+/// many sessions it has, and how many need the user. A collapsed header also
+/// shows the age and status of its most urgent session (`roll_up`). Clicking
+/// it collapses or expands the group, and right-clicking it opens the
+/// project's color menu. `rise_started_at` is set while the header rises into
+/// place out of the badge it was.
 fn render_group_header(
     header: SectionHeader,
     roll_up: Option<HeaderRollUp>,
@@ -1697,12 +1741,16 @@ fn render_group_header(
         ..
     } = header;
 
-    let pill = render_project_pill(text.name, &project, &look.header, look, appearance);
+    let name = Text::new_inline(text.name, font_family, look.header_font_size)
+        .with_clip(ClipConfig::ellipsis())
+        .with_color(look.style(&project).text)
+        .with_style(Properties::default().weight(Weight::Semibold))
+        .finish();
     let name_and_count = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_spacing(7.)
-        .with_child(Shrinkable::new(1., pill).finish())
+        .with_child(Shrinkable::new(1., name).finish())
         .with_child(
             Text::new_inline(text.count, font_family, GROUP_HEADER_FONT_SIZE)
                 .with_color(palette.text_faint)
@@ -1764,7 +1812,7 @@ fn render_group_header(
 
     let header = Hoverable::new(mouse_state, move |hover_state| {
         let mut container = Container::new(row)
-            .with_padding(Padding::uniform(4.).with_left(8.).with_right(8.))
+            .with_padding(Padding::uniform(4.).with_left(10.).with_right(8.))
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
                 STATUS_ROW_CORNER_RADIUS,
             )));
@@ -1773,16 +1821,122 @@ fn render_group_header(
         }
         container.finish()
     })
-    .on_click(move |ctx, _, _| {
-        ctx.dispatch_typed_action(WorkspaceAction::ToggleVerticalTabsProjectCollapsed(
-            project.clone(),
-        ));
+    .on_click({
+        let project = project.clone();
+        move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::ToggleVerticalTabsProjectCollapsed(
+                project.clone(),
+            ));
+        }
+    })
+    .on_right_click(move |ctx, _, position| {
+        ctx.dispatch_typed_action(WorkspaceAction::OpenProjectColorMenu {
+            project: project.clone(),
+            position,
+        });
     })
     .with_cursor(Cursor::PointingHand)
     .finish();
     match rise_started_at {
         Some(started_at) => SlideIn::new(header, vec2f(0., GROUP_HEADER_RISE), started_at).finish(),
         None => header,
+    }
+}
+
+/// A grouped row with the dashed branch that joins it to the group's header:
+/// a line down the gutter on the row's left, through the gap above the row,
+/// and a short stub across to the row at its middle. The line goes on past the
+/// last row's middle only for rows that have another row below them.
+struct GroupBranch {
+    child: Box<dyn Element>,
+    is_last: bool,
+    color: ColorU,
+    origin: Option<Point>,
+}
+
+impl GroupBranch {
+    fn new(child: Box<dyn Element>, is_last: bool, color: ColorU) -> Self {
+        Self {
+            child,
+            is_last,
+            color,
+            origin: None,
+        }
+    }
+
+    fn paint_dashes(&self, start: Vector2F, length: f32, vertical: bool, ctx: &mut PaintContext) {
+        for (offset, dash) in dash_runs(length, GROUP_BRANCH_DASH, GROUP_BRANCH_GAP) {
+            let (origin, size) = if vertical {
+                (start + vec2f(0., offset), vec2f(1., dash))
+            } else {
+                (start + vec2f(offset, 0.), vec2f(dash, 1.))
+            };
+            ctx.scene
+                .draw_rect_without_hit_recording(RectF::new(origin, size))
+                .with_background(self.color);
+        }
+    }
+}
+
+impl Element for GroupBranch {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        ctx: &mut LayoutContext,
+        app: &AppContext,
+    ) -> Vector2F {
+        let inset = |x: f32| (x - GROUP_ROW_INDENT).max(0.);
+        let child_constraint = SizeConstraint::new(
+            vec2f(inset(constraint.min.x()), constraint.min.y()),
+            vec2f(inset(constraint.max.x()), constraint.max.y()),
+        );
+        self.child.layout(child_constraint, ctx, app) + vec2f(GROUP_ROW_INDENT, 0.)
+    }
+
+    fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
+        self.child.after_layout(ctx, app);
+    }
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        if let Some(size) = self.child.size() {
+            let x = (origin.x() + GROUP_BRANCH_X).round();
+            let middle = (origin.y() + size.y() / 2.).round();
+            let top = origin.y() - ROW_SPACING;
+            let bottom = if self.is_last {
+                middle + 1.
+            } else {
+                origin.y() + size.y()
+            };
+            self.paint_dashes(vec2f(x, top), bottom - top, true, ctx);
+            self.paint_dashes(vec2f(x, middle), GROUP_BRANCH_STUB, false, ctx);
+        }
+        self.child
+            .paint(origin + vec2f(GROUP_ROW_INDENT, 0.), ctx, app);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.child
+            .size()
+            .map(|size| size + vec2f(GROUP_ROW_INDENT, 0.))
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        event: &DispatchedEvent,
+        ctx: &mut EventContext,
+        app: &AppContext,
+    ) -> bool {
+        self.child.dispatch_event(event, ctx, app)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn debug_text_content(&self) -> Option<String> {
+        self.child.debug_text_content()
     }
 }
 

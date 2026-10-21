@@ -2,6 +2,8 @@
 //! lone row's badge and a group header's name), read from the settings file
 //! and applied live. Every value is optional; anything left out keeps the
 //! built-in look, and out-of-range values are clamped where they are drawn.
+//! Each project's color can also be picked from its label's right-click menu
+//! ([`VerticalTabsProjectColors`]).
 
 use std::collections::HashMap;
 
@@ -118,6 +120,61 @@ settings::macros::implement_setting_for_enum!(
     toml_path: "appearance.vertical_tabs.project_labels",
     description: "How the project labels in the vertical tabs panel look: the palette, per-project hues, sizes, and the colors on dark and light themes.",
 );
+
+/// Fork feature: the color of each project's label, by project name, picked
+/// from the label's right-click menu in the vertical tabs panel. A color is
+/// saved by name (rose, clay, amber, moss, sage, teal, slate or lavender), not
+/// as a fixed color, so the label takes that color's dark or light tones to
+/// suit the theme. A project without an entry, or with a name that isn't one
+/// of these, gets its color automatically.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "The color of each project's label, by project name: rose, clay, amber, moss, sage, teal, slate or lavender."
+)]
+pub struct VerticalTabsProjectColors(pub HashMap<String, String>);
+
+settings::macros::implement_setting_for_enum!(
+    VerticalTabsProjectColors,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    // Fork-only setting: never synced to the user's Warp account.
+    SyncToCloud::Never,
+    surface: settings::SettingSurfaces::GUI,
+    private: false,
+    toml_path: "appearance.vertical_tabs.project_colors",
+    description: "The color of each project's label in the vertical tabs panel, by project name: rose, clay, amber, moss, sage, teal, slate or lavender. Right-click a project's label to pick one.",
+);
+
+impl VerticalTabsProjectColors {
+    /// The color name saved for `project`, if any, as written in the file.
+    pub fn color_name(&self, project: &str) -> Option<&str> {
+        self.0.get(project).map(String::as_str)
+    }
+
+    /// These colors with `project` set to `color`, or removed for `None`.
+    pub fn with_color(&self, project: &str, color: Option<&str>) -> Self {
+        let mut colors = self.0.clone();
+        match color {
+            Some(color) => {
+                colors.insert(project.to_owned(), color.to_owned());
+            }
+            None => {
+                colors.remove(project);
+            }
+        }
+        Self(colors)
+    }
+}
 
 #[cfg(test)]
 #[path = "project_labels_tests.rs"]

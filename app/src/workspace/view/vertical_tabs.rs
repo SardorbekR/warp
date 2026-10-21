@@ -1,6 +1,8 @@
+mod project_color_menu;
 mod status_list;
 mod status_order;
 
+pub(super) use project_color_menu::{PROJECT_COLOR_MENU_WIDTH, project_color_menu_items};
 pub(super) use status_list::{SessionHeaderText, session_header_text};
 pub mod telemetry;
 

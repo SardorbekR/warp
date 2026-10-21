@@ -5,7 +5,7 @@ use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::ui::theme::AnsiColorIdentifier;
 
-use super::project_labels::VerticalTabsProjectLabels;
+use super::project_labels::{VerticalTabsProjectColors, VerticalTabsProjectLabels};
 
 #[derive(
     Default,
@@ -657,6 +657,8 @@ define_settings_group!(TabSettings, settings: [
     },
     // Fork feature: the look of the project labels, live from the settings file.
     vertical_tabs_project_labels: VerticalTabsProjectLabels,
+    // Fork feature: each project's label color, picked from the label's right-click menu.
+    vertical_tabs_project_colors: VerticalTabsProjectColors,
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,

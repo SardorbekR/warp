@@ -191,3 +191,151 @@ fn non_finite_project_label_values_never_get_through() {
         None
     );
 }
+
+fn project_colors(entries: &[(&str, &str)]) -> VerticalTabsProjectColors {
+    VerticalTabsProjectColors(
+        entries
+            .iter()
+            .map(|(project, color)| ((*project).to_owned(), (*color).to_owned()))
+            .collect(),
+    )
+}
+
+fn read_colors_from_settings_file(contents: &str) -> Option<VerticalTabsProjectColors> {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, contents).expect("write settings file");
+    let (preferences, error) = TomlBackedUserPreferences::new(path);
+    assert!(error.is_none(), "{error:?}");
+    VerticalTabsProjectColors::read_from_preferences(&preferences)
+}
+
+/// A settings file with hand edits around the vertical tabs tables: comments,
+/// inline tables and a table after them.
+const HAND_EDITED_SETTINGS: &str = r#"# WarpOss settings, edited by hand.
+[appearance]
+font_size = 13 # bigger text
+
+[appearance.themes]
+dark = "Frost Dark"
+light = "Frost Light"
+
+[appearance.vertical_tabs]
+enabled = true
+
+# Hand-tuned label look.
+[appearance.vertical_tabs.project_labels]
+project_hues = { Shipzen = 12, "Lucid Notes" = 280 }
+
+[appearance.vertical_tabs.project_labels.dark]
+text = { lightness = 0.86, chroma = 0.08 } # a bit brighter
+
+[terminal]
+scrollback = 10000
+"#;
+
+#[test]
+fn project_colors_use_the_vertical_tabs_path() {
+    assert_eq!(
+        VerticalTabsProjectColors::toml_path(),
+        Some("appearance.vertical_tabs.project_colors")
+    );
+    assert_eq!(
+        VerticalTabsProjectColors::hierarchy(),
+        Some("appearance.vertical_tabs")
+    );
+    assert_eq!(VerticalTabsProjectColors::toml_key(), "project_colors");
+}
+
+#[test]
+fn project_colors_are_absent_without_a_table() {
+    assert_eq!(read_colors_from_settings_file(HAND_EDITED_SETTINGS), None);
+    assert_eq!(read_colors_from_settings_file(""), None);
+}
+
+#[test]
+fn hand_edited_project_colors_load_as_written() {
+    // Names are kept as written; the panel matches them without case and
+    // treats a name it doesn't know as automatic.
+    assert_eq!(
+        read_colors_from_settings_file(
+            "[appearance.vertical_tabs.project_colors]\nShipzen = \"Sage\"\n\"Lucid Notes\" = \"pink\"\n"
+        ),
+        Some(project_colors(&[
+            ("Shipzen", "Sage"),
+            ("Lucid Notes", "pink")
+        ]))
+    );
+    assert_eq!(
+        read_colors_from_settings_file(
+            "[appearance.vertical_tabs]\nproject_colors = { Shipzen = \"teal\" }\n"
+        ),
+        Some(project_colors(&[("Shipzen", "teal")]))
+    );
+}
+
+#[test]
+fn a_mistyped_project_color_rejects_only_its_table() {
+    let contents = "[appearance.vertical_tabs.project_labels]\nproject_hues = { Shipzen = 30 }\n\n[appearance.vertical_tabs.project_colors]\nShipzen = 3\n";
+    assert_eq!(read_colors_from_settings_file(contents), None);
+    assert_eq!(
+        read_from_settings_file(contents).map(|labels| labels.project_hues),
+        Some(HashMap::from([("Shipzen".to_owned(), 30.)]))
+    );
+}
+
+#[test]
+fn picking_and_resetting_colors_leaves_the_rest_of_the_file_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("settings.toml");
+    std::fs::write(&path, HAND_EDITED_SETTINGS).expect("write settings file");
+    let (preferences, error) = TomlBackedUserPreferences::new(path.clone());
+    assert!(error.is_none(), "{error:?}");
+    let labels = VerticalTabsProjectLabels::read_from_preferences(&preferences);
+    assert!(labels.is_some());
+    let read_file = || std::fs::read_to_string(&path).expect("read settings file");
+
+    // Two picks from the menu, one project at a time.
+    let picked = VerticalTabsProjectColors::default().with_color("Shipzen", Some("sage"));
+    assert!(VerticalTabsProjectColors::write_to_preferences(&picked, &preferences).expect("pick"));
+    let picked = picked.with_color("Lucid Notes", Some("teal"));
+    assert!(VerticalTabsProjectColors::write_to_preferences(&picked, &preferences).expect("pick"));
+    assert_eq!(
+        read_file(),
+        HAND_EDITED_SETTINGS.replace(
+            "[terminal]",
+            "[appearance.vertical_tabs.project_colors]\n\"Lucid Notes\" = \"teal\"\nShipzen = \"sage\"\n\n[terminal]"
+        )
+    );
+    // The same pick again doesn't touch the file.
+    assert!(!VerticalTabsProjectColors::write_to_preferences(&picked, &preferences).expect("pick"));
+
+    // The app reads back the picks, and the label settings are as they were.
+    let (reloaded, error) = TomlBackedUserPreferences::new(path.clone());
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(
+        VerticalTabsProjectColors::read_from_preferences(&reloaded),
+        Some(picked.clone())
+    );
+    assert_eq!(
+        VerticalTabsProjectLabels::read_from_preferences(&reloaded),
+        labels
+    );
+
+    // "Automatic" for one project removes only its line.
+    let picked = picked.with_color("Lucid Notes", None);
+    assert!(VerticalTabsProjectColors::write_to_preferences(&picked, &preferences).expect("reset"));
+    assert_eq!(
+        read_file(),
+        HAND_EDITED_SETTINGS.replace(
+            "[terminal]",
+            "[appearance.vertical_tabs.project_colors]\nShipzen = \"sage\"\n\n[terminal]"
+        )
+    );
+
+    // Resetting the last pick clears the setting, which gives back the file
+    // exactly as it was.
+    assert!(picked.with_color("Shipzen", None).0.is_empty());
+    VerticalTabsProjectColors::clear_from_preferences(&preferences).expect("clear");
+    assert_eq!(read_file(), HAND_EDITED_SETTINGS);
+}

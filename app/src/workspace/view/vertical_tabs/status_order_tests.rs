@@ -7,18 +7,19 @@ use warpui::EntityId;
 use super::{
     AttentionBucket, DARK_FILL, DEEP_TEXT, FreezeInputs, GroupHeaderText, GroupTransition,
     KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, LIGHT_FILL, OTHER_PROJECT_LABEL, PALE_TEXT,
-    POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_HUES, ProjectGroup, StatusRowKey,
-    StatusRowNavigation, StatusSortInput, Tone, activity_age, attention_bucket,
-    auto_group_by_project, badge_overhang, bounded_setting, compact_age_label, group_by_project,
-    group_header_text, group_transitions, is_order_frozen, navigation_target, oklch, project_hue,
-    project_name, project_palette_index, project_pill_style, reconcile_frozen_order,
-    resolve_display_order, row_attention_bucket, row_display_status, slide_progress,
-    status_sorted_indices,
+    POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_COLOR_NAMES, PROJECT_HUES, ProjectGroup,
+    StatusRowKey, StatusRowNavigation, StatusSortInput, Tone, activity_age, attention_bucket,
+    auto_group_by_project, automatic_project_hue, badge_overhang, bounded_setting,
+    compact_age_label, dash_runs, group_by_project, group_header_text, group_transitions,
+    is_order_frozen, navigation_target, oklch, picked_project_color, project_color_index,
+    project_color_of_hue, project_hue, project_name, project_palette_index, project_pill_style,
+    reconcile_frozen_order, resolve_display_order, row_attention_bucket, row_display_status,
+    slide_progress, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
 use crate::workspace::project_labels::{
-    ProjectLabelTone, ProjectLabelTones, VerticalTabsProjectLabels,
+    ProjectLabelTone, ProjectLabelTones, VerticalTabsProjectColors, VerticalTabsProjectLabels,
 };
 
 fn pane_id() -> PaneId {
@@ -520,12 +521,13 @@ fn built_in() -> VerticalTabsProjectLabels {
 fn oklch_matches_known_colors() {
     assert_eq!(oklch(1., 0., 0.), ColorU::white());
     assert_eq!(oklch(0., 0., 0.), ColorU::black());
-    assert_eq!(DEEP_TEXT.of(12.), rgb(0x77, 0x3A, 0x43));
-    assert_eq!(PALE_TEXT.of(198.), rgb(0xBD, 0xE5, 0xE6));
-    assert_eq!(DARK_FILL[0].of(12.), rgb(0x65, 0x42, 0x46));
-    assert_eq!(LIGHT_FILL[1].of(256.), rgb(0xD8, 0xE8, 0xFD));
+    // The quiet tint's tones, as the agreed mockup draws them.
+    assert_eq!(DEEP_TEXT.of(12.), rgb(0x83, 0x3B, 0x46));
+    assert_eq!(PALE_TEXT.of(198.), rgb(0x89, 0xDB, 0xDD));
+    assert_eq!(DARK_FILL[0].of(12.), rgb(0x53, 0x37, 0x3A));
+    assert_eq!(LIGHT_FILL[1].of(256.), rgb(0xDB, 0xE9, 0xFC));
     // Deep teal lies just outside sRGB; its red channel is clipped to zero.
-    assert_eq!(DEEP_TEXT.of(198.), rgb(0x00, 0x5D, 0x61));
+    assert_eq!(DEEP_TEXT.of(198.), rgb(0x00, 0x65, 0x69));
 }
 
 #[test]
@@ -568,59 +570,54 @@ fn project_tones_are_equally_bright_across_hues() {
 #[test]
 fn project_label_style_follows_the_theme() {
     let hue = PROJECT_HUES[5];
+    // A quiet tint: one flat fill, no glass edge, no shadow; the color is in
+    // the text, bright on dark themes and deep on light ones.
     let dark = project_pill_style(hue, true, &built_in());
     assert_eq!(dark.text, PALE_TEXT.of(hue));
-    // A glass edge: white, brightest on top and fading downward.
+    assert_eq!(dark.fill_top, dark.fill_bottom);
     assert_eq!(
-        (dark.rim_top.r, dark.rim_top.g, dark.rim_top.b),
-        (255, 255, 255)
+        (dark.rim_top.a, dark.rim_bottom.a, dark.shadow.a),
+        (0, 0, 0)
     );
-    assert_eq!(
-        (dark.rim_bottom.r, dark.rim_bottom.g, dark.rim_bottom.b),
-        (255, 255, 255)
-    );
-    assert!(dark.rim_top.a > dark.rim_bottom.a);
-    assert!(relative_luminance(dark.fill_top) > relative_luminance(dark.fill_bottom));
+    assert!(relative_luminance(dark.text) > relative_luminance(dark.fill_top));
 
     let light = project_pill_style(hue, false, &built_in());
-    let deep = DEEP_TEXT.of(hue);
-    assert_eq!(light.text, deep);
-    // White on top, fading into a trace of the label's own deep tone.
-    assert_eq!(light.rim_top.r, 255);
+    assert_eq!(light.text, DEEP_TEXT.of(hue));
+    assert_eq!(light.fill_top, light.fill_bottom);
     assert_eq!(
-        (light.rim_bottom.r, light.rim_bottom.g, light.rim_bottom.b),
-        (deep.r, deep.g, deep.b)
+        (light.rim_top.a, light.rim_bottom.a, light.shadow.a),
+        (0, 0, 0)
     );
-    assert!(light.rim_bottom.a < 128);
-    assert!(relative_luminance(light.fill_top) > relative_luminance(light.fill_bottom));
+    assert!(relative_luminance(light.text) < relative_luminance(light.fill_top));
 }
 
 #[test]
 fn built_in_project_labels_keep_their_look() {
-    // The v6 look, value for value, when the settings file overrides nothing.
+    // The quiet tint Sardor picked (v8), value for value, when the settings
+    // file overrides nothing.
     let hue = PROJECT_HUES[2];
     assert_eq!(
         project_pill_style(hue, true, &built_in()),
         super::ProjectPillStyle {
-            fill_top: DARK_FILL[0].of(hue),
-            fill_bottom: DARK_FILL[1].of(hue),
-            rim_top: ColorU::new(255, 255, 255, 87),
-            rim_bottom: ColorU::new(255, 255, 255, 15),
-            text: PALE_TEXT.of(hue),
-            shadow: ColorU::new(0, 0, 0, 89),
+            fill_top: oklch(0.37, 0.04, hue),
+            fill_bottom: oklch(0.37, 0.04, hue),
+            rim_top: ColorU::new(255, 255, 255, 0),
+            rim_bottom: ColorU::new(255, 255, 255, 0),
+            text: oklch(0.84, 0.08, hue),
+            shadow: ColorU::new(0, 0, 0, 0),
             shadow_blur: 1.5,
         }
     );
-    let deep = DEEP_TEXT.of(hue);
+    let deep = oklch(0.45, 0.1, hue);
     assert_eq!(
         project_pill_style(hue, false, &built_in()),
         super::ProjectPillStyle {
-            fill_top: LIGHT_FILL[0].of(hue),
-            fill_bottom: LIGHT_FILL[1].of(hue),
-            rim_top: ColorU::new(255, 255, 255, 242),
-            rim_bottom: ColorU { a: 61, ..deep },
+            fill_top: oklch(0.93, 0.03, hue),
+            fill_bottom: oklch(0.93, 0.03, hue),
+            rim_top: ColorU::new(255, 255, 255, 0),
+            rim_bottom: ColorU { a: 0, ..deep },
             text: deep,
-            shadow: ColorU::new(31, 35, 48, 36),
+            shadow: ColorU::new(31, 35, 48, 0),
             shadow_blur: 1.,
         }
     );
@@ -635,7 +632,7 @@ fn built_in_project_labels_keep_their_look() {
         ("resume", 2),
     ] {
         assert_eq!(
-            project_hue(project, &built_in()),
+            automatic_project_hue(project, &built_in()),
             PROJECT_HUES[slot],
             "{project}"
         );
@@ -652,18 +649,30 @@ fn settings_file_hues_replace_the_palette() {
     let wrapped = palette(vec![390., -60.]);
     for project in ["Shipzen", "Lucid Notes", "warp", ""] {
         let expected = [30., 300.][project_palette_index(project, 2)];
-        assert_eq!(project_hue(project, &wrapped), expected, "{project}");
+        assert_eq!(
+            automatic_project_hue(project, &wrapped),
+            expected,
+            "{project}"
+        );
     }
     // Non-finite hues are skipped; an empty palette falls back to the built-in one.
     let only_bad = palette(vec![f64::NAN, f64::INFINITY]);
     let empty = palette(Vec::new());
     for project in ["Shipzen", "resume"] {
-        let built_in_hue = project_hue(project, &built_in());
-        assert_eq!(project_hue(project, &only_bad), built_in_hue, "{project}");
-        assert_eq!(project_hue(project, &empty), built_in_hue, "{project}");
+        let built_in_hue = automatic_project_hue(project, &built_in());
+        assert_eq!(
+            automatic_project_hue(project, &only_bad),
+            built_in_hue,
+            "{project}"
+        );
+        assert_eq!(
+            automatic_project_hue(project, &empty),
+            built_in_hue,
+            "{project}"
+        );
     }
     assert_eq!(
-        project_hue("x", &palette(vec![f64::NAN, 42.])),
+        automatic_project_hue("x", &palette(vec![f64::NAN, 42.])),
         42.,
         "the one finite hue is the whole palette"
     );
@@ -677,17 +686,128 @@ fn settings_file_project_hues_win() {
     };
     labels.project_hues.insert("Shipzen".to_owned(), 725.);
     labels.project_hues.insert("resume".to_owned(), f64::NAN);
-    assert_eq!(project_hue("Shipzen", &labels), 5.);
+    assert_eq!(automatic_project_hue("Shipzen", &labels), 5.);
     // A non-finite pick is ignored, so the project keeps its palette slot.
     assert_eq!(
-        project_hue("resume", &labels),
+        automatic_project_hue("resume", &labels),
         [10., 20.][project_palette_index("resume", 2)]
     );
     // Names match exactly.
     assert_eq!(
-        project_hue("shipzen", &labels),
+        automatic_project_hue("shipzen", &labels),
         [10., 20.][project_palette_index("shipzen", 2)]
     );
+}
+
+fn colors(entries: &[(&str, &str)]) -> VerticalTabsProjectColors {
+    VerticalTabsProjectColors(
+        entries
+            .iter()
+            .map(|(project, color)| ((*project).to_owned(), (*color).to_owned()))
+            .collect(),
+    )
+}
+
+#[test]
+fn color_names_match_the_palette() {
+    assert_eq!(PROJECT_COLOR_NAMES.len(), PROJECT_HUES.len());
+    for (index, name) in PROJECT_COLOR_NAMES.iter().enumerate() {
+        assert_eq!(project_color_index(name), Some(index), "{name}");
+        assert_eq!(
+            project_color_of_hue(PROJECT_HUES[index]),
+            Some(index),
+            "{name}"
+        );
+    }
+    assert_eq!(project_color_index("rose"), Some(0));
+    assert_eq!(project_color_index("lavender"), Some(7));
+    // Hand-edited names: case and surrounding spaces don't matter.
+    assert_eq!(project_color_index(" Sage "), Some(4));
+    assert_eq!(project_color_index("TEAL"), Some(5));
+    // Anything else is no color at all.
+    for name in ["", "pink", "sage green", "#ff0000", "12"] {
+        assert_eq!(project_color_index(name), None, "{name:?}");
+    }
+    assert_eq!(project_color_of_hue(13.), None);
+}
+
+#[test]
+fn a_picked_color_wins_and_follows_the_theme() {
+    let mut labels = VerticalTabsProjectLabels {
+        hues: Some(vec![10., 20.]),
+        ..Default::default()
+    };
+    labels.project_hues.insert("Shipzen".to_owned(), 90.);
+    let picked = colors(&[("Shipzen", "sage"), ("resume", "Slate")]);
+    // The pick beats the settings file's hues and the palette.
+    assert_eq!(project_hue("Shipzen", &labels, &picked), PROJECT_HUES[4]);
+    assert_eq!(project_hue("resume", &labels, &picked), PROJECT_HUES[6]);
+    assert_eq!(picked_project_color("Shipzen", &picked), Some(4));
+    // Projects without a pick keep their automatic hue.
+    assert_eq!(
+        project_hue("Lucid Notes", &labels, &picked),
+        automatic_project_hue("Lucid Notes", &labels)
+    );
+    assert_eq!(picked_project_color("Lucid Notes", &picked), None);
+    // The pick is a name, so the label takes that color's dark or light tones.
+    let hue = project_hue("Shipzen", &built_in(), &picked);
+    assert_eq!(
+        project_pill_style(hue, true, &built_in()).text,
+        PALE_TEXT.of(PROJECT_HUES[4])
+    );
+    assert_eq!(
+        project_pill_style(hue, false, &built_in()).text,
+        DEEP_TEXT.of(PROJECT_HUES[4])
+    );
+}
+
+#[test]
+fn an_unknown_or_missing_pick_means_automatic() {
+    let labels = built_in();
+    let none = VerticalTabsProjectColors::default();
+    let unknown = colors(&[("Shipzen", "pink"), ("resume", "")]);
+    for project in ["Shipzen", "resume", "Lucid Notes"] {
+        let automatic = automatic_project_hue(project, &labels);
+        assert_eq!(project_hue(project, &labels, &none), automatic, "{project}");
+        assert_eq!(
+            project_hue(project, &labels, &unknown),
+            automatic,
+            "{project}"
+        );
+        assert_eq!(picked_project_color(project, &unknown), None, "{project}");
+    }
+    // Names match the project exactly.
+    let picked = colors(&[("Shipzen", "sage")]);
+    assert_eq!(
+        project_hue("shipzen", &labels, &picked),
+        automatic_project_hue("shipzen", &labels)
+    );
+}
+
+#[test]
+fn picking_and_resetting_a_color_changes_only_that_project() {
+    let start = colors(&[("Shipzen", "sage"), ("resume", "teal")]);
+    let picked = start.with_color("Lucid Notes", Some("rose"));
+    assert_eq!(
+        picked,
+        colors(&[
+            ("Shipzen", "sage"),
+            ("resume", "teal"),
+            ("Lucid Notes", "rose")
+        ])
+    );
+    let changed = picked.with_color("Shipzen", Some("amber"));
+    assert_eq!(changed.color_name("Shipzen"), Some("amber"));
+    assert_eq!(changed.color_name("resume"), Some("teal"));
+    let reset = changed.with_color("Shipzen", None);
+    assert_eq!(
+        reset,
+        colors(&[("resume", "teal"), ("Lucid Notes", "rose")])
+    );
+    // Resetting a project without a pick changes nothing.
+    assert_eq!(reset.with_color("Shipzen", None), reset);
+    // The original is untouched.
+    assert_eq!(start, colors(&[("Shipzen", "sage"), ("resume", "teal")]));
 }
 
 #[test]
@@ -788,6 +908,41 @@ fn bounded_setting_clamps_and_falls_back() {
 }
 
 #[test]
+fn dashed_lines_start_and_end_with_a_dash() {
+    for length in [8., 9.5, 16., 17., 32., 34., 61.25] {
+        let runs = dash_runs(length, 3., 2.);
+        assert!(runs.len() >= 2, "{length}: {runs:?}");
+        assert_eq!(runs.first(), Some(&(0., 3.)), "{length}");
+        let (last_start, last_dash) = *runs.last().expect("dashes");
+        assert!(
+            (last_start + last_dash - length).abs() < 1e-4,
+            "{length}: {runs:?}"
+        );
+        for pair in runs.windows(2) {
+            let gap = pair[1].0 - (pair[0].0 + pair[0].1);
+            assert!(gap > 1. && gap < 4., "{length}: gap {gap}");
+        }
+    }
+    // A row's branch: 30 px row and the 2 px gap above it.
+    let runs = dash_runs(32., 3., 2.);
+    assert_eq!(runs.len(), 7);
+    // The stub: two dashes and one gap.
+    assert_eq!(dash_runs(8., 3., 2.), vec![(0., 3.), (5., 3.)]);
+}
+
+#[test]
+fn short_or_broken_dashed_lines_stay_safe() {
+    assert_eq!(dash_runs(7.9, 3., 2.), vec![(0., 7.9)]);
+    assert_eq!(dash_runs(2., 3., 2.), vec![(0., 2.)]);
+    assert!(dash_runs(0., 3., 2.).is_empty());
+    assert!(dash_runs(-5., 3., 2.).is_empty());
+    assert!(dash_runs(f32::NAN, 3., 2.).is_empty());
+    assert!(dash_runs(f32::INFINITY, 3., 2.).is_empty());
+    assert_eq!(dash_runs(10., 0., 2.), vec![(0., 10.)]);
+    assert_eq!(dash_runs(10., 3., f32::NAN), vec![(0., 10.)]);
+}
+
+#[test]
 fn badge_overhang_is_half_the_badge_height() {
     assert_eq!(badge_overhang(10., 1., 1.), 8.);
     assert_eq!(badge_overhang(20., 0., 0.), 12.);
@@ -873,7 +1028,7 @@ fn palette_index_is_stable_and_in_range() {
         assert!(index < PROJECT_HUES.len(), "{project}: {index}");
         assert_eq!(index, project_palette_index(project, PROJECT_HUES.len()));
         assert_eq!(
-            project_hue(project, &built_in()),
+            automatic_project_hue(project, &built_in()),
             PROJECT_HUES[index],
             "{project}"
         );
