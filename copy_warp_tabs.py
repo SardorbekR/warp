@@ -51,6 +51,8 @@ OFFICIAL_WARP_MARKER = "/Warp.app/Contents/MacOS/"
 ANSI_COLORS = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 BLOCK_SESSION_RE = re.compile(r"^precmd-(-?\d+)-\d+$")
+# A word short and plain enough to show from a command line that's still running.
+HINT_WORD_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._:@+/-]{0,23}$")
 START_MATCH_SECONDS = 5
 # Copies open this far apart, so 19 sessions and their MCP servers don't all start at once.
 STAGGER_SECONDS = 2
@@ -623,6 +625,22 @@ def copy_name(agent):
     return clean_name(agent.get("name"), os.path.basename(norm(agent.get("resume_cwd") or agent["cwd"]) or "") or "copy")
 
 
+def command_hint(command):
+    """The first plain words of a command, quoted, such as "npm run dev". Values, flags and
+    anything long are left out, since a command line can carry a key."""
+    words = (command or "").split()
+    while words and "=" in words[0]:
+        words.pop(0)
+    hint = []
+    for word in words:
+        if len(hint) == 4 or not HINT_WORD_RE.match(word):
+            break
+        hint.append(word)
+    if not hint:
+        return "a command"
+    return '"' + " ".join(hint) + (" ..." if len(hint) < len(words) else "") + '"'
+
+
 def quoted(words):
     return " ".join(shlex.quote(w) for w in words)
 
@@ -635,7 +653,7 @@ def pane_commands(pane, start, delays):
     agent = pane.get("agent")
     if not agent:
         if pane.get("running"):
-            note = ("In official Warp, this tab is still running: " + clean_name(pane["running"], "")[:80]
+            note = ("In official Warp, this tab is still running " + command_hint(pane["running"])
                     + ". Start it here once you stop it there.")
             return ["echo " + shlex.quote(note)]
         return []
