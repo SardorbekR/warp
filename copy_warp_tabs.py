@@ -41,6 +41,7 @@ from pathlib import Path
 HOME = Path.home()
 MIGRATE_DIR = HOME / "SideProjects" / "warp-custom" / "migrate"
 HELPER = MIGRATE_DIR / "open-copy.sh"
+SCRIPT_NAME = "copy_warp_tabs.py"
 COPIES_FILE = MIGRATE_DIR / "copies.json"
 CLAUDE_DIR = HOME / ".claude"
 WARPOSS_APP = Path("/Applications/WarpOss.app")
@@ -463,6 +464,9 @@ def read_layout(snapshot):
             if leaf.get("kind") != "terminal" or terminal is None:
                 return None
             sessions = block_sessions.get(uuid_key(terminal.get("uuid")), set())
+            # The pane this script runs in isn't copied.
+            if any(r.get("session_id") in sessions and SCRIPT_NAME in (r.get("command") or "") for r in running):
+                return None
             # A non-agent command still running here, such as a dev server.
             busy = [r["command"] for r in running
                     if r.get("session_id") in sessions and r.get("command") and not runs_agent(r["command"])]
@@ -598,7 +602,8 @@ def place_agents(agents, layout):
 
 def layout_from_processes(procs, warp, agents):
     """Without the database: one tab per pane in official Warp, oldest first, no splits."""
-    roots = sorted(pane_roots(procs, warp), key=lambda p: p.start)
+    mine = {p.pid for p in ancestors(procs, os.getpid())}
+    roots = sorted((p for p in pane_roots(procs, warp) if p.pid not in mine), key=lambda p: p.start)
     cwds = cwd_of([p.pid for p in roots])
     by_shell = {a["shell"].pid: a for a in agents if a["shell"]}
     tabs = []
