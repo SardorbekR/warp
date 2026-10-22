@@ -338,7 +338,7 @@ def pane_roots(procs, warp):
 
 def memory_report(procs, agents):
     """What the agent sessions use now (with their MCP servers and tools) and what macOS reports
-    as available, in GB."""
+    as available, in GB as macOS counts them (2^30 bytes, so a 64 GB Mac shows 64)."""
     used_kb = 0
     for agent in agents:
         pid = agent["proc"].pid
@@ -351,12 +351,12 @@ def memory_report(procs, agents):
         for label in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
             found = re.search(rf"^{label}:\s+(\d+)", out, re.M)
             pages += int(found.group(1)) if found else 0
-        available = pages * int(page.group(1)) / 1e9
+        available = pages * int(page.group(1)) / 2**30
     total = run(["sysctl", "-n", "hw.memsize"]).strip()
     return {
-        "agents_gb": round(used_kb / 1e6, 1),
+        "agents_gb": round(used_kb / 2**20, 1),
         "available_gb": round(available, 1) if available is not None else None,
-        "total_gb": round(int(total) / 1e9) if total.isdigit() else None,
+        "total_gb": round(int(total) / 2**30) if total.isdigit() else None,
     }
 
 
@@ -589,13 +589,17 @@ def place_agents(agents, layout):
             if len(hits) == 1:
                 take(hits[0], agent, "folder")
 
-    # 3. Several free panes in the folder: oldest session first, left to right. Swapping two
-    #    sessions of one project only changes which of those tabs each lands in.
+    # 3. Several free panes in the folder: oldest session first, left to right. Warp saves a
+    #    block only once its command finishes, so a session still running its first command has
+    #    no blocks in its pane, and a pane with blocks but no match above is a plain shell. Panes
+    #    without blocks go first. Swapping two sessions of one project only changes which of
+    #    those tabs each lands in.
     for agent in sorted(agents, key=lambda a: a["proc"].start):
         if not agent.get("placed_by"):
             hits = [p for p in panes if id(p) not in taken and in_folder(p, agent)]
+            hits.sort(key=lambda p: bool(p["shell_sessions"]))
             if hits:
-                take(hits[0], agent, "folder, order guessed")
+                take(hits[0], agent, "folder, order guessed" if hits[0]["shell_sessions"] else "folder, no history")
 
     return [a for a in agents if not a.get("placed_by")]
 
@@ -870,7 +874,22 @@ def main():
         else:
             warnings.append("official Warp's database wasn't found, so tabs follow the process list")
     if layout:
-        for agent in place_agents(agents, layout):
+        unplaced = place_agents(agents, layout)
+        # How sure the folder guesses are: they're exact as a set when a folder has as many
+        # tabs without history as sessions placed there by folder.
+        panes = [p for w in layout["windows"] for t in w["tabs"] for p in panes_of(t["root"])]
+        by_folder = {}
+        for agent in agents:
+            folder = norm(agent.get("cwd")) or agent.get("resume_cwd")
+            if folder and (agent.get("placed_by") or "").startswith("folder,"):
+                by_folder.setdefault(folder, []).append(agent)
+        for folder, guessed in sorted(by_folder.items()):
+            fresh = [p for p in panes if norm(p["cwd"]) == folder and not p["shell_sessions"]]
+            warnings.append(f"{os.path.basename(folder)}: {len(guessed)} session(s) placed by folder; "
+                            f"{len(fresh)} tab(s) there have no history, so "
+                            + ("those are most likely their tabs, and only the order among them is a guess"
+                               if len(fresh) == len(guessed) else "which tab each goes in is a guess"))
+        for agent in unplaced:
             agent["placed_by"] = "new tab at the end"
             target = next((w for w in layout["windows"] if w["active"]), layout["windows"][0])
             target["tabs"].append({"title": None, "color": None, "group": None, "active": False,

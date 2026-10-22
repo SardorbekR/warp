@@ -16,10 +16,15 @@ record="$HOME/.claude/sessions/$pid.json"
 # Tab title while the tab waits.
 printf '\033]0;%s\007' "$name"
 
-# Whether the original is in the middle of a turn. Claude Code keeps "status" in its record.
-original_busy() {
+# Whether the original is still running and in the given state. Claude Code keeps "status" in
+# its record: busy during a turn, waiting while it asks you something, idle after.
+original_is() {
     kill -0 "$pid" 2>/dev/null || return 1
-    grep -Eq '"status"[[:space:]]*:[[:space:]]*"busy"' "$record" 2>/dev/null
+    grep -Eq "\"status\"[[:space:]]*:[[:space:]]*\"$1\"" "$record" 2>/dev/null
+}
+
+original_unfinished() {
+    original_is busy || original_is waiting
 }
 
 case $mode in
@@ -42,11 +47,16 @@ if [ "$delay" -gt 0 ] 2>/dev/null; then
     sleep "$delay"
 fi
 
-if original_busy; then
+if original_unfinished; then
     printf '\n  %s\n\n' "$name"
-    printf '  The original is still working in official Warp. This tab opens its copy as soon as\n'
-    printf '  it finishes, so the copy has the finished work. Enter opens it now; Ctrl-C skips it.\n\n'
-    while original_busy; do
+    if original_is waiting; then
+        printf '  The original is waiting for your answer in official Warp. Answer it there, and this\n'
+        printf '  tab opens its copy once that turn is done. Enter opens it now; Ctrl-C skips it.\n\n'
+    else
+        printf '  The original is still working in official Warp. This tab opens its copy as soon as\n'
+        printf '  it finishes, so the copy has the finished work. Enter opens it now; Ctrl-C skips it.\n\n'
+    fi
+    while original_unfinished; do
         # A timeout and Ctrl-D both return non-zero (macOS's bash 3.2 doesn't tell them apart),
         # so only a line read counts as Enter.
         if read -r -t 2 _; then
