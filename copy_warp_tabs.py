@@ -50,9 +50,13 @@ UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 BLOCK_SESSION_RE = re.compile(r"^precmd-(-?\d+)-\d+$")
 START_MATCH_SECONDS = 5
 
-# Claude Code flags carried over to the copy. Other flags are listed in the plan.
-CARRIED_FLAGS_WITH_VALUE = {"--effort", "--model", "--permission-mode", "--settings", "--agent"}
+# Claude Code flags carried over to the copy (resume doesn't restore these). Other flags are
+# listed in the plan.
+CARRIED_FLAGS_WITH_VALUE = {"--effort", "--settings", "--agent", "--fallback-model"}
 CARRIED_FLAGS_WITH_VALUES = {"--add-dir", "--mcp-config", "--plugin-dir"}
+# Resume restores the model and permission mode the session was last in, so the launch values
+# would undo a later /model or mode switch. Bypass mode isn't restored, so it is carried.
+RESTORED_FLAGS_WITH_VALUE = {"--model", "--permission-mode"}
 CARRIED_SWITCHES = {
     "--dangerously-skip-permissions",
     "--allow-dangerously-skip-permissions",
@@ -253,6 +257,13 @@ def split_claude_flags(args):
             while i + 1 < len(words) and not words[i + 1].startswith("-"):
                 carried.append(words[i + 1])
                 i += 1
+        elif flag in RESTORED_FLAGS_WITH_VALUE:
+            value = inline
+            if not inline and i + 1 < len(words):
+                value = words[i + 1]
+                i += 1
+            if flag == "--permission-mode" and value == "bypassPermissions":
+                carried += [flag, value]
         elif flag in SESSION_FLAGS_WITH_VALUE:
             if not inline and i + 1 < len(words) and not words[i + 1].startswith("-"):
                 i += 1
