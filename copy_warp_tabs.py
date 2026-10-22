@@ -55,6 +55,8 @@ BLOCK_SESSION_RE = re.compile(r"^precmd-(-?\d+)-\d+$")
 # A word short and plain enough to show from a command line that's still running.
 HINT_WORD_RE = re.compile(r"^[A-Za-z0-9.][A-Za-z0-9._:@+/-]{0,23}$")
 START_MATCH_SECONDS = 5
+# A tab's last finished block starts this many seconds before the agent process it ran, at most.
+BLOCK_BEFORE_SECONDS = 5
 # Copies open this far apart, so 19 sessions and their MCP servers don't all start at once.
 STAGGER_SECONDS = 2
 
@@ -157,6 +159,16 @@ def agent_kind(proc):
     return None
 
 
+def lsof_path(text):
+    """lsof prints bytes outside ASCII as \\xNN (an em dash is \\xe2\\x80\\x94), so turn those back
+    into the real path when that path exists."""
+    if "\\x" not in text:
+        return text
+    raw = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]), text.encode("utf-8"))
+    decoded = raw.decode("utf-8", "replace")
+    return decoded if os.path.exists(decoded) else text
+
+
 def cwd_of(pids):
     cwds = {}
     if not pids:
@@ -167,7 +179,7 @@ def cwd_of(pids):
         if line.startswith("p"):
             pid = int(line[1:])
         elif line.startswith("n") and pid is not None:
-            cwds[pid] = line[1:]
+            cwds[pid] = lsof_path(line[1:])
     return cwds
 
 
@@ -444,10 +456,16 @@ def read_layout(snapshot):
         leaves = {r["pane_node_id"]: r for r in select(conn, "pane_leaves", ["pane_node_id", "kind", "is_focused"])}
         terminals = {r["id"]: r for r in select(conn, "terminal_panes", ["id", "uuid", "cwd"])}
         block_sessions = {}
-        for pane_uuid, block_id in conn.execute("SELECT pane_leaf_uuid, block_id FROM blocks"):
+        block_starts = {}
+        for pane_uuid, block_id, start_ts in conn.execute("SELECT pane_leaf_uuid, block_id, start_ts FROM blocks"):
+            if pane_uuid is None:
+                continue
             match = BLOCK_SESSION_RE.match(block_id or "")
-            if match and pane_uuid is not None:
+            if match:
                 block_sessions.setdefault(uuid_key(pane_uuid), set()).add(int(match.group(1)))
+            times = parse_db_time(start_ts)
+            if times:
+                block_starts.setdefault(uuid_key(pane_uuid), []).append(times)
         running = select(conn, "commands", ["command", "start_ts", "pwd", "session_id"],
                          "WHERE completed_ts IS NULL AND start_ts IS NOT NULL")
     finally:
@@ -475,6 +493,7 @@ def read_layout(snapshot):
                 "cwd": terminal.get("cwd"),
                 "is_focused": bool(leaf.get("is_focused")),
                 "shell_sessions": sessions,
+                "block_starts": block_starts.get(uuid_key(terminal.get("uuid")), []),
                 "running": busy[-1] if busy else None,
             }
         built = [b for b in (build(c) for c in children.get(node["id"], [])) if b]
@@ -582,24 +601,41 @@ def place_agents(agents, layout):
             if len(hits) == 1:
                 take(hits[0], agent, "shell session")
 
-    # 2. Only one free pane in the agent's folder.
+    # 2. Warp stores some agent commands without their shell session, but the agent's tab still
+    #    has a finished block that started a moment before the agent did. Taken only when exactly
+    #    one pane anywhere has such a block, and that pane is free and in the agent's folder.
+    best = {}
+    for reading in ("utc", "local"):
+        found = {}
+        for agent in agents:
+            if agent.get("placed_by"):
+                continue
+            start = agent["proc"].start
+            near = [p for p in panes
+                    if any(start - BLOCK_BEFORE_SECONDS <= t[reading] <= start + 1 for t in p.get("block_starts", []))]
+            if len(near) == 1 and id(near[0]) not in taken and in_folder(near[0], agent):
+                found[agent["proc"].pid] = near[0]
+        if len(found) > len(best):
+            best = found
+    for agent in agents:
+        pane = best.get(agent["proc"].pid)
+        if pane is not None and id(pane) not in taken:
+            take(pane, agent, "block start")
+
+    # 3. Only one free pane in the agent's folder.
     for agent in agents:
         if not agent.get("placed_by"):
             hits = [p for p in panes if id(p) not in taken and in_folder(p, agent)]
             if len(hits) == 1:
                 take(hits[0], agent, "folder")
 
-    # 3. Several free panes in the folder: oldest session first, left to right. Warp saves a
-    #    block only once its command finishes, so a session still running its first command has
-    #    no blocks in its pane, and a pane with blocks but no match above is a plain shell. Panes
-    #    without blocks go first. Swapping two sessions of one project only changes which of
-    #    those tabs each lands in.
+    # 4. Several free panes in the folder: oldest session first, left to right. Swapping two
+    #    sessions of one project only changes which of those tabs each lands in.
     for agent in sorted(agents, key=lambda a: a["proc"].start):
         if not agent.get("placed_by"):
             hits = [p for p in panes if id(p) not in taken and in_folder(p, agent)]
-            hits.sort(key=lambda p: bool(p["shell_sessions"]))
             if hits:
-                take(hits[0], agent, "folder, order guessed" if hits[0]["shell_sessions"] else "folder, no history")
+                take(hits[0], agent, "folder, order guessed")
 
     return [a for a in agents if not a.get("placed_by")]
 
@@ -875,20 +911,14 @@ def main():
             warnings.append("official Warp's database wasn't found, so tabs follow the process list")
     if layout:
         unplaced = place_agents(agents, layout)
-        # How sure the folder guesses are: they're exact as a set when a folder has as many
-        # tabs without history as sessions placed there by folder.
-        panes = [p for w in layout["windows"] for t in w["tabs"] for p in panes_of(t["root"])]
         by_folder = {}
         for agent in agents:
-            folder = norm(agent.get("cwd")) or agent.get("resume_cwd")
-            if folder and (agent.get("placed_by") or "").startswith("folder,"):
+            if agent.get("placed_by") == "folder, order guessed":
+                folder = agent.get("resume_cwd") or norm(agent.get("cwd")) or "?"
                 by_folder.setdefault(folder, []).append(agent)
         for folder, guessed in sorted(by_folder.items()):
-            fresh = [p for p in panes if norm(p["cwd"]) == folder and not p["shell_sessions"]]
-            warnings.append(f"{os.path.basename(folder)}: {len(guessed)} session(s) placed by folder; "
-                            f"{len(fresh)} tab(s) there have no history, so "
-                            + ("those are most likely their tabs, and only the order among them is a guess"
-                               if len(fresh) == len(guessed) else "which tab each goes in is a guess"))
+            warnings.append(f"{os.path.basename(folder)}: {len(guessed)} session(s) placed by folder alone, "
+                            "so which of its tabs each one goes in is a guess")
         for agent in unplaced:
             agent["placed_by"] = "new tab at the end"
             target = next((w for w in layout["windows"] if w["active"]), layout["windows"][0])
