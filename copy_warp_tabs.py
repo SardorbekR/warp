@@ -4,18 +4,20 @@
 Official Warp is only read, never changed: the script reads the process list,
 Claude Code's ~/.claude/sessions/<pid>.json files, and a read-only backup of
 Warp's database. It never signals, types into, or closes anything in official
-Warp. Each agent tab in WarpOss opens a *copy* of its conversation
-(`claude --resume <id> --fork-session`, `codex fork <id>`), which gets a new
-session id, so the original keeps running and its transcript is never written
-by WarpOss.
+Warp. Each agent tab in WarpOss opens a *copy* of its conversation under a new
+session id (`claude --resume <id> --fork-session --session-id <new id>`,
+`codex fork <id>`), so the original keeps running and its transcript is never
+written by WarpOss. Each Claude copy names itself after the original with a
+local /rename (no model call), which also saves its transcript right away, so
+WarpOss can bring the copy back after a restart even before you use it.
 
     python3 copy_warp_tabs.py            # dry run: print and save the plan
     python3 copy_warp_tabs.py --apply    # write the launch config, open it in WarpOss
 
 Options:
+    --start enter    wait for Enter in each agent tab instead of opening copies on their own
     --agents-only    leave plain shell tabs out
-    --start now      open every copy right away instead of on Enter
-    --again          include sessions you already opened a copy of
+    --again          make new copies of sessions that already have one
     --force          replace an existing "Copied from Warp" launch config
     --no-db          don't read official Warp's database (no titles, colors, splits)
 """
@@ -33,12 +35,13 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import uuid
 from pathlib import Path
 
 HOME = Path.home()
 MIGRATE_DIR = HOME / "SideProjects" / "warp-custom" / "migrate"
 HELPER = MIGRATE_DIR / "open-copy.sh"
-OPENED_DIR = MIGRATE_DIR / "opened"
+COPIES_FILE = MIGRATE_DIR / "copies.json"
 CLAUDE_DIR = HOME / ".claude"
 WARPOSS_APP = Path("/Applications/WarpOss.app")
 WARPOSS_LAUNCH_DIR = HOME / ".warp-oss" / "launch_configurations"
@@ -49,6 +52,8 @@ ANSI_COLORS = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "wh
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 BLOCK_SESSION_RE = re.compile(r"^precmd-(-?\d+)-\d+$")
 START_MATCH_SECONDS = 5
+# Copies open this far apart, so 19 sessions and their MCP servers don't all start at once.
+STAGGER_SECONDS = 2
 
 # Claude Code flags carried over to the copy (resume doesn't restore these). Other flags are
 # listed in the plan.
@@ -67,11 +72,16 @@ CARRIED_SWITCHES = {
 # Flags that pick or name the session; the copy gets its own id.
 SESSION_FLAGS_WITH_VALUE = {"-r", "--resume", "--session-id", "-n", "--name"}
 SESSION_SWITCHES = {"-c", "--continue", "--fork-session"}
+# Claude processes that aren't a conversation of their own.
+CLAUDE_SUBCOMMANDS = {"agents", "attach"}
 
 
 def run(args, cwd=None):
     env = dict(os.environ, LC_ALL="C")
-    result = subprocess.run(args, capture_output=True, text=True, cwd=cwd, env=env)
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, cwd=cwd, env=env)
+    except OSError:
+        return ""
     return result.stdout
 
 
@@ -79,9 +89,10 @@ def run(args, cwd=None):
 
 
 class Proc:
-    def __init__(self, pid, ppid, tty, start, comm):
+    def __init__(self, pid, ppid, rss_kb, tty, start, comm):
         self.pid = pid
         self.ppid = ppid
+        self.rss_kb = rss_kb
         self.tty = tty
         self.start = start
         self.comm = comm
@@ -91,13 +102,13 @@ class Proc:
 
 def read_processes():
     procs = {}
-    for line in run(["ps", "-axo", "pid=,ppid=,tty=,lstart=,comm="]).splitlines():
-        parts = line.split(None, 8)
-        if len(parts) < 9:
+    for line in run(["ps", "-axo", "pid=,ppid=,rss=,tty=,lstart=,comm="]).splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 10:
             continue
         try:
-            start = time.mktime(time.strptime(" ".join(parts[3:8]), "%a %b %d %H:%M:%S %Y"))
-            procs[int(parts[0])] = Proc(int(parts[0]), int(parts[1]), parts[2], start, parts[8])
+            start = time.mktime(time.strptime(" ".join(parts[4:9]), "%a %b %d %H:%M:%S %Y"))
+            procs[int(parts[0])] = Proc(int(parts[0]), int(parts[1]), int(parts[2]), parts[3], start, parts[9])
         except ValueError:
             continue
     return procs
@@ -170,6 +181,7 @@ def codex_session_id(procs, pid):
 
 
 def claude_session_record(pid):
+    """Claude Code's record for a running process: sessionId, cwd, status (busy or idle), ..."""
     try:
         return json.loads((CLAUDE_DIR / "sessions" / f"{pid}.json").read_text())
     except (OSError, ValueError):
@@ -224,8 +236,8 @@ def claude_project_dir_name(path):
 
 
 def claude_resume_cwd(transcript, candidates):
-    """The folder to start the copy in. Claude Code looks a session id up under the project of
-    the folder it runs in, so this is the first folder whose project holds the transcript."""
+    """The folder to start the copy in, so its tools work on the same project: the first folder
+    whose project holds the transcript."""
     for candidate in candidates:
         path = norm(candidate)
         if path and claude_project_dir_name(path) == transcript.parent.name:
@@ -273,6 +285,24 @@ def split_claude_flags(args):
     return carried, dropped
 
 
+def claude_subcommand(args):
+    """["agents"] or ["attach", <id>] when the process is Claude's agent view or a terminal
+    attached to a background session, else None."""
+    words = args.split()[1:]
+    value_flags = CARRIED_FLAGS_WITH_VALUE | RESTORED_FLAGS_WITH_VALUE | SESSION_FLAGS_WITH_VALUE
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word.startswith("-"):
+            flag, _, inline = word.partition("=")
+            if flag in value_flags and not inline:
+                i += 1
+            i += 1
+            continue
+        return [word] + words[i + 1:i + 2] if word in CLAUDE_SUBCOMMANDS else None
+    return None
+
+
 def official_warp_pids(procs):
     return {pid for pid, p in procs.items() if OFFICIAL_WARP_MARKER in p.comm}
 
@@ -301,6 +331,30 @@ def find_agents(procs, warp):
 
 def pane_roots(procs, warp):
     return [p for p in procs.values() if p.ppid in warp and p.pid not in warp and p.tty not in ("??", "-")]
+
+
+def memory_report(procs, agents):
+    """What the agent sessions use now (with their MCP servers and tools) and what macOS reports
+    as available, in GB."""
+    used_kb = 0
+    for agent in agents:
+        pid = agent["proc"].pid
+        used_kb += sum(procs[p].rss_kb for p in [pid] + descendants(procs, pid) if p in procs)
+    available = None
+    out = run(["vm_stat"])
+    page = re.search(r"page size of (\d+) bytes", out)
+    if page:
+        pages = 0
+        for label in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"):
+            found = re.search(rf"^{label}:\s+(\d+)", out, re.M)
+            pages += int(found.group(1)) if found else 0
+        available = pages * int(page.group(1)) / 1e9
+    total = run(["sysctl", "-n", "hw.memsize"]).strip()
+    return {
+        "agents_gb": round(used_kb / 1e6, 1),
+        "available_gb": round(available, 1) if available is not None else None,
+        "total_gb": round(int(total) / 1e9) if total.isdigit() else None,
+    }
 
 
 # --- official Warp's database ----------------------------------------------------
@@ -338,6 +392,12 @@ def select(conn, table, wanted, extra=""):
         return []
     rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table} {extra}").fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+
+def uuid_key(value):
+    if value is None:
+        return None
+    return bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else str(value).encode()
 
 
 def parse_color(value):
@@ -381,10 +441,10 @@ def read_layout(snapshot):
         leaves = {r["pane_node_id"]: r for r in select(conn, "pane_leaves", ["pane_node_id", "kind", "is_focused"])}
         terminals = {r["id"]: r for r in select(conn, "terminal_panes", ["id", "uuid", "cwd"])}
         block_sessions = {}
-        for uuid, block_id in conn.execute("SELECT pane_leaf_uuid, block_id FROM blocks"):
+        for pane_uuid, block_id in conn.execute("SELECT pane_leaf_uuid, block_id FROM blocks"):
             match = BLOCK_SESSION_RE.match(block_id or "")
-            if match and uuid is not None:
-                block_sessions.setdefault(bytes(uuid), set()).add(int(match.group(1)))
+            if match and pane_uuid is not None:
+                block_sessions.setdefault(uuid_key(pane_uuid), set()).add(int(match.group(1)))
         running = select(conn, "commands", ["command", "start_ts", "pwd", "session_id"],
                          "WHERE completed_ts IS NULL AND start_ts IS NOT NULL")
     finally:
@@ -400,11 +460,16 @@ def read_layout(snapshot):
             terminal = terminals.get(node["id"])
             if leaf.get("kind") != "terminal" or terminal is None:
                 return None
+            sessions = block_sessions.get(uuid_key(terminal.get("uuid")), set())
+            # A non-agent command still running here, such as a dev server.
+            busy = [r["command"] for r in running
+                    if r.get("session_id") in sessions and r.get("command") and not runs_agent(r["command"])]
             return {
                 "type": "pane",
                 "cwd": terminal.get("cwd"),
                 "is_focused": bool(leaf.get("is_focused")),
-                "shell_sessions": block_sessions.get(bytes(terminal["uuid"] or b""), set()),
+                "shell_sessions": sessions,
+                "running": busy[-1] if busy else None,
             }
         built = [b for b in (build(c) for c in children.get(node["id"], [])) if b]
         if not built:
@@ -422,9 +487,14 @@ def read_layout(snapshot):
             continue
         window_groups = [g for g in groups if g["window_id"] == window["id"]]
         group_ids = [g["id"] for g in window_groups]
+        # Warp saves a window's tabs in their on-screen order, and active_tab_index counts them.
+        window_tabs = [t for t in tabs if t["window_id"] == window["id"]]
+        active_index = window.get("active_tab_index")
+        active_tab_id = (window_tabs[active_index]["id"]
+                         if isinstance(active_index, int) and 0 <= active_index < len(window_tabs) else None)
         out_tabs = []
-        for tab in tabs:
-            if tab["window_id"] != window["id"] or tab["id"] not in roots:
+        for tab in window_tabs:
+            if tab["id"] not in roots:
                 continue
             root = build(roots[tab["id"]])
             if root is None:
@@ -434,6 +504,7 @@ def read_layout(snapshot):
                 "title": tab.get("custom_title"),
                 "color": parse_color(tab.get("color")),
                 "group": group_ids.index(group_id) if group_id in group_ids else None,
+                "active": tab["id"] == active_tab_id,
                 "root": root,
             })
         layout["windows"].append({
@@ -478,6 +549,7 @@ def place_agents(agents, layout):
 
     def take(pane, agent, how):
         pane["agent"] = agent
+        pane["running"] = None
         agent["placed_by"] = how
         taken.add(id(pane))
 
@@ -529,31 +601,51 @@ def layout_from_processes(procs, warp, agents):
     by_shell = {a["shell"].pid: a for a in agents if a["shell"]}
     tabs = []
     for root in roots:
-        pane = {"type": "pane", "cwd": cwds.get(root.pid), "is_focused": True, "shell_sessions": set()}
+        pane = {"type": "pane", "cwd": cwds.get(root.pid), "is_focused": True, "shell_sessions": set(),
+                "running": None}
         agent = by_shell.get(root.pid)
         if agent:
             pane["agent"] = agent
             agent["placed_by"] = "process"
-        tabs.append({"title": None, "color": None, "group": None, "root": pane})
+        tabs.append({"title": None, "color": None, "group": None, "active": False, "root": pane})
     return {"windows": [{"active": True, "groups": [], "tabs": tabs}], "running": []}
 
 
 # --- the WarpOss launch configuration ----------------------------------------------
 
 
-def resume_command(agent):
-    if agent["kind"] == "claude":
-        # The name the session was given with /rename or --name, so the copy is listed the same way.
-        name = ["--name", agent["custom_title"]] if agent.get("custom_title") else []
-        return " ".join(["claude", "--resume", agent["session_id"], "--fork-session"]
-                        + [shlex.quote(w) for w in name + agent["carried"]])
-    return "codex fork " + agent["session_id"]
+def clean_name(text, fallback):
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text or "").strip()
+    return (text or fallback)[:100]
 
 
-def pane_commands(pane, start):
+def copy_name(agent):
+    return clean_name(agent.get("name"), os.path.basename(norm(agent.get("resume_cwd") or agent["cwd"]) or "") or "copy")
+
+
+def quoted(words):
+    return " ".join(shlex.quote(w) for w in words)
+
+
+def helper_command(mode, delay, agent):
+    return quoted(["/bin/bash", str(HELPER), mode, str(delay), str(agent["proc"].pid), copy_name(agent)])
+
+
+def pane_commands(pane, start, delays):
     agent = pane.get("agent")
     if not agent:
+        if pane.get("running"):
+            note = ("In official Warp, this tab is still running: " + clean_name(pane["running"], "")[:80]
+                    + ". Start it here once you stop it there.")
+            return ["echo " + shlex.quote(note)]
         return []
+    subcommand = agent.get("subcommand")
+    if subcommand and subcommand[0] == "agents":
+        return ["claude agents"]
+    if subcommand and subcommand[0] == "attach" and len(subcommand) > 1:
+        return [helper_command("attach", 0, agent), quoted(["claude", "attach", subcommand[1]])]
+    if subcommand:
+        return ["claude agents"]
     if not agent.get("session_id"):
         if agent["kind"] == "claude":
             note = ("Official Warp ran a Claude Code session here, but its id could not be read. "
@@ -562,11 +654,17 @@ def pane_commands(pane, start):
             note = ("Official Warp ran a Codex session here, but its id could not be read. "
                     "To copy it, run: codex fork (then pick it from the list)")
         return ["echo " + shlex.quote(note)]
-    commands = []
-    if start == "enter":
-        commands.append(" ".join(shlex.quote(w) for w in [
-            "sh", str(HELPER), agent["kind"], agent["session_id"], agent.get("name") or agent["session_id"]]))
-    commands.append(resume_command(agent))
+    if agent["kind"] == "claude" and not agent.get("transcript"):
+        # Nothing was said in it yet, so a new session is the same thing.
+        return [quoted(["claude"] + agent["carried"])]
+    commands = [helper_command(start, delays.get(id(agent), 0), agent)]
+    if agent["kind"] == "claude":
+        # The prompt goes before the carried flags: --add-dir and friends take several values.
+        commands.append(quoted(["claude", "--resume", agent["session_id"], "--fork-session",
+                                "--session-id", agent["copy_id"], "/rename " + copy_name(agent)]
+                               + agent["carried"]))
+    else:
+        commands.append(quoted(["codex", "fork", agent["session_id"]]))
     return commands
 
 
@@ -574,19 +672,19 @@ def y(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def emit_node(node, indent, start, lines, first_prefix):
+def emit_node(node, indent, start, delays, lines, first_prefix):
     pad = " " * indent
     if node["type"] == "split":
         lines.append(f"{first_prefix}split_direction: {node['direction']}")
         lines.append(f"{pad}panes:")
         for child in node["panes"]:
-            emit_node(child, indent + 4, start, lines, " " * (indent + 2) + "- ")
+            emit_node(child, indent + 4, start, delays, lines, " " * (indent + 2) + "- ")
         return
     agent = node.get("agent") or {}
     lines.append(f"{first_prefix}cwd: {y(agent.get('resume_cwd') or node['cwd'] or str(HOME))}")
     if node.get("is_focused"):
         lines.append(f"{pad}is_focused: true")
-    commands = pane_commands(node, start)
+    commands = pane_commands(node, start, delays)
     if commands:
         lines.append(f"{pad}commands:")
         for command in commands:
@@ -607,20 +705,39 @@ def launch_config(layout, start, keep):
         f"# Made by copy_warp_tabs.py on {dt.datetime.now():%Y-%m-%d %H:%M}.",
         "# Agent tabs open a copy of their conversation; official Warp is untouched.",
         f"name: {y(CONFIG_NAME)}",
-        "windows:",
     ]
+    windows = []
     for window in layout["windows"]:
         tabs = []
         for tab in window["tabs"]:
             root = prune(tab["root"], keep)
             if root:
                 tabs.append(dict(tab, root=root))
-        if not tabs:
-            continue
+        if tabs:
+            windows.append(dict(window, tabs=tabs))
+    # Copies that open on their own start STAGGER_SECONDS apart, in tab order.
+    delays = {}
+    for window in windows:
+        for tab in window["tabs"]:
+            for pane in panes_of(tab["root"]):
+                agent = pane.get("agent")
+                if agent and agent.get("session_id") and agent.get("transcript") and not agent.get("subcommand"):
+                    delays[id(agent)] = len(delays) * STAGGER_SECONDS
+    active_window = next((i for i, w in enumerate(windows) if w["active"]), None)
+    if active_window is not None:
+        lines.append(f"active_window_index: {active_window}")
+    lines.append("windows:")
+    for window in windows:
+        tabs = window["tabs"]
         # Keep only groups that still have a tab, renumbered.
         used = sorted({t["group"] for t in tabs if t["group"] is not None})
         renumber = {old: new for new, old in enumerate(used)}
-        lines.append("  - tabs:")
+        active_tab = next((i for i, t in enumerate(tabs) if t.get("active")), None)
+        first = "  - "
+        if active_tab is not None:
+            lines.append(f"{first}active_tab_index: {active_tab}")
+            first = "    "
+        lines.append(f"{first}tabs:")
         for tab in tabs:
             first = "      - "
             if tab["title"]:
@@ -633,7 +750,7 @@ def launch_config(layout, start, keep):
                 lines.append(f"{first}group: {renumber[tab['group']]}")
                 first = "        "
             lines.append(f"{first}layout:")
-            emit_node(tab["root"], 10, start, lines, " " * 10)
+            emit_node(tab["root"], 10, start, delays, lines, " " * 10)
         if used:
             lines.append("    tab_groups:")
             for old in used:
@@ -651,11 +768,19 @@ def launch_config(layout, start, keep):
 # --- main ---------------------------------------------------------------------------
 
 
+def load_copies():
+    try:
+        copies = json.loads(COPIES_FILE.read_text())
+        return copies if isinstance(copies, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--agents-only", action="store_true")
-    parser.add_argument("--start", choices=("enter", "now"), default="enter")
+    parser.add_argument("--start", choices=("auto", "enter"), default="auto")
     parser.add_argument("--again", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no-db", action="store_true")
@@ -664,6 +789,7 @@ def main():
     MIGRATE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     warnings = []
+    copies = load_copies()
 
     procs = read_processes()
     warp = official_warp_pids(procs)
@@ -676,18 +802,18 @@ def main():
         proc = agent["proc"]
         proc.args = proc.args or process_args(proc.pid)
         agent["cwd"] = cwds.get(agent["shell"].pid if agent["shell"] else proc.pid) or cwds.get(proc.pid)
-        agent["resume_cwd"] = None
-        agent["name"] = agent["custom_title"] = None
-        agent["last_write"] = None
-        agent["carried"], agent["dropped"] = [], []
+        agent.update(resume_cwd=None, name=None, last_write=None, transcript=None, status=None,
+                     subcommand=None, copy_id=None, copied=None, carried=[], dropped=[])
         if agent["kind"] == "claude":
             record = claude_session_record(proc.pid)
-            agent["session_id"] = find_key(record, "sessionId", "session_id")
+            agent["subcommand"] = claude_subcommand(proc.args)
+            agent["status"] = find_key(record, "status")
+            agent["session_id"] = None if agent["subcommand"] else find_key(record, "sessionId", "session_id")
             agent["carried"], agent["dropped"] = split_claude_flags(proc.args)
             transcript = claude_transcript(agent["session_id"]) if agent["session_id"] else None
             if transcript:
                 facts = claude_transcript_facts(transcript)
-                agent["custom_title"] = facts["custom"]
+                agent["transcript"] = str(transcript)
                 agent["name"] = facts["custom"] or facts["ai"]
                 agent["last_write"] = os.path.getmtime(transcript)
                 agent["resume_cwd"] = claude_resume_cwd(
@@ -695,14 +821,18 @@ def main():
                 if not agent["resume_cwd"]:
                     warnings.append(f"pid {proc.pid}: couldn't tell which folder session {agent['session_id']} "
                                     f"belongs to ({transcript.parent.name}); its tab starts in {agent['cwd']}")
-            elif agent["session_id"]:
-                warnings.append(f"pid {proc.pid}: no transcript found for session {agent['session_id']}")
+                # A copy made earlier counts once Claude saved it (it saves itself when it opens).
+                earlier = copies.get(agent["session_id"]) or {}
+                if earlier.get("copy_id") and claude_transcript(earlier["copy_id"]):
+                    agent["copied"] = earlier.get("made") or "earlier"
+                    agent["copy_id"] = str(uuid.uuid4()) if opts.again else earlier["copy_id"]
+                else:
+                    agent["copy_id"] = earlier.get("copy_id") or str(uuid.uuid4())
         else:
             agent["session_id"] = codex_session_id(procs, proc.pid)
-        if not agent["session_id"]:
+            agent["transcript"] = agent["session_id"]
+        if not agent["session_id"] and not agent["subcommand"]:
             warnings.append(f"pid {proc.pid}: couldn't read its {agent['kind']} session id")
-        marker = OPENED_DIR / str(agent["session_id"])
-        agent["opened"] = marker.read_text().strip() if agent["session_id"] and marker.exists() else None
 
     layout = None
     if not opts.no_db:
@@ -720,19 +850,19 @@ def main():
         for agent in place_agents(agents, layout):
             agent["placed_by"] = "new tab at the end"
             target = next((w for w in layout["windows"] if w["active"]), layout["windows"][0])
-            target["tabs"].append({"title": None, "color": None, "group": None,
+            target["tabs"].append({"title": None, "color": None, "group": None, "active": False,
                                    "root": {"type": "pane", "cwd": agent["cwd"], "is_focused": True,
-                                            "shell_sessions": set(), "agent": agent}})
+                                            "shell_sessions": set(), "running": None, "agent": agent}})
     else:
         layout = layout_from_processes(procs, warp, agents)
 
-    reapply = any(a["opened"] for a in agents) and not opts.again
+    reapply = any(a["copied"] for a in agents) and not opts.again
 
     def keep(pane):
         agent = pane.get("agent")
         if agent is None:
             return not (opts.agents_only or reapply)
-        return not (reapply and (agent["opened"] or not agent["session_id"]))
+        return not (reapply and (agent["copied"] or not agent["session_id"]))
 
     rows = []
     for wi, window in enumerate(layout["windows"]):
@@ -745,34 +875,45 @@ def main():
                     "agent": agent.get("kind"),
                     "pid": agent["proc"].pid if agent else None,
                     "session_id": agent.get("session_id"),
+                    "copy_id": agent.get("copy_id"),
                     "name": agent.get("name"),
+                    "status": agent.get("status"),
+                    "subcommand": agent.get("subcommand"),
                     "placed_by": agent.get("placed_by"),
                     "kept_flags": agent.get("carried"),
                     "dropped_flags": agent.get("dropped"),
                     "last_write": (dt.datetime.fromtimestamp(agent["last_write"]).strftime("%m-%d %H:%M")
                                    if agent.get("last_write") else None),
-                    "already_opened": agent.get("opened"),
+                    "already_copied": agent.get("copied"),
+                    "shell_still_running_something": bool(pane.get("running")),
                     "included": keep(pane),
                 })
     yaml_text = launch_config(layout, opts.start, keep)
+    memory = memory_report(procs, agents)
     plan_json = MIGRATE_DIR / f"plan-{stamp}.json"
     plan_yaml = MIGRATE_DIR / f"plan-{stamp}.yaml"
-    plan_json.write_text(json.dumps({"made": stamp, "start": opts.start, "rows": rows, "warnings": warnings},
-                                    indent=2, ensure_ascii=False))
+    plan_json.write_text(json.dumps({"made": stamp, "start": opts.start, "memory": memory, "rows": rows,
+                                     "warnings": warnings}, indent=2, ensure_ascii=False))
     plan_yaml.write_text(yaml_text)
 
     tab_count = sum(len(w["tabs"]) for w in layout["windows"])
-    print(f"\nOfficial Warp: {tab_count} tabs, {len(agents)} agent sessions.\n")
-    print(f"{'tab':<6}{'folder':<24}{'session':<44}{'placed by':<23}included")
+    print(f"\nOfficial Warp: {len(layout['windows'])} window(s), {tab_count} tabs, {len(agents)} agent sessions.\n")
+    print(f"{'tab':<6}{'folder':<20}{'session':<40}{'status':<8}{'placed by':<23}included")
     for r in rows:
         folder = os.path.basename(norm(r["folder"]) or "") or "~"
-        session = ((r["name"] or r["session_id"] or "id unknown") if r["agent"] else "(shell)")[:42]
-        print(f"{r['window']}.{r['tab']:<4}{folder[:22]:<24}{session:<44}{r['placed_by'] or '':<23}"
-              f"{'yes' if r['included'] else 'no'}")
+        if r["agent"]:
+            session = r["name"] or (" ".join(r["subcommand"]) if r["subcommand"] else None) or r["session_id"] or "id unknown"
+        else:
+            session = "(shell, still running something)" if r["shell_still_running_something"] else "(shell)"
+        print(f"{r['window']}.{r['tab']:<4}{folder[:18]:<20}{session[:38]:<40}{(r['status'] or '')[:7]:<8}"
+              f"{r['placed_by'] or '':<23}{'yes' if r['included'] else 'no'}")
     for w in warnings:
         print("  ! " + w)
+    print(f"\nMemory: the agent sessions use about {memory['agents_gb']} GB with their MCP servers; "
+          f"their copies will need about as much again. Available now: {memory['available_gb']} GB "
+          f"of {memory['total_gb']} GB.")
     if reapply:
-        print("\nSome sessions already have a copy, so only the others are included (--again includes all).")
+        print("Some sessions already have a copy, so only the others are included (--again makes new ones).")
     print(f"\nPlan: {plan_json}\nLaunch config preview: {plan_yaml}")
 
     if not opts.apply:
@@ -780,7 +921,7 @@ def main():
         return
     if not WARPOSS_APP.exists():
         sys.exit("WarpOss isn't installed at /Applications/WarpOss.app.")
-    if opts.start == "enter" and not HELPER.exists():
+    if not HELPER.exists():
         sys.exit(f"Missing {HELPER}.")
     target = WARPOSS_LAUNCH_DIR / CONFIG_FILE
     if target.exists() and not opts.force:
@@ -788,11 +929,12 @@ def main():
     WARPOSS_LAUNCH_DIR.mkdir(parents=True, exist_ok=True)
     target.write_text(yaml_text)
     shutil.copy(plan_json, MIGRATE_DIR / f"applied-{stamp}.json")
-    if opts.start == "now":
-        OPENED_DIR.mkdir(parents=True, exist_ok=True)
-        for agent in agents:
-            if agent["session_id"] and agent.get("placed_by") and (opts.again or not agent["opened"]):
-                (OPENED_DIR / agent["session_id"]).write_text(dt.datetime.now().strftime("%Y-%m-%d %H:%M") + "\n")
+    made = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    for agent in agents:
+        if agent.get("copy_id") and agent.get("placed_by") and (opts.again or not agent["copied"]):
+            copies[agent["session_id"]] = {"copy_id": agent["copy_id"], "made": made,
+                                           "name": agent.get("name"), "folder": agent.get("resume_cwd")}
+    COPIES_FILE.write_text(json.dumps(copies, indent=2, ensure_ascii=False))
     subprocess.run(["open", "warposs://launch/" + urllib.parse.quote(CONFIG_NAME)])
     print(f"\nOpened '{CONFIG_NAME}' in WarpOss. To undo, close that window and delete {target}.")
 

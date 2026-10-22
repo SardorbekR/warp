@@ -1,38 +1,59 @@
-#!/bin/sh
-# Shown in a WarpOss tab made by copy_warp_tabs.py, before the tab opens its
-# copy of a conversation that is still running in official Warp.
+#!/bin/bash
+# Runs in a WarpOss tab made by copy_warp_tabs.py, just before the tab opens its copy of a
+# conversation that is still running in official Warp.
 #
-#   open-copy.sh <agent> <session-id> <name>
+#   open-copy.sh <auto|enter|attach> <delay in seconds> <original pid> <name>
 #
-# Exits 0 when you press Enter, so WarpOss runs the next queued command (the
-# fork). Ctrl-C exits non-zero, which cancels it. Nothing here touches official
-# Warp or the original session.
+# Exits 0 when the copy should open, so WarpOss runs the next queued command (the copy).
+# Ctrl-C exits non-zero, which skips it. Nothing here touches official Warp or the original.
 
-case $1 in
-    claude) agent="Claude Code" ;;
-    codex) agent="Codex" ;;
-    *) agent=$1 ;;
-esac
-id=$2
-name=$3
-marker_dir="$HOME/SideProjects/warp-custom/migrate/opened"
-marker="$marker_dir/$id"
+mode=$1
+delay=$2
+pid=$3
+name=$4
+record="$HOME/.claude/sessions/$pid.json"
 
 # Tab title while the tab waits.
 printf '\033]0;%s\007' "$name"
 
-printf '\n  %s\n\n' "$name"
-printf '  This tab holds a copy of a %s conversation from official Warp\n' "$agent"
-printf '  (session %s).\n\n' "$id"
-if [ -e "$marker" ]; then
-    printf '  You already opened a copy of it on %s.\n' "$(cat "$marker" 2>/dev/null)"
-    printf '  Press Enter to make another copy anyway, or Ctrl-C to skip.\n\n'
-else
-    printf '  Press Enter to open the copy here. The original keeps running in\n'
-    printf '  official Warp, untouched. Ctrl-C skips it.\n\n'
+# Whether the original is in the middle of a turn. Claude Code keeps "status" in its record.
+original_busy() {
+    kill -0 "$pid" 2>/dev/null || return 1
+    grep -Eq '"status"[[:space:]]*:[[:space:]]*"busy"' "$record" 2>/dev/null
+}
+
+case $mode in
+    enter | attach)
+        printf '\n  %s\n\n' "$name"
+        if [ "$mode" = attach ]; then
+            printf '  Official Warp has this tab attached to a background session.\n'
+            printf '  Press Enter to attach here too, or Ctrl-C to skip.\n\n'
+        else
+            printf '  Press Enter to open a copy of this conversation here. The original keeps\n'
+            printf '  running in official Warp, untouched. Ctrl-C skips it.\n\n'
+        fi
+        read -r _ || exit 1
+        exit 0
+        ;;
+esac
+
+# Copies start a couple of seconds apart, so they don't all load at once.
+if [ "$delay" -gt 0 ] 2>/dev/null; then
+    sleep "$delay"
 fi
 
-read -r _ || exit 1
-
-mkdir -p "$marker_dir" && date '+%Y-%m-%d %H:%M' > "$marker"
+if original_busy; then
+    printf '\n  %s\n\n' "$name"
+    printf '  The original is still working in official Warp. This tab opens its copy as soon as\n'
+    printf '  it finishes, so the copy has the finished work. Enter opens it now; Ctrl-C skips it.\n\n'
+    while original_busy; do
+        # A timeout and Ctrl-D both return non-zero (macOS's bash 3.2 doesn't tell them apart),
+        # so only a line read counts as Enter.
+        if read -r -t 2 _; then
+            break
+        fi
+        # Not a terminal, so read returns at once: wait here instead of spinning.
+        [ -t 0 ] || sleep 2
+    done
+fi
 exit 0
