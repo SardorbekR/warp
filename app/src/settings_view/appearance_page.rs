@@ -429,6 +429,10 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         app.register_fixed_bindings(
             [
                 (
+                    "Vertical tabs: Order by last prompt",
+                    VerticalTabsSortMode::LastPrompt,
+                ),
+                (
                     "Vertical tabs: Sort by status",
                     VerticalTabsSortMode::Status,
                 ),
@@ -1788,6 +1792,7 @@ impl AppearanceSettingsPageView {
 
     fn vertical_tabs_sort_mode_dropdown_item_label(value: VerticalTabsSortMode) -> &'static str {
         match value {
+            VerticalTabsSortMode::LastPrompt => "By last prompt",
             VerticalTabsSortMode::Status => "By status",
             VerticalTabsSortMode::GroupByProject => "Grouped by project",
             VerticalTabsSortMode::Manual => "Manual",
@@ -2764,6 +2769,7 @@ impl AppearanceSettingsPageView {
             let mut dropdown = Dropdown::new(ctx);
             dropdown.set_items(
                 [
+                    VerticalTabsSortMode::LastPrompt,
                     VerticalTabsSortMode::Status,
                     VerticalTabsSortMode::GroupByProject,
                     VerticalTabsSortMode::Manual,

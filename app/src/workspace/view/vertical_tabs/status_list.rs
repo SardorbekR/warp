@@ -2,8 +2,10 @@
 //! feature): a status-sorted list of every pane in which a project's sessions
 //! gather under a collapsible header once there are two of them (a lone
 //! session wears its project as a badge on its top edge), or the same rows with
-//! every project under a header. Manual order keeps using the upstream renderer
-//! in the parent module.
+//! every project under a header. The last-prompt order lists the rows in tab
+//! order instead (see [`super::last_prompt_order`]), with the sessions waiting
+//! for an answer on top, and gathers only adjacent sessions of a project.
+//! Manual order keeps using the upstream renderer in the parent module.
 //!
 //! Row data is gathered once per render, sorted by the pure helpers in
 //! [`super::status_order`], and rendered through the shared pane-row shell so
@@ -39,11 +41,13 @@ use warpui::{AppContext, EntityId, EventContext, Gradient, SingletonEntity, Task
 
 use super::status_order::{
     AttentionBucket, FreezeInputs, GROUP_TRANSITION_DURATION, GroupHeaderText, GroupTransition,
-    OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, ProjectPillStyle, StatusRowKey,
-    StatusSortInput, activity_age, auto_group_by_project, badge_overhang, bounded_setting,
-    compact_age_label, dash_runs, group_by_project, group_header_text, group_transitions,
-    is_order_frozen, project_hue, project_name, project_pill_style, resolve_display_order,
-    row_attention_bucket, row_display_status, slide_progress, status_sorted_indices,
+    LastPromptSortInput, OTHER_PROJECT_LABEL, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE,
+    ProjectPillStyle, StatusRowKey, StatusSortInput, activity_age, auto_group_by_project,
+    badge_overhang, bounded_setting, compact_age_label, dash_runs, group_adjacent_by_project,
+    group_by_project, group_header_text, group_transitions, is_order_frozen,
+    last_prompt_sorted_indices, most_urgent_row, needs_answer, project_hue, project_name,
+    project_pill_style, resolve_display_order, row_attention_bucket, row_display_status,
+    slide_progress, status_sorted_indices,
 };
 use super::{
     PaneProps, PaneRowBadgeMouseStates, PaneRowState, StatusRowClick, TerminalPrimaryLineData,
@@ -192,6 +196,15 @@ impl StatusRow<'_> {
             project: self.project.as_deref(),
         }
     }
+
+    fn last_prompt_input(&self) -> LastPromptSortInput {
+        LastPromptSortInput {
+            key: self.key,
+            needs_answer: needs_answer(self.status.as_ref(), self.interrupted.is_some()),
+            age: self.age,
+            fallback_rank: self.fallback_rank,
+        }
+    }
 }
 
 /// What a row shows for an interrupted agent session.
@@ -229,6 +242,10 @@ struct ListSection {
     /// The project of a lone row in status order, shown as a badge on the
     /// row's top edge.
     badge: Option<String>,
+    /// In the last-prompt order, where a project can have several groups:
+    /// the section's first row, which tells the mouse state of its header
+    /// or badge apart from those of the project's other groups.
+    label_row: Option<StatusRowKey>,
 }
 
 /// What a collapsed header shows of its group's most urgent row.
@@ -241,8 +258,10 @@ struct HeaderRollUp {
 /// Status order: what the project groups remember between frames.
 #[derive(Default)]
 pub(super) struct StatusListGroups {
-    /// Mouse states of the group headers and lone rows' badges, by project.
-    label_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    /// Mouse states of the group headers and lone rows' badges, by project
+    /// and, in the last-prompt order, the section's first row
+    /// ([`ListSection::label_row`]).
+    label_mouse_states: RefCell<HashMap<LabelKey, MouseStateHandle>>,
     /// Rows of collapsed groups shown last frame because they were selected.
     /// While the order is frozen they stay, so that selecting another row
     /// doesn't move the rows under the pointer.
@@ -254,17 +273,29 @@ pub(super) struct StatusListGroups {
     transitions: RefCell<HashMap<String, (GroupTransition, Instant)>>,
 }
 
+/// Identifies a project label (a group header or a lone row's badge) across
+/// frames: its project and, in the last-prompt order, its section's first row.
+type LabelKey = (String, Option<StatusRowKey>);
+
 impl StatusListGroups {
-    fn label_mouse_state(&self, project: &str) -> MouseStateHandle {
+    fn label_mouse_state(
+        &self,
+        project: &str,
+        label_row: Option<StatusRowKey>,
+    ) -> MouseStateHandle {
         let Ok(mut mouse_states) = self.label_mouse_states.try_borrow_mut() else {
             return MouseStateHandle::default();
         };
-        mouse_states.entry(project.to_owned()).or_default().clone()
+        mouse_states
+            .entry((project.to_owned(), label_row))
+            .or_default()
+            .clone()
     }
 
-    fn retain_label_mouse_states(&self, projects: &HashSet<&str>) {
+    fn retain_label_mouse_states(&self, labels: &HashSet<(&str, Option<StatusRowKey>)>) {
         if let Ok(mut mouse_states) = self.label_mouse_states.try_borrow_mut() {
-            mouse_states.retain(|project, _| projects.contains(project.as_str()));
+            mouse_states
+                .retain(|(project, label_row), _| labels.contains(&(project.as_str(), *label_row)));
         }
     }
 
@@ -359,7 +390,7 @@ pub(super) fn render_status_ordered_list(
     let transitions = state
         .status_list_groups
         .update_transitions(comparable_grouping(state, mode, &sections), Instant::now());
-    let labeled_projects: HashSet<&str> = sections
+    let labeled_projects: HashSet<(&str, Option<StatusRowKey>)> = sections
         .iter()
         .filter_map(|section| {
             section
@@ -367,6 +398,7 @@ pub(super) fn render_status_ordered_list(
                 .as_ref()
                 .map(|header| header.project.as_str())
                 .or(section.badge.as_deref())
+                .map(|project| (project, section.label_row))
         })
         .collect();
     state
@@ -404,6 +436,7 @@ pub(super) fn render_status_ordered_list(
             header,
             row_indices,
             badge,
+            label_row,
         } = section;
         let top_gap = if section_index == 0 {
             if badge.is_some() {
@@ -448,7 +481,9 @@ pub(super) fn render_status_ordered_list(
                 .get(&header.project)
                 .filter(|(transition, _)| *transition == GroupTransition::Formed)
                 .map(|(_, started_at)| *started_at);
-            let mouse_state = state.status_list_groups.label_mouse_state(&header.project);
+            let mouse_state = state
+                .status_list_groups
+                .label_mouse_state(&header.project, label_row);
             section_elements.push(render_group_header(
                 header,
                 roll_up,
@@ -475,7 +510,9 @@ pub(super) fn render_status_ordered_list(
                 section_elements.push(with_project_badge(
                     row,
                     project,
-                    state.status_list_groups.label_mouse_state(project),
+                    state
+                        .status_list_groups
+                        .label_mouse_state(project, label_row),
                     transition,
                     &label_look,
                     appearance,
@@ -504,13 +541,18 @@ pub(super) fn render_status_ordered_list(
 
 /// The projects shown with a group header and as a badged row, when this
 /// frame can be compared with the next to animate groups forming and
-/// dissolving: in status order without a search.
+/// dissolving: in status order without a search. The last-prompt order
+/// doesn't animate them, since a project can have several groups there.
 fn comparable_grouping(
     state: &VerticalTabsPanelState,
     mode: VerticalTabsSortMode,
     sections: &[ListSection],
 ) -> Option<(HashSet<String>, HashSet<String>)> {
-    if mode == VerticalTabsSortMode::GroupByProject || !state.search_query.is_empty() {
+    if matches!(
+        mode,
+        VerticalTabsSortMode::GroupByProject | VerticalTabsSortMode::LastPrompt
+    ) || !state.search_query.is_empty()
+    {
         return None;
     }
     let grouped = sections
@@ -552,11 +594,13 @@ pub(super) fn displayed_row_locators(
 
 /// Sorts the rows, applies the freeze rule, and splits them into sections:
 /// in status order, a project's rows form a group once there are two of them
-/// (rows of an unknown project never do); grouped by project, every project
-/// has a group. A collapsed group shows only its selected row, and while the
-/// order is frozen, the rows it showed last frame. A search shows every
-/// group expanded. Remembers the row order and the rows shown in collapsed
-/// groups for the next frame.
+/// (rows of an unknown project never do); in the last-prompt order, a run of
+/// two or more adjacent rows of a project does, so a project can have
+/// several groups; grouped by project, every project has a group. A
+/// collapsed group shows only its selected row, and while the order is
+/// frozen, the rows it showed last frame. A search shows every group
+/// expanded. Remembers the row order and the rows shown in collapsed groups
+/// for the next frame.
 fn layout_sections(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -565,7 +609,15 @@ fn layout_sections(
     app: &AppContext,
 ) -> Vec<ListSection> {
     let sort_inputs: Vec<StatusSortInput<'_>> = rows.iter().map(StatusRow::sort_input).collect();
-    let fresh_keys: Vec<StatusRowKey> = status_sorted_indices(&sort_inputs)
+    let is_last_prompt_order = mode == VerticalTabsSortMode::LastPrompt;
+    let fresh_order = if is_last_prompt_order {
+        let last_prompt_inputs: Vec<LastPromptSortInput> =
+            rows.iter().map(StatusRow::last_prompt_input).collect();
+        last_prompt_sorted_indices(&last_prompt_inputs)
+    } else {
+        status_sorted_indices(&sort_inputs)
+    };
+    let fresh_keys: Vec<StatusRowKey> = fresh_order
         .into_iter()
         .filter_map(|index| sort_inputs.get(index).map(|row| row.key))
         .collect();
@@ -587,6 +639,8 @@ fn layout_sections(
     let every_project_grouped = mode == VerticalTabsSortMode::GroupByProject;
     let groups = if every_project_grouped {
         group_by_project(&sort_inputs, &display_order)
+    } else if is_last_prompt_order {
+        group_adjacent_by_project(&sort_inputs, &display_order)
     } else {
         auto_group_by_project(&sort_inputs, &display_order)
     };
@@ -603,17 +657,28 @@ fn layout_sections(
     let mut shown_collapsed_rows = Vec::new();
     let mut sections = Vec::with_capacity(groups.len());
     for group in groups {
-        let Some(&lead_row_index) = group.row_indices.first() else {
+        let Some(&first_row_index) = group.row_indices.first() else {
             continue;
         };
+        let label_row = is_last_prompt_order
+            .then(|| rows.get(first_row_index).map(|row| row.key))
+            .flatten();
         if !every_project_grouped && group.row_indices.len() < 2 {
             sections.push(ListSection {
                 header: None,
                 badge: group.project.map(str::to_owned),
                 row_indices: group.row_indices,
+                label_row,
             });
             continue;
         }
+        // A collapsed header shows its group's most urgent row: the first in
+        // status order, and any of them in the last-prompt order.
+        let lead_row_index = if is_last_prompt_order {
+            most_urgent_row(&sort_inputs, &group.row_indices).unwrap_or(first_row_index)
+        } else {
+            first_row_index
+        };
         let project = group.project.unwrap_or(OTHER_PROJECT_LABEL).to_owned();
         let is_collapsed = !is_searching && collapsed_projects.contains(&project);
         let text = group_header_text(&group);
@@ -639,6 +704,7 @@ fn layout_sections(
             }),
             row_indices,
             badge: None,
+            label_row,
         });
     }
     state
@@ -2035,6 +2101,11 @@ pub(super) fn render_sort_mode_section(
             .finish(),
         );
     for (label, mode, mouse_state) in [
+        (
+            "Last prompt",
+            VerticalTabsSortMode::LastPrompt,
+            &state.last_prompt_sort_option_mouse_state,
+        ),
         (
             "Status",
             VerticalTabsSortMode::Status,

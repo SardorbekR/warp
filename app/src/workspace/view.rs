@@ -3833,6 +3833,8 @@ impl Workspace {
         {
             // Fork: status changes add age labels; keep them ticking.
             self.sync_vertical_tabs_status_age_tick(ctx);
+            // Fork: prompts and answers move their tab up in last-prompt order.
+            self.note_cli_agent_event_for_last_prompt_order(event, ctx);
             ctx.notify();
         }
     }
@@ -12853,6 +12855,10 @@ impl Workspace {
         }
 
         self.activate_tab(insert_index, ctx);
+        // Fork: a reopened tab goes to the top in last-prompt order.
+        if let Some(pane_group_id) = self.tabs.get(insert_index).map(|tab| tab.pane_group.id()) {
+            self.move_reopened_tab_to_top(pane_group_id, ctx);
+        }
 
         ctx.notify();
     }
@@ -16447,6 +16453,8 @@ impl Workspace {
         event: &pane_group::Event,
         ctx: &mut ViewContext<Self>,
     ) {
+        // Fork: a split or reopened pane moves its tab up in last-prompt order.
+        self.note_pane_group_event_for_last_prompt_order(&pane_group, ctx);
         match event {
             pane_group::Event::AppStateChanged => {
                 ctx.dispatch_global_action("workspace:save_app", ());
@@ -24381,6 +24389,8 @@ impl TypedActionView for Workspace {
             return;
         }
 
+        // Fork: tabs the user opens go to the top in last-prompt order.
+        let tabs_before_new_tab_action = self.tabs_before_new_tab_action(action, ctx);
         match action {
             ActivateTab(index) => self.activate_tab(*index, ctx),
             ActivateTabByNumber(num) => {
@@ -27002,6 +27012,7 @@ impl TypedActionView for Workspace {
                 self.show_team_switcher_dropdown(ctx);
             }
         };
+        self.move_tabs_opened_by_action_to_top(tabs_before_new_tab_action, ctx);
         if action.should_save_app_state_on_action() {
             ctx.dispatch_global_action("workspace:save_app", ());
         }

@@ -2783,6 +2783,18 @@ fn status_ordered_workspace_with_unread_tab(
     unread_tab_index: usize,
     ctx: &mut ViewContext<Workspace>,
 ) {
+    // The default last-prompt order keeps unread rows in place, so these
+    // tests use the status order unless they picked another one.
+    if crate::tab::vertical_tabs_sort_mode(ctx)
+        == crate::workspace::tab_settings::VerticalTabsSortMode::LastPrompt
+    {
+        workspace.handle_action(
+            &WorkspaceAction::SetVerticalTabsSortMode(
+                crate::workspace::tab_settings::VerticalTabsSortMode::Status,
+            ),
+            ctx,
+        );
+    }
     workspace.add_terminal_tab(false, ctx);
     workspace.add_terminal_tab(false, ctx);
     assert_eq!(workspace.active_tab_index, 2);
@@ -3296,6 +3308,13 @@ fn test_nested_headless_run_keeps_the_agent_row_running() {
         let workspace = mock_workspace(&mut app);
         // Three idle tabs with tab 2 active; tab 1 runs a plugin-backed agent.
         let agent_terminal_view = workspace.update(&mut app, |workspace, ctx| {
+            // The status order, which sorts a running agent first.
+            workspace.handle_action(
+                &WorkspaceAction::SetVerticalTabsSortMode(
+                    crate::workspace::tab_settings::VerticalTabsSortMode::Status,
+                ),
+                ctx,
+            );
             workspace.add_terminal_tab(false, ctx);
             workspace.add_terminal_tab(false, ctx);
             assert_eq!(workspace.active_tab_index, 2);

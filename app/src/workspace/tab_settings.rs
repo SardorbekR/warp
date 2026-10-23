@@ -410,9 +410,14 @@ settings::macros::implement_setting_for_enum!(
     rename_all = "snake_case"
 )]
 pub enum VerticalTabsSortMode {
+    /// The tab order, in which a tab moves to the top when it is opened or
+    /// split, or when the user prompts its agent or answers it; reading a
+    /// tab never moves it. Sessions waiting for an answer float on top.
+    /// Adjacent sessions of a project share a collapsible header.
+    #[default]
+    LastPrompt,
     /// Every session, sorted by how urgently it needs attention. A project's
     /// sessions gather under a collapsible header once there are two of them.
-    #[default]
     Status,
     /// Sessions grouped by project, groups ordered by their most urgent session.
     GroupByProject,

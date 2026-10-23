@@ -84,6 +84,7 @@ fn pane_name_actions_save_workspace_state() {
 #[test]
 fn sort_mode_change_does_not_save_workspace_state() {
     for mode in [
+        VerticalTabsSortMode::LastPrompt,
         VerticalTabsSortMode::Status,
         VerticalTabsSortMode::GroupByProject,
         VerticalTabsSortMode::Manual,

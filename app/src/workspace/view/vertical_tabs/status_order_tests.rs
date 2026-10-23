@@ -6,15 +6,16 @@ use warpui::EntityId;
 
 use super::{
     AttentionBucket, DARK_FILL, DEEP_TEXT, FreezeInputs, GroupHeaderText, GroupTransition,
-    KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, LIGHT_FILL, OTHER_PROJECT_LABEL, PALE_TEXT,
-    POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_COLOR_NAMES, PROJECT_HUES, ProjectGroup,
-    StatusRowKey, StatusRowNavigation, StatusSortInput, Tone, activity_age, attention_bucket,
-    auto_group_by_project, automatic_project_hue, badge_overhang, bounded_setting,
-    compact_age_label, dash_runs, group_by_project, group_header_text, group_transitions,
-    is_order_frozen, navigation_target, oklch, picked_project_color, project_color_index,
-    project_color_of_hue, project_hue, project_name, project_palette_index, project_pill_style,
-    reconcile_frozen_order, resolve_display_order, row_attention_bucket, row_display_status,
-    slide_progress, status_sorted_indices,
+    KEYBOARD_NAVIGATION_FREEZE_TIMEOUT, LIGHT_FILL, LastPromptSortInput, OTHER_PROJECT_LABEL,
+    PALE_TEXT, POINTER_IDLE_CAP, POINTER_IDLE_RELEASE, PROJECT_COLOR_NAMES, PROJECT_HUES,
+    ProjectGroup, StatusRowKey, StatusRowNavigation, StatusSortInput, Tone, activity_age,
+    attention_bucket, auto_group_by_project, automatic_project_hue, badge_overhang,
+    bounded_setting, compact_age_label, dash_runs, group_adjacent_by_project, group_by_project,
+    group_header_text, group_transitions, is_order_frozen, last_prompt_sorted_indices,
+    most_urgent_row, navigation_target, needs_answer, oklch, picked_project_color,
+    project_color_index, project_color_of_hue, project_hue, project_name, project_palette_index,
+    project_pill_style, reconcile_frozen_order, resolve_display_order, row_attention_bucket,
+    row_display_status, slide_progress, status_sorted_indices,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::pane_group::{PaneId, TerminalPaneId};
@@ -1433,4 +1434,253 @@ fn group_by_project_navigation_walks_each_group_in_turn() {
         visited.extend(current.and_then(|position| displayed.get(position).copied()));
     }
     assert_eq!(visited, displayed, "every row once, in display order");
+}
+
+/// A row of the last-prompt order at the given (tab, pane) rank that doesn't
+/// need an answer; tests override other fields with struct-update syntax.
+fn prompt_row(key: StatusRowKey, fallback_rank: (usize, usize)) -> LastPromptSortInput {
+    LastPromptSortInput {
+        key,
+        needs_answer: false,
+        age: None,
+        fallback_rank,
+    }
+}
+
+#[test]
+fn only_a_live_blocked_session_needs_an_answer() {
+    assert!(needs_answer(Some(&blocked()), false));
+    // An interrupted session stays in place until it's resumed.
+    assert!(!needs_answer(Some(&blocked()), true));
+    assert!(!needs_answer(None, true));
+    for status in [
+        None,
+        Some(ConversationStatus::InProgress),
+        Some(ConversationStatus::Success),
+        Some(ConversationStatus::Error),
+        Some(ConversationStatus::Cancelled),
+        Some(ConversationStatus::TransientError),
+        Some(ConversationStatus::WaitingForEvents),
+    ] {
+        assert!(!needs_answer(status.as_ref(), false), "{status:?}");
+    }
+}
+
+#[test]
+fn last_prompt_order_keeps_the_tab_order_whatever_the_age() {
+    // Activity (a finished, unread or running session) never moves a row:
+    // only the tab order, which prompts change, does.
+    let rows = vec![
+        LastPromptSortInput {
+            age: secs(3_600),
+            ..prompt_row(key(1), (2, 0))
+        },
+        LastPromptSortInput {
+            age: secs(1),
+            ..prompt_row(key(2), (0, 1))
+        },
+        prompt_row(key(3), (0, 0)),
+        LastPromptSortInput {
+            age: secs(5),
+            ..prompt_row(key(4), (1, 0))
+        },
+    ];
+    assert_eq!(last_prompt_sorted_indices(&rows), vec![2, 1, 3, 0]);
+}
+
+#[test]
+fn last_prompt_order_floats_requests_newest_first() {
+    let rows = vec![
+        prompt_row(key(1), (0, 0)),
+        LastPromptSortInput {
+            needs_answer: true,
+            age: secs(300),
+            ..prompt_row(key(2), (1, 0))
+        },
+        prompt_row(key(3), (2, 0)),
+        LastPromptSortInput {
+            needs_answer: true,
+            age: secs(4),
+            ..prompt_row(key(4), (3, 0))
+        },
+        // A request without a known age sits below the other requests.
+        LastPromptSortInput {
+            needs_answer: true,
+            ..prompt_row(key(5), (4, 0))
+        },
+        // Two requests of the same age keep their tab order.
+        LastPromptSortInput {
+            needs_answer: true,
+            age: secs(300),
+            ..prompt_row(key(6), (0, 1))
+        },
+    ];
+    assert_eq!(last_prompt_sorted_indices(&rows), vec![3, 5, 1, 4, 0, 2]);
+}
+
+#[test]
+fn interrupted_sessions_stay_in_place_in_the_last_prompt_order() {
+    let rows = vec![
+        prompt_row(key(1), (0, 0)),
+        LastPromptSortInput {
+            needs_answer: needs_answer(Some(&blocked()), true),
+            age: secs(1),
+            ..prompt_row(key(2), (1, 0))
+        },
+        LastPromptSortInput {
+            needs_answer: needs_answer(Some(&blocked()), false),
+            age: secs(60),
+            ..prompt_row(key(3), (2, 0))
+        },
+    ];
+    assert_eq!(last_prompt_sorted_indices(&rows), vec![2, 0, 1]);
+}
+
+#[test]
+fn last_prompt_order_is_deterministic_and_handles_empty_input() {
+    assert!(last_prompt_sorted_indices(&[]).is_empty());
+    let rows = vec![
+        prompt_row(key(2), (0, 0)),
+        prompt_row(key(1), (0, 0)),
+        LastPromptSortInput {
+            needs_answer: true,
+            ..prompt_row(key(4), (1, 0))
+        },
+        LastPromptSortInput {
+            needs_answer: true,
+            ..prompt_row(key(3), (1, 0))
+        },
+    ];
+    let tabs = |rows: &[LastPromptSortInput]| -> Vec<EntityId> {
+        last_prompt_sorted_indices(rows)
+            .into_iter()
+            .map(|index| rows[index].key.pane_group_id)
+            .collect()
+    };
+    let expected = tabs(&rows);
+    assert_eq!(
+        expected,
+        [3, 4, 1, 2].map(EntityId::from_usize).to_vec(),
+        "ties fall back to the key"
+    );
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    assert_eq!(tabs(&reversed), expected);
+}
+
+/// Rows of the given projects, in that order, for the grouping tests.
+fn project_rows<'a>(projects: &[Option<&'a str>]) -> Vec<StatusSortInput<'a>> {
+    projects
+        .iter()
+        .enumerate()
+        .map(|(index, project)| StatusSortInput {
+            project: *project,
+            fallback_rank: (index, 0),
+            ..row(key(index + 1), AttentionBucket::Idle)
+        })
+        .collect()
+}
+
+fn group_rows(groups: &[ProjectGroup<'_>]) -> Vec<(Option<String>, Vec<usize>)> {
+    groups
+        .iter()
+        .map(|group| (group.project.map(str::to_owned), group.row_indices.clone()))
+        .collect()
+}
+
+#[test]
+fn adjacent_grouping_gives_a_project_one_group_per_run() {
+    let mut rows = project_rows(&[
+        Some("chorsu"),
+        Some("chorsu"),
+        Some("warp"),
+        Some("chorsu"),
+        None,
+        None,
+        Some("chorsu"),
+        Some("chorsu"),
+    ]);
+    rows[1].bucket = AttentionBucket::NeedsYou;
+    rows[7].bucket = AttentionBucket::NeedsYou;
+    let order: Vec<usize> = (0..rows.len()).collect();
+    let groups = group_adjacent_by_project(&rows, &order);
+    assert_eq!(
+        group_rows(&groups),
+        vec![
+            (Some("chorsu".to_owned()), vec![0, 1]),
+            (Some("warp".to_owned()), vec![2]),
+            (Some("chorsu".to_owned()), vec![3]),
+            // Rows of an unknown project never group, even side by side.
+            (None, vec![4]),
+            (None, vec![5]),
+            (Some("chorsu".to_owned()), vec![6, 7]),
+        ]
+    );
+    let needs_you: Vec<usize> = groups.iter().map(|group| group.needs_you_count).collect();
+    assert_eq!(needs_you, vec![1, 0, 0, 0, 0, 1]);
+}
+
+#[test]
+fn adjacent_grouping_follows_the_display_order() {
+    // The mockup's second frame: prompting a Chorsu session lower down moves
+    // it next to the new Chorsu tab on top, so the two share a header, and
+    // the Chorsu group it left shrinks to a lone row.
+    let rows = project_rows(&[Some("chorsu"), Some("warp"), Some("chorsu"), Some("chorsu")]);
+    let before = group_adjacent_by_project(&rows, &[0, 1, 2, 3]);
+    assert_eq!(
+        group_rows(&before),
+        vec![
+            (Some("chorsu".to_owned()), vec![0]),
+            (Some("warp".to_owned()), vec![1]),
+            (Some("chorsu".to_owned()), vec![2, 3]),
+        ]
+    );
+    let after = group_adjacent_by_project(&rows, &[3, 0, 1, 2]);
+    assert_eq!(
+        group_rows(&after),
+        vec![
+            (Some("chorsu".to_owned()), vec![3, 0]),
+            (Some("warp".to_owned()), vec![1]),
+            (Some("chorsu".to_owned()), vec![2]),
+        ]
+    );
+}
+
+#[test]
+fn adjacent_grouping_skips_out_of_range_indices_and_handles_empty_input() {
+    let rows = project_rows(&[Some("chorsu"), Some("chorsu")]);
+    let groups = group_adjacent_by_project(&rows, &[9, 0, 4, 1, usize::MAX]);
+    assert_eq!(
+        group_rows(&groups),
+        vec![(Some("chorsu".to_owned()), vec![0, 1])]
+    );
+    assert!(group_adjacent_by_project(&rows, &[]).is_empty());
+    assert!(group_adjacent_by_project(&[], &[0, 1]).is_empty());
+}
+
+#[test]
+fn most_urgent_row_picks_by_the_status_rules() {
+    let rows = vec![
+        StatusSortInput {
+            age: secs(1),
+            ..row(key(1), AttentionBucket::Idle)
+        },
+        StatusSortInput {
+            age: secs(90),
+            ..row(key(2), AttentionBucket::NeedsYou)
+        },
+        StatusSortInput {
+            age: secs(5),
+            ..row(key(3), AttentionBucket::NeedsYou)
+        },
+        StatusSortInput {
+            is_unread: true,
+            ..row(key(4), AttentionBucket::Unread)
+        },
+    ];
+    assert_eq!(most_urgent_row(&rows, &[0, 1, 2, 3]), Some(2));
+    assert_eq!(most_urgent_row(&rows, &[3, 0]), Some(3));
+    assert_eq!(most_urgent_row(&rows, &[0, 7]), Some(0));
+    assert_eq!(most_urgent_row(&rows, &[7, 8]), None);
+    assert_eq!(most_urgent_row(&rows, &[]), None);
 }

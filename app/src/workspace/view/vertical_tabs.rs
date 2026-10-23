@@ -1,3 +1,4 @@
+mod last_prompt_order;
 mod project_color_menu;
 mod status_list;
 mod status_order;
@@ -798,6 +799,10 @@ pub(super) struct VerticalTabsPanelState {
     status_list_last_order: RefCell<Vec<StatusRowKey>>,
     /// Status order: what the project groups remember between frames.
     status_list_groups: status_list::StatusListGroups,
+    /// Last-prompt order: what the workspace remembers to tell when to move
+    /// a tab to the top.
+    last_prompt_order: last_prompt_order::LastPromptOrderState,
+    last_prompt_sort_option_mouse_state: MouseStateHandle,
     status_sort_option_mouse_state: MouseStateHandle,
     group_by_project_sort_option_mouse_state: MouseStateHandle,
     manual_sort_option_mouse_state: MouseStateHandle,
@@ -854,6 +859,8 @@ impl Default for VerticalTabsPanelState {
             status_list_pointer: Rc::default(),
             status_list_last_order: RefCell::default(),
             status_list_groups: Default::default(),
+            last_prompt_order: Default::default(),
+            last_prompt_sort_option_mouse_state: Default::default(),
             status_sort_option_mouse_state: Default::default(),
             group_by_project_sort_option_mouse_state: Default::default(),
             manual_sort_option_mouse_state: Default::default(),
@@ -881,6 +888,14 @@ impl VerticalTabsPanelState {
     pub(super) fn reset_status_list_hover(&self) {
         if let Ok(mut mouse_state) = self.status_list_hover_state.lock() {
             mouse_state.reset_interaction_state();
+        }
+    }
+
+    /// Forgets the row order shown last frame, so the next frame shows the
+    /// fresh order even if the list is frozen; later frames freeze that one.
+    fn release_status_list_freeze_once(&self) {
+        if let Ok(mut last_order) = self.status_list_last_order.try_borrow_mut() {
+            last_order.clear();
         }
     }
 

@@ -98,17 +98,33 @@ fn use_vertical_tabs_defaults_to_true_in_fork() {
 }
 
 #[test]
-fn vertical_tabs_sort_mode_defaults_to_status() {
+fn vertical_tabs_sort_mode_defaults_to_last_prompt() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
 
         TabSettings::handle(&app).read(&app, |settings, _ctx| {
             assert_eq!(
                 *settings.vertical_tabs_sort_mode.value(),
-                VerticalTabsSortMode::Status
+                VerticalTabsSortMode::LastPrompt
             );
         });
     });
+}
+
+#[test]
+fn vertical_tabs_sort_modes_keep_their_settings_file_names() {
+    use settings_value::SettingsValue as _;
+
+    for (mode, name) in [
+        (VerticalTabsSortMode::LastPrompt, "last_prompt"),
+        (VerticalTabsSortMode::Status, "status"),
+        (VerticalTabsSortMode::GroupByProject, "group_by_project"),
+        (VerticalTabsSortMode::Manual, "manual"),
+    ] {
+        let value = mode.to_file_value();
+        assert_eq!(value, serde_json::Value::String(name.to_owned()));
+        assert_eq!(VerticalTabsSortMode::from_file_value(&value), Some(mode));
+    }
 }
 
 #[test]

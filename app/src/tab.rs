@@ -266,8 +266,8 @@ pub fn vertical_tabs_sort_mode(ctx: &AppContext) -> VerticalTabsSortMode {
     *TabSettings::as_ref(ctx).vertical_tabs_sort_mode.value()
 }
 
-/// True when the vertical tabs panel orders rows by status (Status or
-/// Group-by-project mode) instead of the manual tab order.
+/// True when the vertical tabs panel shows its fork's row list (Last-prompt,
+/// Status or Group-by-project mode) instead of the manual tab order.
 pub fn is_vertical_tabs_status_order_active(ctx: &AppContext) -> bool {
     !matches!(vertical_tabs_sort_mode(ctx), VerticalTabsSortMode::Manual)
 }

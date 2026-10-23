@@ -206,6 +206,109 @@ fn group_rows_by_project<'a>(
     groups
 }
 
+/// The per-row data the last-prompt order needs ([`last_prompt_sorted_indices`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LastPromptSortInput {
+    pub key: StatusRowKey,
+    /// The session is waiting for the user's answer (see [`needs_answer`]).
+    pub needs_answer: bool,
+    /// Time since the session's last status change: for a session waiting
+    /// for an answer, how long ago it asked.
+    pub age: Option<Duration>,
+    /// (tab position, pane position). The workspace keeps its tabs in the
+    /// order they were last prompted, newest first.
+    pub fallback_rank: (usize, usize),
+}
+
+/// Whether a row floats to the top of the last-prompt order: its agent is
+/// blocked on the user (a permission or a question). An interrupted session
+/// (its agent died in a crash or restart) waits for the user too, but stays
+/// in place until it is resumed and prompted.
+pub(super) fn needs_answer(status: Option<&ConversationStatus>, is_interrupted: bool) -> bool {
+    !is_interrupted && matches!(status, Some(ConversationStatus::Blocked { .. }))
+}
+
+fn compare_last_prompt_rows(a: &LastPromptSortInput, b: &LastPromptSortInput) -> Ordering {
+    // Rows waiting for an answer first.
+    b.needs_answer
+        .cmp(&a.needs_answer)
+        // Among those, the newest request first; rows without a known age
+        // last.
+        .then_with(|| {
+            if !(a.needs_answer && b.needs_answer) {
+                return Ordering::Equal;
+            }
+            match (a.age, b.age) {
+                (Some(a_age), Some(b_age)) => a_age.cmp(&b_age),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        })
+        .then_with(|| a.fallback_rank.cmp(&b.fallback_rank))
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+/// Returns indices into `rows` in the last-prompt order: the rows waiting for
+/// the user's answer, newest request first, then every other row in tab
+/// order, which the workspace keeps sorted by when each tab was last
+/// prompted. Ties fall back to the rank, then the key (fully deterministic).
+pub(super) fn last_prompt_sorted_indices(rows: &[LastPromptSortInput]) -> Vec<usize> {
+    let mut entries: Vec<(usize, &LastPromptSortInput)> = rows.iter().enumerate().collect();
+    entries.sort_by(|(_, a), (_, b)| compare_last_prompt_rows(a, b));
+    entries.into_iter().map(|(index, _)| index).collect()
+}
+
+/// The last-prompt order's grouping: consecutive rows (in `order`, indices
+/// into `rows`) of the same project form a group, so a project shows as
+/// several groups when rows of other projects sit between its rows. Rows
+/// whose project is unknown are never grouped, so each is a group of its
+/// own. The caller shows a header only for groups of two or more rows.
+/// Out-of-range indices are skipped.
+pub(super) fn group_adjacent_by_project<'a>(
+    rows: &[StatusSortInput<'a>],
+    order: &[usize],
+) -> Vec<ProjectGroup<'a>> {
+    let mut groups: Vec<ProjectGroup<'a>> = Vec::new();
+    for &row_index in order {
+        let Some(row) = rows.get(row_index) else {
+            continue;
+        };
+        let joins_previous = row.project.is_some()
+            && groups
+                .last()
+                .is_some_and(|group| group.project == row.project);
+        if !joins_previous {
+            groups.push(ProjectGroup {
+                project: row.project,
+                row_indices: Vec::new(),
+                needs_you_count: 0,
+            });
+        }
+        if let Some(group) = groups.last_mut() {
+            group.row_indices.push(row_index);
+            if row.bucket == AttentionBucket::NeedsYou {
+                group.needs_you_count = group.needs_you_count.saturating_add(1);
+            }
+        }
+    }
+    groups
+}
+
+/// The most urgent of `row_indices` (indices into `rows`) by the status
+/// order's rules, whose age and status a collapsed group header shows. `None`
+/// when none of them is in range.
+pub(super) fn most_urgent_row(
+    rows: &[StatusSortInput<'_>],
+    row_indices: &[usize],
+) -> Option<usize> {
+    row_indices
+        .iter()
+        .filter_map(|&index| rows.get(index).map(|row| (index, row)))
+        .min_by(|(_, a), (_, b)| compare_rows(a, b))
+        .map(|(index, _)| index)
+}
+
 /// Label used for rows whose project can't be determined.
 pub(super) const OTHER_PROJECT_LABEL: &str = "Other";
 
