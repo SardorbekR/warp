@@ -359,7 +359,7 @@ impl PersistedCLIAgentSession {
         let evidently_interactive = launch.started_as_agent
             || context.showed_interactive_prompt
             || previous_same_session.is_some_and(|previous| previous.evidently_interactive);
-        if !has_activity && !(keep_awaiting_first_prompt && evidently_interactive) {
+        if !(has_activity || (keep_awaiting_first_prompt && evidently_interactive)) {
             return None;
         }
         let mut record = Self {
