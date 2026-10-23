@@ -3140,6 +3140,7 @@ fn interrupted_cli_agent_session(
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
         session_name: None,
+        awaiting_first_prompt: false,
     }
 }
 

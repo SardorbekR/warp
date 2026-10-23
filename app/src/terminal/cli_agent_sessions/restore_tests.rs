@@ -33,6 +33,7 @@ fn record(
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
         session_name: None,
+        awaiting_first_prompt: false,
     }
 }
 
@@ -892,4 +893,214 @@ fn sessions_are_evidently_interactive_once_seen_as_such() {
     let restored = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
     assert!(!restored.evidently_interactive);
     assert!(restored.can_resume_here());
+}
+
+#[test]
+fn a_session_awaiting_its_first_prompt_is_kept_only_when_interactive() {
+    // Only `SessionStart` was seen: the session has an id but hasn't done anything.
+    let session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/proj"), None),
+    );
+    let awaiting = PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+        &session,
+        None,
+        None,
+        LOCAL_AGENT,
+        5,
+    )
+    .expect("an interactive session is kept for a restart");
+    assert!(awaiting.awaiting_first_prompt);
+    assert_eq!(awaiting.session_id.as_deref(), Some(CLAUDE_ID));
+    assert_eq!(awaiting.launch_cwd.as_deref(), Some("/proj"));
+    assert_eq!(awaiting.title, None);
+    assert!(awaiting.can_resume_here());
+
+    // A run Warp can't tell is interactive (e.g. `claude -p` in a script) isn't.
+    assert_eq!(
+        PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+            &session, None, None, UNOBSERVED, 5,
+        ),
+        None
+    );
+    // An idle prompt shows it is.
+    let mut idle = session.clone();
+    idle.session_context.showed_interactive_prompt = true;
+    assert!(
+        PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+            &idle, None, None, UNOBSERVED, 5,
+        )
+        .is_some_and(|record| record.awaiting_first_prompt)
+    );
+}
+
+#[test]
+fn activity_ends_awaiting_the_first_prompt() {
+    let session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/proj"), None),
+    );
+    let awaiting = PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+        &session,
+        None,
+        None,
+        LOCAL_AGENT,
+        5,
+    )
+    .expect("an interactive session is kept for a restart");
+
+    let prompted = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/proj"), Some("fix the login bug")),
+    );
+    for live in [
+        PersistedCLIAgentSession::from_live_session(
+            &prompted,
+            None,
+            Some(&awaiting),
+            LOCAL_AGENT,
+            6,
+        ),
+        PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+            &prompted,
+            None,
+            Some(&awaiting),
+            LOCAL_AGENT,
+            6,
+        ),
+    ] {
+        let live = live.expect("a prompted session is persisted");
+        assert!(!live.awaiting_first_prompt);
+        assert_eq!(live.title.as_deref(), Some("fix the login bug"));
+        assert!(!awaiting.has_same_content(&live), "the change is saved");
+        assert_eq!(live.updated_at_unix_ms, 6);
+    }
+}
+
+#[test]
+fn a_session_saved_with_activity_never_awaits_its_first_prompt_again() {
+    // e.g. a restored session that only ever asked for a permission, resumed in a new instance
+    // that hasn't reported anything yet.
+    let mut previous = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    previous.title = None;
+    let session = live_session(
+        CLIAgent::Claude,
+        context(Some(CLAUDE_ID), Some("/proj"), None),
+    );
+    let live = PersistedCLIAgentSession::from_live_session_or_awaiting_first_prompt(
+        &session,
+        None,
+        Some(&previous),
+        LOCAL_AGENT,
+        6,
+    )
+    .expect("the session is persisted");
+    assert!(!live.awaiting_first_prompt);
+    assert!(previous.has_same_content(&live));
+}
+
+#[test]
+fn awaiting_first_prompt_round_trips_and_is_omitted_when_unset() {
+    let mut awaiting = record(CLIAgent::Codex, Some(CODEX_ID), Some("/proj"));
+    awaiting.title = None;
+    awaiting.awaiting_first_prompt = true;
+    let json = awaiting.to_json().expect("record should serialize");
+    assert_eq!(PersistedCLIAgentSession::from_json(&json), Some(awaiting));
+
+    let used = record(CLIAgent::Codex, Some(CODEX_ID), Some("/proj"));
+    let json = used.to_json().expect("record should serialize");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(value.get("awaiting_first_prompt"), None);
+
+    // Records from before this field existed were only saved once the session had done
+    // something.
+    let json = format!(r#"{{"v":1,"agent":"Codex","session_id":"{CODEX_ID}"}}"#);
+    let older = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
+    assert!(!older.awaiting_first_prompt);
+}
+
+#[test]
+fn a_minimal_record_written_outside_warp_resumes_in_its_folder() {
+    // The keys a record written by a migration script has.
+    let json = format!(
+        r#"{{"v":1,"agent":"Claude","session_id":"{CLAUDE_ID}","launch_cwd":"/Users/me/SideProjects/Chorsu — Project Inbox","launched_locally":true,"evidently_interactive":true,"updated_at_unix_ms":1792740000000,"session_name":"Glass border styling"}}"#
+    );
+    let restored = PersistedCLIAgentSession::from_json(&json).expect("record should parse");
+    assert!(restored.can_resume_here());
+    assert!(restored.evidently_interactive);
+    assert!(!restored.awaiting_first_prompt);
+    assert_eq!(restored.session_command(None), SessionCommand::Resume);
+    assert_eq!(
+        restored.display_name().as_deref(),
+        Some("Glass border styling")
+    );
+    assert_eq!(
+        restored.resume_command_steps(ShellType::Zsh, Some("/Users/me")),
+        Some(vec![
+            "cd '/Users/me/SideProjects/Chorsu — Project Inbox'".to_owned(),
+            format!("claude --resume {CLAUDE_ID}"),
+        ])
+    );
+}
+
+#[test]
+fn only_an_awaiting_session_without_a_conversation_starts_anew() {
+    let used = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/proj"));
+    let mut awaiting = used.clone();
+    awaiting.awaiting_first_prompt = true;
+    for transcript_exists in [Some(true), Some(false), None] {
+        assert_eq!(
+            used.session_command(transcript_exists),
+            SessionCommand::Resume,
+            "{transcript_exists:?}"
+        );
+    }
+    // e.g. started with `--resume` and not used since.
+    assert_eq!(awaiting.session_command(Some(true)), SessionCommand::Resume);
+    // Unknown: resuming is what earlier builds did.
+    assert_eq!(awaiting.session_command(None), SessionCommand::Resume);
+    assert_eq!(
+        awaiting.session_command(Some(false)),
+        SessionCommand::StartNew
+    );
+}
+
+#[test]
+fn start_new_commands_open_the_agent_in_the_launch_directory() {
+    let claude = record(CLIAgent::Claude, Some(CLAUDE_ID), Some("/Users/me/my proj"));
+    assert_eq!(
+        claude.command_steps(SessionCommand::StartNew, ShellType::Zsh, Some("/Users/me")),
+        Some(vec![
+            "cd '/Users/me/my proj'".to_owned(),
+            "claude".to_owned()
+        ])
+    );
+    assert_eq!(
+        claude.command_steps(
+            SessionCommand::StartNew,
+            ShellType::Zsh,
+            Some("/Users/me/my proj")
+        ),
+        Some(vec!["claude".to_owned()])
+    );
+    assert_eq!(
+        claude.command_line(SessionCommand::StartNew, ShellType::Bash),
+        Some("cd '/Users/me/my proj' && claude".to_owned())
+    );
+    let codex = record(CLIAgent::Codex, Some(CODEX_ID), None);
+    assert_eq!(
+        codex.command_line(SessionCommand::StartNew, ShellType::Fish),
+        Some("codex".to_owned())
+    );
+    // Resuming is unchanged.
+    assert_eq!(
+        codex.command_line(SessionCommand::Resume, ShellType::Fish),
+        codex.resume_command_line(ShellType::Fish)
+    );
+    let mut gemini = claude.clone();
+    gemini.agent = CLIAgent::Gemini;
+    assert_eq!(
+        gemini.command_line(SessionCommand::StartNew, ShellType::Bash),
+        None
+    );
 }

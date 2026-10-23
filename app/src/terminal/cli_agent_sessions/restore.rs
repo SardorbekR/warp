@@ -87,6 +87,23 @@ pub struct PersistedCLIAgentSession {
     /// by the pane, and not compared by [`Self::has_same_content`]. Missing in older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_name: Option<String>,
+    /// Fork: the session hadn't done anything yet (no prompt, reply, summary or status change)
+    /// when it was saved, e.g. an agent opened in a tab and not used before Warp quit or
+    /// crashed. Such a record only serves a restart: resuming it resumes its conversation when
+    /// there is one (e.g. it was started with `--resume`) and otherwise starts a new session in
+    /// the launch directory. Missing in older records, which were only saved once the session
+    /// had done something.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub awaiting_first_prompt: bool,
+}
+
+/// What the commands that bring a saved session back do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Resume the saved session's conversation.
+    Resume,
+    /// Start a new session of the same agent, for a saved session that had no conversation.
+    StartNew,
 }
 
 /// What a pane saw of how the agent session reporting through it was started.
@@ -98,6 +115,10 @@ pub struct LaunchObservation {
     /// The pane's running command is the agent itself (directly or through an alias), rather
     /// than e.g. a script that runs it.
     pub started_as_agent: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Unknown statuses (e.g. written by a newer build) are dropped instead of invalidating the
@@ -247,6 +268,7 @@ impl PersistedCLIAgentSession {
             updated_at_unix_ms: self.updated_at_unix_ms,
             last_activity_at_unix_ms: self.last_activity_at_unix_ms.filter(|at| *at > 0),
             session_name: self.session_name.as_deref().and_then(clean_session_name),
+            awaiting_first_prompt: self.awaiting_first_prompt,
         })
     }
 
@@ -270,6 +292,30 @@ impl PersistedCLIAgentSession {
         previous: Option<&Self>,
         launch: LaunchObservation,
         now_unix_ms: i64,
+    ) -> Option<Self> {
+        Self::from_live(session, pane_cwd, previous, launch, now_unix_ms, false)
+    }
+
+    /// Fork: like [`Self::from_live_session`], but an evidently interactive session that hasn't
+    /// done anything yet is kept too, marked [`Self::awaiting_first_prompt`], so that a restart
+    /// brings back the agent that was open in the pane.
+    pub fn from_live_session_or_awaiting_first_prompt(
+        session: &CLIAgentSession,
+        pane_cwd: Option<&str>,
+        previous: Option<&Self>,
+        launch: LaunchObservation,
+        now_unix_ms: i64,
+    ) -> Option<Self> {
+        Self::from_live(session, pane_cwd, previous, launch, now_unix_ms, true)
+    }
+
+    fn from_live(
+        session: &CLIAgentSession,
+        pane_cwd: Option<&str>,
+        previous: Option<&Self>,
+        launch: LaunchObservation,
+        now_unix_ms: i64,
+        keep_awaiting_first_prompt: bool,
     ) -> Option<Self> {
         let agent = session.agent;
         if !is_resumable_agent(agent) {
@@ -304,16 +350,18 @@ impl PersistedCLIAgentSession {
         let has_activity = title.is_some()
             || context.title_like_text().is_some()
             || non_empty(context.response.as_deref()).is_some()
-            || !matches!(session.status, CLIAgentSessionStatus::InProgress);
-        if !has_activity {
-            return None;
-        }
+            || !matches!(session.status, CLIAgentSessionStatus::InProgress)
+            // Once saved with activity, a session stays a conversation to resume.
+            || previous_same_session.is_some_and(|previous| !previous.awaiting_first_prompt);
 
         let launched_locally = launch.launched_locally
             || previous_same_session.is_some_and(|previous| previous.launched_locally);
         let evidently_interactive = launch.started_as_agent
             || context.showed_interactive_prompt
             || previous_same_session.is_some_and(|previous| previous.evidently_interactive);
+        if !has_activity && !(keep_awaiting_first_prompt && evidently_interactive) {
+            return None;
+        }
         let mut record = Self {
             agent,
             session_id: Some(session_id),
@@ -331,6 +379,7 @@ impl PersistedCLIAgentSession {
                 .and_then(|previous| previous.last_activity_at_unix_ms),
             // Kept in step with the live session by the pane.
             session_name: previous_same_session.and_then(|previous| previous.session_name.clone()),
+            awaiting_first_prompt: !has_activity,
         };
         if let Some(previous) = previous
             && previous.has_same_content(&record)
@@ -351,6 +400,7 @@ impl PersistedCLIAgentSession {
             && self.remote_host == other.remote_host
             && self.launched_locally == other.launched_locally
             && self.evidently_interactive == other.evidently_interactive
+            && self.awaiting_first_prompt == other.awaiting_first_prompt
     }
 
     pub fn is_remote(&self) -> bool {
@@ -362,6 +412,18 @@ impl PersistedCLIAgentSession {
     /// the command.
     pub fn can_resume_here(&self) -> bool {
         !self.is_remote() && self.launched_locally
+    }
+
+    /// Fork: how to bring this session back, given whether its transcript exists on this
+    /// machine (see [`transcript_exists`]; `None` when that can't be determined). Only a session
+    /// saved before it did anything, and known to have no conversation, starts anew: resuming it
+    /// would fail. Whether the transcript exists only matters for such sessions.
+    pub fn session_command(&self, transcript_exists: Option<bool>) -> SessionCommand {
+        if self.awaiting_first_prompt && transcript_exists == Some(false) {
+            SessionCommand::StartNew
+        } else {
+            SessionCommand::Resume
+        }
     }
 
     /// Fork: what to call the session: its name, else [`Self::display_title`].
@@ -387,16 +449,24 @@ impl PersistedCLIAgentSession {
 
     /// The agent command that resumes this session, without changing directories.
     pub fn agent_resume_command(&self, shell_type: ShellType) -> Option<String> {
+        self.agent_command(SessionCommand::Resume, shell_type)
+    }
+
+    /// The agent command that brings this session back as `command` says, without changing
+    /// directories.
+    pub fn agent_command(&self, command: SessionCommand, shell_type: ShellType) -> Option<String> {
         let session_id = self.session_id.as_deref().and_then(valid_session_id);
-        let command = match (self.agent, session_id) {
-            (CLIAgent::Claude, Some(id)) => {
+        let command = match (self.agent, command, session_id) {
+            (CLIAgent::Claude, SessionCommand::StartNew, _) => "claude".to_owned(),
+            (CLIAgent::Claude, SessionCommand::Resume, Some(id)) => {
                 format!("claude --resume {}", quote_shell_arg(id, shell_type))
             }
-            (CLIAgent::Claude, None) => "claude --continue".to_owned(),
-            (CLIAgent::Codex, Some(id)) => {
+            (CLIAgent::Claude, SessionCommand::Resume, None) => "claude --continue".to_owned(),
+            (CLIAgent::Codex, SessionCommand::StartNew, _) => "codex".to_owned(),
+            (CLIAgent::Codex, SessionCommand::Resume, Some(id)) => {
                 format!("codex resume {}", quote_shell_arg(id, shell_type))
             }
-            (CLIAgent::Codex, None) => "codex resume --last".to_owned(),
+            (CLIAgent::Codex, SessionCommand::Resume, None) => "codex resume --last".to_owned(),
             (
                 CLIAgent::Gemini
                 | CLIAgent::Amp
@@ -417,6 +487,7 @@ impl PersistedCLIAgentSession {
                 | CLIAgent::WarpTui
                 | CLIAgent::Unknown,
                 _,
+                _,
             ) => return None,
         };
         Some(command)
@@ -431,7 +502,17 @@ impl PersistedCLIAgentSession {
         shell_type: ShellType,
         pane_cwd: Option<&str>,
     ) -> Option<Vec<String>> {
-        let agent_command = self.agent_resume_command(shell_type)?;
+        self.command_steps(SessionCommand::Resume, shell_type, pane_cwd)
+    }
+
+    /// Like [`Self::resume_command_steps`], for `command`.
+    pub fn command_steps(
+        &self,
+        command: SessionCommand,
+        shell_type: ShellType,
+        pane_cwd: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let agent_command = self.agent_command(command, shell_type)?;
         let mut steps = Vec::with_capacity(2);
         if let Some(launch_cwd) = non_empty(self.launch_cwd.as_deref())
             && !paths_match(launch_cwd, pane_cwd)
@@ -444,7 +525,12 @@ impl PersistedCLIAgentSession {
 
     /// A single command line that resumes this session from any directory.
     pub fn resume_command_line(&self, shell_type: ShellType) -> Option<String> {
-        let agent_command = self.agent_resume_command(shell_type)?;
+        self.command_line(SessionCommand::Resume, shell_type)
+    }
+
+    /// Like [`Self::resume_command_line`], for `command`.
+    pub fn command_line(&self, command: SessionCommand, shell_type: ShellType) -> Option<String> {
+        let agent_command = self.agent_command(command, shell_type)?;
         let Some(launch_cwd) = non_empty(self.launch_cwd.as_deref()) else {
             return Some(agent_command);
         };

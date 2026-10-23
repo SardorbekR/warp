@@ -96,6 +96,7 @@ fn restored_record() -> PersistedCLIAgentSession {
         updated_at_unix_ms: 1_000,
         last_activity_at_unix_ms: None,
         session_name: None,
+        awaiting_first_prompt: false,
     }
 }
 
@@ -1779,4 +1780,243 @@ fn escape_write_during_a_turn_is_observed() {
             assert_eq!(session.status, CLIAgentSessionStatus::InProgress);
         });
     })
+}
+
+/// A Codex session id without a transcript on any machine running these tests.
+const FRESH_CODEX_SESSION_ID: &str = "0b9e3c2a-5d1f-4e8b-9a7c-6f2e1d0c3b4a";
+
+/// The record of a session that was saved before it did anything.
+fn awaiting_record(agent: CLIAgent, session_id: &str) -> PersistedCLIAgentSession {
+    PersistedCLIAgentSession {
+        agent,
+        session_id: Some(session_id.to_owned()),
+        title: None,
+        awaiting_first_prompt: true,
+        ..restored_record()
+    }
+}
+
+fn pending_steps(app: &App, terminal: &ViewHandle<TerminalView>) -> Vec<(ResumeStep, String)> {
+    terminal.read(app, |view, _| {
+        view.cli_agent_session_restore
+            .pending_resume_steps
+            .iter()
+            .cloned()
+            .collect()
+    })
+}
+
+#[test]
+fn a_fresh_agent_is_saved_before_its_first_prompt() {
+    App::test((), |mut app| async move {
+        let terminal = bootstrapped_terminal(&mut app).await;
+        let view_id = terminal.id();
+        let saves = count_saves(&mut app);
+        simulate_running_command(&mut app, &terminal, "claude");
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(SESSION_ID), None),
+        );
+
+        let record = snapshot(&app, &terminal).expect("the session is kept for a restart");
+        assert!(record.awaiting_first_prompt);
+        assert_eq!(record.session_id.as_deref(), Some(SESSION_ID));
+        assert!(record.evidently_interactive);
+        assert_eq!(saves.get(), 1);
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::Tracking);
+        assert!(!has_banner(&app, &terminal));
+    })
+}
+
+#[test]
+fn a_fresh_agent_does_not_replace_a_session_that_did_something() {
+    App::test((), |mut app| async move {
+        let terminal = bootstrapped_terminal(&mut app).await;
+        let view_id = terminal.id();
+        simulate_running_command(&mut app, &terminal, "claude");
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(SESSION_ID), Some("fix it")),
+        );
+        // The session ends without its block finishing, e.g. it was replaced.
+        end_live_session(&mut app, view_id);
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(OTHER_SESSION_ID), None),
+        );
+
+        let record = snapshot(&app, &terminal).expect("the earlier session is kept");
+        assert_eq!(record.session_id.as_deref(), Some(SESSION_ID));
+        assert!(!record.awaiting_first_prompt);
+
+        // Once the new session does something, it takes over.
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Claude, true, Some(OTHER_SESSION_ID), Some("next")),
+        );
+        let record = snapshot(&app, &terminal).expect("the new session is persisted");
+        assert_eq!(record.session_id.as_deref(), Some(OTHER_SESSION_ID));
+        assert!(!record.awaiting_first_prompt);
+    })
+}
+
+#[test]
+fn a_never_used_agent_is_forgotten_when_it_exits() {
+    for succeeded in [false, true] {
+        App::test((), |mut app| async move {
+            let terminal = bootstrapped_terminal(&mut app).await;
+            let view_id = terminal.id();
+            simulate_running_command(&mut app, &terminal, "claude");
+            start_live_session(
+                &mut app,
+                view_id,
+                live_session(CLIAgent::Claude, true, Some(SESSION_ID), None),
+            );
+            assert!(snapshot(&app, &terminal).is_some());
+            end_live_session(&mut app, view_id);
+            complete_agent_block(&mut app, &terminal, succeeded);
+
+            assert_eq!(snapshot(&app, &terminal), None, "succeeded: {succeeded}");
+            assert_eq!(phase(&app, &terminal), RecoveryPhase::Tracking);
+            assert!(!has_banner(&app, &terminal));
+        })
+    }
+}
+
+#[test]
+fn a_restored_session_without_a_conversation_starts_anew() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        let view_id = terminal.id();
+        restore(
+            &mut app,
+            &terminal,
+            awaiting_record(CLIAgent::Codex, FRESH_CODEX_SESSION_ID),
+        );
+        assert_eq!(resume(&mut app, &terminal), CLIAgentResumeOutcome::Resumed);
+
+        wait_for(&app, |app| {
+            phase(app, &terminal) == RecoveryPhase::ResumePending
+        })
+        .await;
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::ResumePending);
+        terminal.read(&app, |view, _| {
+            assert_eq!(
+                view.cli_agent_session_command(),
+                Some(SessionCommand::StartNew)
+            );
+            assert!(view.cli_agent_session_restore.resume_starts_new_session);
+        });
+        assert_eq!(
+            in_flight_step(&app, &terminal),
+            Some(ResumeStep::ChangeDirectory)
+        );
+        assert!(command_was_sent(&app, &terminal, &cd_command()));
+        assert_eq!(
+            pending_steps(&app, &terminal),
+            vec![(ResumeStep::Agent, "codex".to_owned())]
+        );
+
+        // The new session reports its own id, which acknowledges the start.
+        simulate_running_command(&mut app, &terminal, "codex");
+        start_live_session(
+            &mut app,
+            view_id,
+            live_session(CLIAgent::Codex, true, Some(OTHER_SESSION_ID), None),
+        );
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::Tracking);
+        let record = snapshot(&app, &terminal).expect("the new session is kept");
+        assert_eq!(record.session_id.as_deref(), Some(OTHER_SESSION_ID));
+        assert!(record.awaiting_first_prompt);
+    })
+}
+
+#[test]
+fn a_restored_session_awaiting_its_first_prompt_resumes_its_conversation() {
+    App::test((), |mut app| async move {
+        let terminal = terminal(&mut app);
+        // e.g. started with `claude --resume` and not used before the restart.
+        let transcript = std::env::temp_dir().join("warp cli agent restore tests transcript.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("the test transcript can be written");
+        let mut record = awaiting_record(CLIAgent::Claude, SESSION_ID);
+        record.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        restore(&mut app, &terminal, record);
+        assert_eq!(resume(&mut app, &terminal), CLIAgentResumeOutcome::Resumed);
+
+        wait_for(&app, |app| {
+            phase(app, &terminal) == RecoveryPhase::ResumePending
+        })
+        .await;
+        assert_eq!(phase(&app, &terminal), RecoveryPhase::ResumePending);
+        terminal.read(&app, |view, _| {
+            assert_eq!(
+                view.cli_agent_session_command(),
+                Some(SessionCommand::Resume)
+            );
+            assert!(!view.cli_agent_session_restore.resume_starts_new_session);
+        });
+        assert_eq!(
+            pending_steps(&app, &terminal),
+            vec![(ResumeStep::Agent, agent_command())]
+        );
+    })
+}
+
+#[test]
+fn copying_a_session_without_a_conversation_copies_the_start_command() {
+    App::test((), |mut app| async move {
+        let terminal = bootstrapped_terminal(&mut app).await;
+        app.add_singleton_model(|_| ToastStack);
+        restore(
+            &mut app,
+            &terminal,
+            awaiting_record(CLIAgent::Codex, FRESH_CODEX_SESSION_ID),
+        );
+        wait_for(&app, |app| {
+            terminal.read(app, |view, _| view.cli_agent_session_command().is_some())
+        })
+        .await;
+        terminal.read(&app, |view, _| {
+            assert_eq!(
+                view.cli_agent_session_command(),
+                Some(SessionCommand::StartNew)
+            );
+        });
+        assert!(has_banner(&app, &terminal));
+        terminal.update(&mut app, |view, ctx| {
+            view.copy_restored_cli_agent_session_command(ctx);
+        });
+        app.update(|ctx| {
+            assert_eq!(
+                ctx.clipboard().read().plain_text,
+                format!("{} && codex", cd_command())
+            );
+        });
+    })
+}
+
+#[test]
+fn queued_resumes_take_turns_with_the_focused_pane_first() {
+    let now = Instant::now();
+    // Nothing queued: it starts right away.
+    let (first, after_first) = claim_resume_start(None, now, false);
+    assert_eq!(first, now);
+    assert_eq!(after_first, now + RESUME_SPACING);
+    // The next one waits its turn.
+    let (second, after_second) = claim_resume_start(Some(after_first), now, false);
+    assert_eq!(second, now + RESUME_SPACING);
+    assert_eq!(after_second, now + RESUME_SPACING * 2);
+    // The focused pane starts right away without moving the others' turns.
+    let (focused, after_focused) = claim_resume_start(Some(after_second), now, true);
+    assert_eq!(focused, now);
+    assert_eq!(after_focused, after_second);
+    // A turn that has passed holds nothing up.
+    let later = now + RESUME_SPACING * 10;
+    let (start, next) = claim_resume_start(Some(after_second), later, false);
+    assert_eq!(start, later);
+    assert_eq!(next, later + RESUME_SPACING);
 }

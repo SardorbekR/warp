@@ -49,6 +49,9 @@ pub struct CLIAgentSessionRestoreBanner {
     record: PersistedCLIAgentSession,
     transcript_missing: bool,
     launch_directory_missing: bool,
+    /// Fork: the session had no conversation yet, so resuming starts a new one in its
+    /// directory (see [`crate::terminal::cli_agent_sessions::restore::SessionCommand`]).
+    starts_new_session: bool,
     previous_resume: PreviousResumeAttempt,
     resume_mouse_state: MouseStateHandle,
     copy_mouse_state: MouseStateHandle,
@@ -61,11 +64,13 @@ impl CLIAgentSessionRestoreBanner {
         record: PersistedCLIAgentSession,
         previous_resume: PreviousResumeAttempt,
         launch_directory_missing: bool,
+        starts_new_session: bool,
     ) -> Self {
         Self {
             record,
             transcript_missing: false,
             launch_directory_missing,
+            starts_new_session,
             previous_resume,
             resume_mouse_state: MouseStateHandle::default(),
             copy_mouse_state: MouseStateHandle::default(),
@@ -85,6 +90,19 @@ impl CLIAgentSessionRestoreBanner {
         }
     }
 
+    /// Fork: marks the session as one that had no conversation yet, so resuming starts a new
+    /// one.
+    pub fn set_starts_new_session(
+        &mut self,
+        starts_new_session: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.starts_new_session != starts_new_session {
+            self.starts_new_session = starts_new_session;
+            ctx.notify();
+        }
+    }
+
     /// Marks the session's launch directory as missing on this machine, which means it ran
     /// elsewhere, so it can only be copied.
     pub fn set_launch_directory_missing(&mut self, missing: bool, ctx: &mut ViewContext<Self>) {
@@ -100,6 +118,9 @@ impl CLIAgentSessionRestoreBanner {
 
     fn title_text(&self) -> String {
         let agent_name = self.record.agent.display_name();
+        if self.starts_new_session {
+            return format!("{agent_name} was open here");
+        }
         match self.record.display_name() {
             Some(title) => {
                 let mut displayed: String = title.chars().take(MAX_DISPLAYED_TITLE_CHARS).collect();
@@ -133,7 +154,13 @@ impl CLIAgentSessionRestoreBanner {
                     .to_owned(),
             );
         }
-        if self.transcript_missing {
+        if self.starts_new_session {
+            details.push(if self.can_resume_here() {
+                "No conversation yet; Start opens a new session in this folder".to_owned()
+            } else {
+                "No conversation yet".to_owned()
+            });
+        } else if self.transcript_missing {
             details.push("Transcript not found; resuming may fail".to_owned());
         }
         match self.previous_resume {
@@ -254,7 +281,11 @@ impl View for CLIAgentSessionRestoreBanner {
             buttons.add_child(button(
                 ButtonVariant::Accent,
                 &self.resume_mouse_state,
-                "Resume",
+                if self.starts_new_session {
+                    "Start"
+                } else {
+                    "Resume"
+                },
                 CLIAgentSessionRestoreBannerAction::Resume,
             ));
         }
