@@ -4237,6 +4237,7 @@ impl Workspace {
                 }
 
                 self.activate_tab_internal(active_tab_index, ctx);
+                self.move_resuming_tabs_to_top_after_restore(ctx);
                 self.check_and_trigger_onboarding(ctx);
             }
             NewWorkspaceSource::FromTemplate { window_template } => {
@@ -16583,6 +16584,14 @@ impl Workspace {
                 self.update_active_session(ctx);
                 ctx.notify();
             }
+            pane_group::Event::CLIAgentSessionResumedByUser { terminal_view_id } => {
+                // Once the input the Resume came with is handled: a sidebar row's menu closes only
+                // after its item's action, and an open menu holds the tab order still.
+                let terminal_view_ids = [*terminal_view_id];
+                let _ = ctx.spawn(async {}, move |me, _, ctx| {
+                    me.move_tabs_resumed_by_user_to_top(&terminal_view_ids, ctx);
+                });
+            }
             pane_group::Event::OnboardingTutorialCompleted => {
                 self.pending_session_config_tab_config_chip = false;
                 self.show_session_config_tab_config_chip = false;
@@ -25864,7 +25873,9 @@ impl TypedActionView for Workspace {
                 ctx.dispatch_global_action("app:undo_close", ());
             }
             ResumeAllCLIAgentSessions => {
-                crate::undo_close::agent_sessions::resume_all_cli_agent_sessions(self, ctx);
+                let resumed =
+                    crate::undo_close::agent_sessions::resume_all_cli_agent_sessions(self, ctx);
+                self.move_tabs_resumed_by_user_to_top(&resumed, ctx);
             }
             ToggleAutoResumeCLIAgentSessions => {
                 crate::undo_close::agent_sessions::toggle_auto_resume_cli_agent_sessions(ctx);

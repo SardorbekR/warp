@@ -515,6 +515,10 @@ pub enum Event {
     /// Event used to propagate a state change for one of the terminal views
     /// inside this pane group.
     TerminalViewStateChanged,
+    /// Fork: the user resumed the restored CLI agent session of one of the terminal views.
+    CLIAgentSessionResumedByUser {
+        terminal_view_id: EntityId,
+    },
     /// Event used to propagate guided onboarding tutorial completion to the workspace.
     OnboardingTutorialCompleted,
     // Tell the workspace to open the workflow modal.

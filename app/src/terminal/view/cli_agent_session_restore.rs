@@ -345,6 +345,15 @@ impl TerminalView {
             .filter(|_| state.phase == RecoveryPhase::Interrupted)
     }
 
+    /// Fork: whether this pane is resuming its restored CLI agent session: the resume is queued
+    /// or its commands are being sent.
+    pub(crate) fn is_resuming_cli_agent_session(&self) -> bool {
+        matches!(
+            self.cli_agent_session_restore.phase,
+            RecoveryPhase::ResumeQueued | RecoveryPhase::ResumePending
+        )
+    }
+
     /// Whether the offered session can be resumed in this pane, rather than only copied: it
     /// started from the pane's local shell and its directory isn't known to be missing here.
     pub(crate) fn can_resume_restored_cli_agent_session_here(&self) -> bool {
@@ -534,12 +543,19 @@ impl TerminalView {
     }
 
     /// Resumes the offered session like [`Self::resume_restored_cli_agent_session`], telling the
-    /// user with a toast when it can't.
+    /// user with a toast when it can't. Only for the user's own Resume (the banner's button or
+    /// the sidebar row's menu item).
     pub(crate) fn resume_restored_cli_agent_session_with_feedback(
         &mut self,
         ctx: &mut ViewContext<Self>,
     ) {
-        let message = match self.resume_restored_cli_agent_session(ctx) {
+        let outcome = self.resume_restored_cli_agent_session(ctx);
+        if outcome == CLIAgentResumeOutcome::Resumed {
+            // Fork: like a prompt, the user's resume moves the tab to the top of the last-prompt
+            // order.
+            ctx.emit(Event::CLIAgentSessionResumedByUser);
+        }
+        let message = match outcome {
             CLIAgentResumeOutcome::Busy => {
                 Some("Can't resume while something is running in this pane")
             }

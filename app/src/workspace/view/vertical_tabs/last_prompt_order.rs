@@ -5,8 +5,14 @@
 //! plain shell or an agent finishing never moves it. The tab order is saved
 //! with the app state, so the order survives restarts as it is.
 //!
-//! Only the hooks here move tabs: tabs restored at startup or with a window,
-//! opened by a launch configuration, dragged in from another window or
+//! Resuming an agent session moves its tab to the top too: the user's own
+//! Resume (a pane's banner, its sidebar row or "Resume all agent sessions"),
+//! and, when a window's tabs are restored, every tab whose agent session
+//! resumes on its own (`general.auto_resume_cli_agent_sessions`). Those go
+//! above the other restored tabs, each group keeping its order.
+//!
+//! Only the hooks here move tabs: other tabs restored at startup or with a
+//! window, opened by a launch configuration, dragged in from another window or
 //! opened by any other path keep their normal placement and order.
 
 use std::collections::{HashMap, HashSet};
@@ -17,6 +23,7 @@ use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 use super::any_workspace_pane_being_dragged;
 use crate::pane_group::PaneGroup;
 use crate::tab::{TabData, vertical_tabs_sort_mode};
+use crate::terminal::TerminalView;
 use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModelEvent};
 use crate::workspace::Workspace;
 use crate::workspace::action::WorkspaceAction;
@@ -233,6 +240,62 @@ impl Workspace {
         }
     }
 
+    /// Moves the tabs of `terminal_view_ids`, whose agent sessions the user
+    /// resumed, to the top like a prompt, keeping their order.
+    pub(in crate::workspace::view) fn move_tabs_resumed_by_user_to_top(
+        &mut self,
+        terminal_view_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if terminal_view_ids.is_empty() {
+            return;
+        }
+        let resumed = self.tabs_matching_terminal_views(
+            |terminal_view_id, _| terminal_view_ids.contains(&terminal_view_id),
+            ctx,
+        );
+        self.move_tabs_to_top_for_user(&resumed, ctx);
+    }
+
+    /// Call once a window's tabs are restored: moves the tabs whose agent
+    /// session resumes on its own to the top, keeping their order, so the
+    /// other tabs follow in theirs. The active tab stays active. Not saved
+    /// right away: the next save of the app state has the new order.
+    pub(in crate::workspace::view) fn move_resuming_tabs_to_top_after_restore(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !is_last_prompt_order_active(ctx) {
+            return;
+        }
+        let resuming = self.tabs_matching_terminal_views(
+            |_, terminal_view| terminal_view.is_resuming_cli_agent_session(),
+            ctx,
+        );
+        self.move_tabs_to_top(&resuming, ctx);
+        ctx.notify();
+    }
+
+    /// The pane groups of the tabs with a terminal pane that matches, in tab
+    /// order.
+    fn tabs_matching_terminal_views(
+        &self,
+        matches: impl Fn(EntityId, &TerminalView) -> bool,
+        ctx: &AppContext,
+    ) -> Vec<EntityId> {
+        self.tabs
+            .iter()
+            .filter(|tab| {
+                tab.pane_group
+                    .as_ref(ctx)
+                    .terminal_views(ctx)
+                    .iter()
+                    .any(|terminal_view| matches(terminal_view.id(), terminal_view.as_ref(ctx)))
+            })
+            .map(|tab| tab.pane_group.id())
+            .collect()
+    }
+
     /// The pane group of the tab that shows `terminal_view_id` in one of its
     /// visible panes.
     fn tab_showing_terminal_view(
@@ -317,6 +380,25 @@ impl Workspace {
             log::debug!("Not moving tabs to the top while the tab order is in use");
             return;
         }
+        let moved = self.move_tabs_to_top(pane_group_ids, ctx);
+        // The user's own action: show it now, even if the list is frozen
+        // under the pointer (a frozen list would keep the tab where it was,
+        // or put a new tab at the bottom). Later changes freeze again.
+        self.vertical_tabs_panel.release_status_list_freeze_once();
+        if moved {
+            ctx.dispatch_global_action("workspace:save_app", ());
+        }
+        ctx.notify();
+    }
+
+    /// Moves the tabs of `pane_group_ids` to the top of the unpinned region,
+    /// in that order. Pinned and grouped tabs stay where they are, and the
+    /// active tab stays active. Returns whether any tab moved.
+    fn move_tabs_to_top(
+        &mut self,
+        pane_group_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
         let mut moved = false;
         // Bottom first, so that each one lands above the ones moved before.
         for pane_group_id in pane_group_ids.iter().rev() {
@@ -338,14 +420,7 @@ impl Workspace {
             self.move_tab_to_index(from, to, ctx);
             moved = true;
         }
-        // The user's own action: show it now, even if the list is frozen
-        // under the pointer (a frozen list would keep the tab where it was,
-        // or put a new tab at the bottom). Later changes freeze again.
-        self.vertical_tabs_panel.release_status_list_freeze_once();
-        if moved {
-            ctx.dispatch_global_action("workspace:save_app", ());
-        }
-        ctx.notify();
+        moved
     }
 }
 

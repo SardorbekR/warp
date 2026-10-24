@@ -1111,6 +1111,11 @@ fn handle_terminal_view_event(
             Event::TerminalViewStateChanged => {
                 ctx.emit(pane_group::Event::TerminalViewStateChanged);
             }
+            Event::CLIAgentSessionResumedByUser => {
+                ctx.emit(pane_group::Event::CLIAgentSessionResumedByUser {
+                    terminal_view_id: terminal_view.id(),
+                });
+            }
             Event::OnboardingTutorialCompleted => {
                 ctx.emit(pane_group::Event::OnboardingTutorialCompleted);
             }

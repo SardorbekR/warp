@@ -94,17 +94,19 @@ fn resume_all_resumes_local_sessions_and_skips_copy_only_ones() {
         terminal.update(&mut app, |view, ctx| {
             view.restore_cli_agent_session(record(false), ctx);
         });
-        workspace.update(&mut app, |workspace, ctx| {
+        let resumed = workspace.update(&mut app, |workspace, ctx| {
             resume_all_cli_agent_sessions(workspace, ctx)
         });
+        assert!(resumed.is_empty());
         assert_eq!(restorable(&app, &terminal), Some(record(false)));
 
         terminal.update(&mut app, |view, ctx| {
             view.restore_cli_agent_session(record(true), ctx);
         });
-        workspace.update(&mut app, |workspace, ctx| {
+        let resumed = workspace.update(&mut app, |workspace, ctx| {
             resume_all_cli_agent_sessions(workspace, ctx)
         });
+        assert_eq!(resumed, vec![terminal.id()]);
         // The resume is queued or running, so the pane no longer offers it, but it still
         // persists the record in case of another crash.
         assert_eq!(restorable(&app, &terminal), None);
@@ -133,9 +135,10 @@ fn resume_all_resumes_each_session_once() {
             });
         }
 
-        workspace.update(&mut app, |workspace, ctx| {
+        let resumed = workspace.update(&mut app, |workspace, ctx| {
             resume_all_cli_agent_sessions(workspace, ctx)
         });
+        assert_eq!(resumed.len(), 1);
         let still_offered: Vec<_> = [&first, &second]
             .into_iter()
             .filter(|terminal| restorable(&app, terminal).is_some())

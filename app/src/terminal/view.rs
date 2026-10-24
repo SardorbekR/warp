@@ -1732,6 +1732,9 @@ pub enum Event {
     /// Event used to propagate a state change for one of the terminal views
     /// inside this pane group.
     TerminalViewStateChanged,
+    /// Fork: the user resumed the pane's restored CLI agent session (the Resume of its banner or
+    /// sidebar row), which moves its tab to the top of the last-prompt order.
+    CLIAgentSessionResumedByUser,
     ShowCommandSearch(CommandSearchOptions),
     // Tell the pane group to open the workflow modal.
     OpenWorkflowModalWithCommand(String),

@@ -4,7 +4,7 @@
 use ::settings::ToggleableSetting as _;
 use warp_errors::report_if_error;
 use warpui::keymap::EditableBinding;
-use warpui::{AppContext, SingletonEntity, ViewContext};
+use warpui::{AppContext, EntityId, SingletonEntity, ViewContext};
 
 use crate::settings_view::ToggleSettingActionPair;
 use crate::terminal::general_settings::GeneralSettings;
@@ -41,7 +41,11 @@ pub(super) fn init(ctx: &mut AppContext) {
 /// Resumes the interrupted CLI agent session in every terminal pane of the workspace's window,
 /// skipping panes where that could disturb something (a running command or typed input) and
 /// sessions that are open, or being resumed, in another pane: each session is resumed once.
-pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContext<Workspace>) {
+/// Returns the terminal views that resume their session.
+pub fn resume_all_cli_agent_sessions(
+    workspace: &Workspace,
+    ctx: &mut ViewContext<Workspace>,
+) -> Vec<EntityId> {
     let terminal_views: Vec<_> = workspace
         .tab_views()
         .flat_map(|pane_group| pane_group.as_ref(ctx).terminal_views(ctx))
@@ -49,13 +53,13 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
 
     // Each pane's resume checks the sessions other panes run, resume or track (see
     // `CLIAgentSessionsModel::resume_claim_elsewhere`), so each session is resumed once.
-    let mut resumed = 0usize;
+    let mut resumed_views = Vec::new();
     let mut skipped = 0usize;
     for terminal_view in terminal_views {
         let outcome =
             terminal_view.update(ctx, |view, ctx| view.resume_restored_cli_agent_session(ctx));
         match outcome {
-            CLIAgentResumeOutcome::Resumed => resumed = resumed.saturating_add(1),
+            CLIAgentResumeOutcome::Resumed => resumed_views.push(terminal_view.id()),
             CLIAgentResumeOutcome::Busy
             | CLIAgentResumeOutcome::HasDraft
             | CLIAgentResumeOutcome::AlreadyOpen
@@ -73,7 +77,7 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
     };
     const SKIP_REASONS: &str =
         "busy, unsent input, already open in another pane, or not resumable from this pane";
-    let message = match (resumed, skipped) {
+    let message = match (resumed_views.len(), skipped) {
         (0, 0) => "No agent sessions to resume".to_owned(),
         (resumed, 0) => format!("Resuming {}", sessions(resumed)),
         (0, skipped) => format!("Couldn't resume {}: {SKIP_REASONS}", sessions(skipped)),
@@ -87,6 +91,7 @@ pub fn resume_all_cli_agent_sessions(workspace: &Workspace, ctx: &mut ViewContex
     ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
         toast_stack.add_ephemeral_toast(DismissibleToast::default(message), window_id, ctx);
     });
+    resumed_views
 }
 
 pub fn toggle_auto_resume_cli_agent_sessions(ctx: &mut ViewContext<Workspace>) {
