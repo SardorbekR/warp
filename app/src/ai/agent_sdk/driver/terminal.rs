@@ -24,10 +24,11 @@ use warpui::r#async::FutureExt;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity as _, ViewHandle};
 
 use super::AgentDriverError;
+use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::redaction::redact_secrets;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::attachment_utils::attachments_download_dir;
-use crate::pane_group::NewTerminalOptions;
+use crate::pane_group::{NewTerminalOptions, PaneGroup};
 use crate::root_view::{NewWorkspaceSource, open_new_with_workspace_source};
 use crate::terminal::model::RespectObfuscatedSecrets;
 use crate::terminal::model::block::{BlockId, BlockState, SerializedBlock};
@@ -127,6 +128,15 @@ pub(crate) struct TerminalDriverOptions<'a> {
     pub team_scope: Option<&'a HeadlessTeamScope>,
 }
 
+pub(super) struct PrewarmedTaskBinding<'a> {
+    pub task_id: AmbientAgentTaskId,
+    pub working_dir: PathBuf,
+    pub team_scope: &'a HeadlessTeamScope,
+    pub share_requests: Vec<ShareRequest>,
+    pub should_share: bool,
+    pub restored_conversation_id: Option<AIConversationId>,
+}
+
 /// Events emitted by [`TerminalDriver`] for [`super::AgentDriver`] to react to.
 pub(crate) enum TerminalDriverEvent {
     /// Terminal bootstrap is taking unusually long.
@@ -155,6 +165,7 @@ struct WaitingCommand {
 /// - Detecting block completion
 pub(crate) struct TerminalDriver {
     terminal_view: ViewHandle<TerminalView>,
+    pane_group: Option<ViewHandle<PaneGroup>>,
     #[cfg(test)]
     pub(super) launch_env_vars_for_test: Option<HashMap<OsString, OsString>>,
     /// Sender half of the bootstrap result channel. Exactly one of
@@ -212,7 +223,7 @@ impl Entity for TerminalDriver {
 fn create_terminal_view(
     options: TerminalDriverOptions<'_>,
     ctx: &mut AppContext,
-) -> Result<ViewHandle<TerminalView>, AgentDriverError> {
+) -> Result<(ViewHandle<TerminalView>, ViewHandle<PaneGroup>), AgentDriverError> {
     let is_shared_session_creator = if options.should_share {
         IsSharedSessionCreator::Yes {
             source: SharedSessionSource::ambient_agent(options.task_id.map(|t| t.to_string())),
@@ -236,15 +247,18 @@ fn create_terminal_view(
         ctx,
     );
 
-    root_view
+    let pane_group = root_view
         .as_ref(ctx)
         .workspace_view()
         .ok_or(AgentDriverError::TerminalUnavailable)?
         .as_ref(ctx)
         .active_tab_pane_group()
+        .clone();
+    let terminal_view = pane_group
         .as_ref(ctx)
         .active_session_view(ctx)
-        .ok_or(AgentDriverError::TerminalUnavailable)
+        .ok_or(AgentDriverError::TerminalUnavailable)?;
+    Ok((terminal_view, pane_group))
 }
 
 impl TerminalDriver {
@@ -258,14 +272,24 @@ impl TerminalDriver {
         let should_share = options.should_share;
         let task_id = options.task_id;
         let working_dir = options.working_dir.clone();
-        let terminal_view = create_terminal_view(options, ctx)?;
+        let (terminal_view, pane_group) = create_terminal_view(options, ctx)?;
         let driver =
             ctx.add_model(|ctx| Self::new(terminal_view, should_share, task_id, working_dir, ctx));
+        driver.update(ctx, |driver, _| driver.pane_group = Some(pane_group));
         #[cfg(test)]
         driver.update(ctx, |driver, _| {
             driver.launch_env_vars_for_test = Some(launch_env_vars_for_test);
         });
         Ok(driver)
+    }
+
+    pub(super) fn session_path(&self, ctx: &AppContext) -> Option<String> {
+        self.terminal_view.read(ctx, |terminal, ctx| {
+            let session = terminal
+                .active_block_session_id()
+                .and_then(|id| terminal.sessions_model().as_ref(ctx).get(id))?;
+            session.path().clone()
+        })
     }
 
     /// Wrap an already-created terminal view in a new `TerminalDriver` model.
@@ -353,6 +377,7 @@ impl TerminalDriver {
 
         Self {
             terminal_view,
+            pane_group: None,
             #[cfg(test)]
             launch_env_vars_for_test: None,
             bootstrap_tx,
@@ -375,15 +400,23 @@ impl TerminalDriver {
         &self.terminal_view
     }
 
+    pub(crate) fn pane_group(&self) -> Option<&ViewHandle<PaneGroup>> {
+        self.pane_group.as_ref()
+    }
+
     pub(super) fn bind_prewarmed_task(
         &mut self,
-        task_id: AmbientAgentTaskId,
-        working_dir: PathBuf,
-        team_scope: &HeadlessTeamScope,
-        share_requests: Vec<ShareRequest>,
-        should_share: bool,
+        binding: PrewarmedTaskBinding<'_>,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(), AgentDriverError> {
+        let PrewarmedTaskBinding {
+            task_id,
+            working_dir,
+            team_scope,
+            share_requests,
+            should_share,
+            restored_conversation_id,
+        } = binding;
         let should_share = sharing_expected(should_share);
         if should_share && !FeatureFlag::CreatingSharedSessions.is_enabled() {
             return Err(AgentDriverError::ShareSessionFailed {
@@ -398,7 +431,7 @@ impl TerminalDriver {
             terminal.ai_controller().update(ctx, |controller, ctx| {
                 controller.set_ambient_agent_task_id(Some(task_id), ctx);
                 controller.set_attachments_download_dir(attachments_download_dir(&working_dir));
-                controller.bind_native_prompt_conversation(None, ctx);
+                controller.bind_native_prompt_conversation(restored_conversation_id, ctx);
             });
             terminal
                 .model

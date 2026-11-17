@@ -8,19 +8,22 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use cloud_object_models::{CodeForge, SourceRepo};
-use futures::future::BoxFuture;
+use futures::future::{self, BoxFuture};
 use futures::stream::BoxStream;
 use futures::{FutureExt as _, Sink, SinkExt as _, StreamExt as _, sink, stream};
+use instant::Instant;
 use warp_cli::agent::{Harness, RunCloudStandbyArgs};
 use warp_cli::skill::SkillSpec;
+use warp_core::features::FeatureFlag;
 use warp_core::{safe_info, safe_warn};
 use warp_graphql::queries::execution_config::ExecutionConfiguration;
+use warp_graphql::queries::task_restricted_git_credentials::GitHubCredentialMode;
 use warpui::r#async::Timer;
 use warpui::platform::TerminationMode;
 use warpui::{AppContext, ModelSpawner, SingletonEntity};
@@ -30,8 +33,11 @@ use crate::ai::agent_sdk::driver::agent_setup::configured_skills::{
 };
 use crate::ai::agent_sdk::driver::agent_setup::resolve_global_skills;
 use crate::ai::agent_sdk::driver::environment::{WorkspaceConfiguration, merge_repos_deduped};
+use crate::ai::agent_sdk::driver::git_credentials::restricted::{
+    self, CredentialStoreGuard, ManagedStoreOwner,
+};
 use crate::ai::agent_sdk::driver::{
-    AgentDriver, AgentDriverError, AgentDriverOptions, Task, git_credentials,
+    AgentDriver, AgentDriverError, AgentDriverOptions, Task, cloud_provider, git_credentials,
 };
 use crate::ai::agent_sdk::setup_observability::{SetupClientEventReporter, SetupStep};
 use crate::ai::agent_sdk::{AgentDriverRunner, config_file, execution_config, mcp_config};
@@ -64,11 +70,12 @@ const DELIVERY_CONFIRMATION_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Starts the standby lifecycle and exits the app after expiry or a fatal error.
 pub(super) fn run(ctx: &mut AppContext, args: RunCloudStandbyArgs) -> anyhow::Result<()> {
+    let supports_deferred_repositories = FeatureFlag::FactoryDeferredRepositories.is_enabled();
     let runner = ctx.add_singleton_model(|_| AgentDriverRunner);
     runner.update(ctx, move |_, ctx| {
         let spawner = ctx.spawner();
         ctx.spawn(
-            prepare_and_wait(spawner, args.standby_id),
+            prepare_and_wait(spawner, args.standby_id, supports_deferred_repositories),
             |_, result, ctx| match result {
                 Ok(()) => ctx.terminate_app(TerminationMode::ForceTerminate, None),
                 Err(err) => super::report_fatal_error(err, ctx),
@@ -84,6 +91,7 @@ pub(super) fn run(ctx: &mut AppContext, args: RunCloudStandbyArgs) -> anyhow::Re
 async fn prepare_and_wait(
     foreground: ModelSpawner<AgentDriverRunner>,
     sandbox_id: String,
+    supports_deferred_repositories: bool,
 ) -> anyhow::Result<()> {
     let api = foreground
         .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_prewarmed_sandbox_client())
@@ -95,8 +103,27 @@ async fn prepare_and_wait(
         })
         .await?;
 
-    let config = api.fetch_configuration(&sandbox_id).await?;
+    let config = api
+        .fetch_configuration(&sandbox_id, supports_deferred_repositories)
+        .await?;
+    anyhow::ensure!(
+        config.sandbox_id == sandbox_id,
+        "Standby configuration sandbox ID does not match"
+    );
+    anyhow::ensure!(
+        !config.generation.is_empty(),
+        "Standby configuration generation is empty"
+    );
     let generation = config.generation.clone();
+    let mode = config.github_credential_mode;
+    let owner = ManagedStoreOwner::Standby {
+        sandbox_id: sandbox_id.clone(),
+        generation: generation.clone(),
+    };
+    let _credentials = CredentialStoreGuard::new(owner.clone());
+    if mode == GitHubCredentialMode::RestrictedInstallation {
+        restricted::prepare_standby_credentials(&owner, config.git_credentials.clone())?;
+    }
     let expires_at = config.expires_at;
     safe_info!(
         safe: ("Preparing pre-warmed sandbox {sandbox_id}"),
@@ -109,7 +136,8 @@ async fn prepare_and_wait(
     );
 
     let clock = StandbyClock::default();
-    run_lifecycle(
+    let assigned_driver = Mutex::new(None);
+    let result = run_lifecycle(
         &generation,
         expires_at,
         async {
@@ -117,7 +145,13 @@ async fn prepare_and_wait(
                 api.as_ref(),
                 &sandbox_id,
                 &generation,
-                prepare(&foreground, config, &setup_events).await,
+                prepare(
+                    &foreground,
+                    config,
+                    supports_deferred_repositories,
+                    &setup_events,
+                )
+                .await,
             )
             .await
         },
@@ -133,17 +167,126 @@ async fn prepare_and_wait(
             }
             .boxed()
         },
-        |driver_spawner, assignment| graduate_sandbox(driver_spawner, assignment).boxed(),
-        |(spawner, task)| {
+        |driver_spawner, assignment| {
+            *assigned_driver.lock().unwrap() = Some(driver_spawner.clone());
+            graduate_sandbox(driver_spawner, assignment, supports_deferred_repositories).boxed()
+        },
+        |(spawner, task, credentials)| {
             async move {
-                AgentDriver::run_prewarmed_assignment(&spawner, task).await?;
+                let result = AgentDriver::run_prewarmed_assignment(&spawner, task).await;
+                drop(credentials);
+                result?;
                 Ok(())
             }
             .boxed()
         },
         &clock,
+        async {
+            if mode == GitHubCredentialMode::RestrictedInstallation {
+                renew_standby_credentials(
+                    api.as_ref(),
+                    &owner,
+                    expires_at,
+                    supports_deferred_repositories,
+                    &clock,
+                )
+                .await
+            } else {
+                future::pending().await
+            }
+        },
     )
-    .await
+    .await;
+    if let Err(error) = &result
+        && error.downcast_ref::<AgentDriverError>().is_none()
+    {
+        let spawner = assigned_driver.lock().unwrap().clone();
+        if let Some(spawner) = spawner {
+            AgentDriver::report_prewarmed_lifecycle_failure(&spawner, error.to_string()).await;
+        }
+    }
+    result
+}
+
+pub(super) async fn renew_standby_credentials(
+    api: &dyn PrewarmedSandboxClient,
+    owner: &ManagedStoreOwner,
+    expires_at: DateTime<Utc>,
+    supports_deferred_repositories: bool,
+    clock: &StandbyClock,
+) -> anyhow::Result<()> {
+    let ManagedStoreOwner::Standby {
+        sandbox_id,
+        generation,
+    } = owner
+    else {
+        anyhow::bail!("Standby renewal requires a standby owner");
+    };
+    loop {
+        let delay = restricted::refresh_delay(owner, Instant::now());
+        if delay >= wait_window(expires_at, (clock.now)()) {
+            return restricted::with_expiry(owner, future::pending()).await;
+        }
+        restricted::with_expiry(owner, (clock.sleep)(delay)).await?;
+        for attempt in 0..=3 {
+            let fetched = restricted::with_expiry(
+                owner,
+                bounded_control(
+                    clock,
+                    api.fetch_configuration(sandbox_id, supports_deferred_repositories),
+                ),
+            )
+            .await?;
+            let fetched = fetched.and_then(|result| result);
+            match fetched {
+                Ok(config) => {
+                    if config.sandbox_id != *sandbox_id
+                        || config.generation != *generation
+                        || config.github_credential_mode
+                            != GitHubCredentialMode::RestrictedInstallation
+                    {
+                        restricted::credential_fetch_failed(owner, false, Instant::now())?;
+                        anyhow::bail!("Standby credential renewal changed its identity or mode");
+                    }
+                    if let Err(error) =
+                        restricted::apply_standby_refresh(owner, config.git_credentials)
+                    {
+                        if restricted::is_fatal_cleanup_error(&error) {
+                            return Err(error.into());
+                        }
+                        log::warn!(
+                            "Standby credential renewal could not install credentials: {error}"
+                        );
+                        restricted::schedule_refresh_retry(owner, Instant::now())?;
+                    }
+                    break;
+                }
+                Err(error) => {
+                    let transient = restricted::is_transient_request_error(&error);
+                    restricted::credential_fetch_failed(owner, transient, Instant::now())?;
+                    if !transient {
+                        return wait_after_standby_config_rejection(error).await;
+                    }
+                    if let Some(delay) = [60, 120, 240].get(attempt) {
+                        restricted::with_expiry(owner, (clock.sleep)(Duration::from_secs(*delay)))
+                            .await?;
+                    } else {
+                        restricted::schedule_refresh_retry(owner, Instant::now())?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn wait_after_standby_config_rejection(error: anyhow::Error) -> anyhow::Result<()> {
+    if is_prewarmed_sandbox_unavailable(&error) {
+        // A committed assignment makes config unavailable before delivery. Only the control
+        // channel can decide whether to retire or install that assignment.
+        future::pending().await
+    } else {
+        Err(error)
+    }
 }
 
 /// Reports the terminal preparation outcome and propagates it.
@@ -191,7 +334,7 @@ enum ConnectionAttempt {
     Retry,
 }
 
-struct StandbyClock {
+pub(super) struct StandbyClock {
     now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     sleep: Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>,
 }
@@ -235,7 +378,7 @@ async fn bounded_control<T>(
     let operation = operation.fuse();
     futures::pin_mut!(timeout, operation);
     futures::select_biased! {
-        () = timeout => anyhow::bail!("Pre-warmed sandbox control request timed out"),
+        () = timeout => Err(std::io::Error::from(std::io::ErrorKind::TimedOut)).context("Pre-warmed sandbox control request timed out"),
         result = operation => Ok(result),
     }
 }
@@ -357,15 +500,18 @@ async fn wait_in_standby<'a, P>(
     preparation: impl Future<Output = anyhow::Result<P>>,
     connect: &mut impl FnMut() -> BoxFuture<'a, ConnectionAttempt>,
     clock: &StandbyClock,
+    renewal: impl Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<Option<(P, Assignment)>> {
     let (event_tx, events) = async_channel::unbounded();
     let transport = maintain_standby_connection(generation, connect, event_tx, clock).fuse();
     let waiting = wait_for_assignment(generation, preparation, &events, clock).fuse();
     let expiry = (clock.sleep)(wait_window(expires_at, (clock.now)())).fuse();
-    futures::pin_mut!(transport, waiting, expiry);
+    let renewal = renewal.fuse();
+    futures::pin_mut!(transport, waiting, expiry, renewal);
     futures::select_biased! {
         () = expiry => Ok(None),
         result = waiting => result,
+        result = renewal => { result?; anyhow::bail!("Standby credential renewal ended") },
         result = transport => {
             result?;
             anyhow::bail!("Standby transport ended")
@@ -413,6 +559,7 @@ async fn confirm_delivery<'a>(
 }
 
 /// Waits in standby for an assignment, installs it, confirms its delivery, and then runs it.
+#[allow(clippy::too_many_arguments)]
 async fn run_lifecycle<'a, P, R>(
     generation: &str,
     expires_at: DateTime<Utc>,
@@ -421,13 +568,23 @@ async fn run_lifecycle<'a, P, R>(
     install: impl FnOnce(P, Assignment) -> BoxFuture<'a, anyhow::Result<R>>,
     run: impl FnOnce(R) -> BoxFuture<'a, anyhow::Result<()>>,
     clock: &StandbyClock,
+    renewal: impl Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let Some((prepared, assignment)) =
-        wait_in_standby(generation, expires_at, preparation, &mut connect, clock).await?
+    let Some((prepared, assignment)) = wait_in_standby(
+        generation,
+        expires_at,
+        preparation,
+        &mut connect,
+        clock,
+        renewal,
+    )
+    .await?
     else {
         return Ok(());
     };
     let execution_id = assignment.execution_config.execution_id.inner().to_owned();
+    let task_owner =
+        ManagedStoreOwner::Task(assignment.execution_config.task_id.inner().to_owned());
     let deadline = (clock.sleep)(wait_window(assignment.expires_at, (clock.now)())).fuse();
     futures::pin_mut!(deadline);
     let installed = {
@@ -439,13 +596,17 @@ async fn run_lifecycle<'a, P, R>(
         }
     };
     let delivered = {
-        let confirm = confirm_delivery(&execution_id, &mut connect, clock).fuse();
+        let confirm = restricted::with_expiry(
+            &task_owner,
+            confirm_delivery(&execution_id, &mut connect, clock),
+        )
+        .fuse();
         let window = (clock.sleep)(DELIVERY_CONFIRMATION_WINDOW).fuse();
         futures::pin_mut!(confirm, window);
         futures::select_biased! {
             () = deadline => anyhow::bail!("Assigned sandbox deadline expired before delivery was confirmed"),
             () = window => anyhow::bail!("The server did not confirm delivery of the assignment"),
-            result = confirm => result?,
+            result = confirm => result??,
         }
     };
     if !delivered {
@@ -461,17 +622,22 @@ async fn run_lifecycle<'a, P, R>(
 async fn graduate_sandbox(
     driver_spawner: ModelSpawner<AgentDriver>,
     assignment: Assignment,
-) -> anyhow::Result<(ModelSpawner<AgentDriver>, Task)> {
+    supports_deferred_repositories: bool,
+) -> anyhow::Result<(ModelSpawner<AgentDriver>, Task, CredentialStoreGuard)> {
+    let credentials = CredentialStoreGuard::new(ManagedStoreOwner::Task(
+        assignment.execution_config.task_id.inner().to_owned(),
+    ));
     let task = AgentDriver::prepare_prewarmed_assignment(
         &driver_spawner,
         assignment.execution_config,
         assignment.runtime_env,
         assignment.api_key,
         assignment.expires_at,
+        supports_deferred_repositories,
     )
     .await
     .context("Failed to prepare pre-warmed sandbox assignment")?;
-    Ok((driver_spawner, task))
+    Ok((driver_spawner, task, credentials))
 }
 
 /// How long to wait before exiting, given a deadline. Saturates at zero so an already-expired
@@ -483,18 +649,23 @@ fn wait_window(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Duration {
         .saturating_sub(EXPIRY_MARGIN)
 }
 
-/// Prepares an Oz sandbox through the shared driver without a prompt or run-only setup.
+/// Prepares a sandbox through the shared driver without a prompt or run-only setup.
 async fn prepare(
     foreground: &ModelSpawner<AgentDriverRunner>,
     config: PrewarmedSandboxConfiguration,
+    supports_deferred_repositories: bool,
     setup_events: &SetupClientEventReporter,
 ) -> Result<ModelSpawner<AgentDriver>, AgentDriverError> {
     let preparation = config.preparation;
+    if !supports_deferred_repositories && !preparation.deferred_repositories.is_empty() {
+        return Err(AgentDriverError::ConfigBuildFailed(anyhow::anyhow!(
+            "Pre-warmed preparation has deferred repositories this client cannot prepare"
+        )));
+    }
     let harness = Harness::from_config_name(&preparation.harness)
-        .filter(|harness| *harness == Harness::Oz)
         .with_context(|| {
             format!(
-                "Pre-warmed sandboxes support only the Oz harness, not '{}'",
+                "Unknown pre-warmed sandbox harness '{}'",
                 preparation.harness,
             )
         })
@@ -581,20 +752,47 @@ async fn prepare(
 
     setup_events
         .record_result(SetupStep::AgentCredentialsFetch, async {
-            apply_git_credentials(&config.git_credentials)
+            if config.github_credential_mode == GitHubCredentialMode::Legacy {
+                let credentials = config
+                    .git_credentials
+                    .iter()
+                    .map(|credential| GitCredential {
+                        host: credential.host.clone(),
+                        token: credential.token.clone(),
+                        username: credential.username.clone(),
+                        email: credential.email.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                apply_git_credentials(&credentials)?;
+            }
+            Ok::<_, AgentDriverError>(())
         })
         .await?;
 
     let (_, discovery_dirs) =
         resolve_configured_skills(foreground, skills, true, &working_dir, setup_events).await?;
+    workspace.definition_skill_dirs = Some(skill_dirs.clone());
     merge_skill_dirs(&mut skill_dirs, discovery_dirs);
     workspace.factory_skill_dirs = Some(skill_dirs);
+    let cloud_providers = if FeatureFlag::OzIdentityFederation.is_enabled() {
+        cloud_provider::load_providers(&execution_config::providers(preparation.providers), None)
+            .map_err(AgentDriverError::CloudProviderSetupFailed)?
+    } else {
+        Vec::new()
+    };
     let options = AgentDriverOptions {
+        github_credential_mode: config.github_credential_mode,
+        credential_store_owner: Some(ManagedStoreOwner::Standby {
+            sandbox_id: config.sandbox_id,
+            generation: config.generation,
+        }),
         working_dir,
         secrets,
         environment_variables: config.environment_variables,
         workspace,
-        computer_use_config: Some((preparation.computer_use_enabled, None)),
+        cloud_providers,
+        computer_use_config: (harness == Harness::Oz)
+            .then_some((preparation.computer_use_enabled, None)),
         selected_harness: harness,
         ..Default::default()
     };
@@ -604,7 +802,14 @@ async fn prepare(
             Ok::<_, AgentDriverError>(driver.update(ctx, |_, ctx| ctx.spawner()))
         })
         .await??;
-    AgentDriver::prepare_resources(&driver_spawner, mcp_specs, global_skills, setup_events).await?;
+    AgentDriver::prepare_resources(
+        &driver_spawner,
+        harness,
+        mcp_specs,
+        global_skills,
+        setup_events,
+    )
+    .await?;
     Ok(driver_spawner)
 }
 

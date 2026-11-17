@@ -3172,7 +3172,7 @@ impl TerminalView {
             SyncInputType::RanCommand => {
                 if terminal_input_state == TerminalInputState::InputEditor {
                     self.input.update(ctx, |input, ctx| {
-                        input.run_command_in_synced_terminal_input(ctx);
+                        input.submit_current_input(ctx);
                     });
                 }
             }
@@ -24170,6 +24170,7 @@ impl TerminalView {
         };
 
         let request = RunAgentsRequest {
+            delegated_github_coauthor_user_uid: None,
             metadata: Default::default(),
             summary: summary.clone(),
             base_prompt: "Shared instructions for every child agent.".to_owned(),

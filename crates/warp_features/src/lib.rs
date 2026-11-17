@@ -780,6 +780,9 @@ pub enum FeatureFlag {
     ///   block snapshot from the server.
     OzHandoff,
 
+    /// Restores native-local descendants when a cloud parent resumes after handoff.
+    RestoreLocalSubtree,
+
     /// Enables the upgraded CLI agent session tracking and notifications infrastructure.
     HOANotifications,
 
@@ -1002,10 +1005,23 @@ pub enum FeatureFlag {
     /// Warp-managed object storage.
     StoredScreenshots,
 
+    /// Runs user-configured agent hooks at fixed points in Warp's agent loop.
+    AgentHooks,
+
     /// Lets cloud agent environment checkouts build repositories from bare git
     /// mirrors kept in the persistent build cache instead of cloning each one
     /// from the remote. Disabling it restores direct, network-only checkouts.
     GitMirrorCache,
+    AgentPromptSteering,
+
+    /// Resolves skill reference files in a Factory definition's skill folders during cloud runs,
+    /// loading the selected skills from other repositories.
+    FactorySkillReferences,
+    CreditEquivalentBillingUsage,
+
+    /// Refreshes the short-lived proxy credentials of managed MCP servers during an agent run,
+    /// before they expire and on first use after they have expired.
+    ManagedMcpCredentialRefresh,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -1076,30 +1092,32 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::PromptCacheExpiryWarning,
     FeatureFlag::JupyterNotebookRendering,
     FeatureFlag::MultiLevelOrchestration,
+    FeatureFlag::RestoreLocalSubtree,
     FeatureFlag::McpJsonTreeView,
     FeatureFlag::BoxDrawingGlyphs,
     FeatureFlag::CtrlCCancelsThirdPartyHarness,
     FeatureFlag::WarpingModelName,
-    FeatureFlag::LrcActivitySignal,
     FeatureFlag::StoredScreenshots,
     FeatureFlag::PreviewUrlsMcp,
     FeatureFlag::GitMirrorCache,
-    FeatureFlag::FactoryDeferredRepositories,
-    FeatureFlag::AcpHarness,
+    FeatureFlag::AgentPromptSteering,
+    FeatureFlag::ManagedMcpCredentialRefresh,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
 /// All PREVIEW_FLAGS are also automatically added to dogfood builds (WarpDev).
-pub const PREVIEW_FLAGS: &[FeatureFlag] = &[];
+pub const PREVIEW_FLAGS: &[FeatureFlag] = &[FeatureFlag::LrcActivitySignal];
 
 /// Features enabled for all release builds (i.e.: everything but WarpLocal).
 /// NOTE: if you are promoting a feature from Preview to launch, you'll likely
 /// want to enable the feature by default in app/Cargo.toml, rather than add it to RELEASE_FLAGS.
 pub const RELEASE_FLAGS: &[FeatureFlag] = &[
+    FeatureFlag::CreditEquivalentBillingUsage,
     FeatureFlag::Autoupdate,
     FeatureFlag::Changelog,
     FeatureFlag::CrashReporting,
     FeatureFlag::PeriodicHandoffCheckpoints,
+    FeatureFlag::FactorySkillReferences,
     FeatureFlag::VideoRecording,
     FeatureFlag::WindowsVideoRecording,
     FeatureFlag::ImeMarkedText,

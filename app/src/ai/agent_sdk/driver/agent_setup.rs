@@ -1,5 +1,6 @@
 //! Shared resource setup for normal runs and standby sandboxes before an agent prompt starts.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
@@ -23,6 +24,9 @@ use super::environment::{
     FACTORY_REPO_CLONE_URL_ENV_VAR, FACTORY_REPO_DIR_ENV_VAR,
     prepend_factory_definition_clone_for_values,
 };
+use super::harness::HarnessKind;
+use super::harness::acp::sidecar_launch_file_roots;
+use super::harness::launch_warmup::LaunchFileWarmup;
 use super::{
     AgentDriver, AgentDriverError, StandbyWorkspace, WorkspaceState, environment, mcp_startup,
 };
@@ -45,6 +49,7 @@ impl AgentDriver {
     #[cfg_attr(all(target_family = "wasm", not(test)), expect(dead_code))]
     pub(crate) async fn prepare_resources(
         foreground: &ModelSpawner<Self>,
+        harness: Harness,
         mcp_specs: Vec<MCPSpec>,
         global_skills: GlobalSkillResolution,
         setup_events: &SetupClientEventReporter,
@@ -58,7 +63,19 @@ impl AgentDriver {
             .await?
             .ok_or(AgentDriverError::InvalidRuntimeState)?;
         let prepared_configuration = workspace.clone();
+        Self::replace_prewarmed_mcp_environment(foreground, Default::default()).await?;
         bootstrap_terminal(foreground, setup_events).await?;
+        // A standby has no launch to yield to, so the warm-up is left to finish.
+        if harness != Harness::Oz {
+            LaunchFileWarmup::start(sidecar_launch_file_roots(harness), setup_events);
+        }
+        Self::initialize_setup_vars(foreground, false).await?;
+        setup_events
+            .record_result(
+                SetupStep::CloudProviderSetup,
+                Self::setup_cloud_providers(foreground),
+            )
+            .await?;
         setup_events
             .record_result(
                 SetupStep::GlobalSkillRepoClone,
@@ -94,23 +111,28 @@ impl AgentDriver {
             .await?;
         let prepared = prepare_workspace(
             foreground,
-            Harness::Oz,
+            harness,
             workspace,
             setup_events,
             snapshot_reporter,
         )
         .await?;
+        Self::read_setup_vars(foreground, false, harness == Harness::Oz).await?;
         let working_dir = prepared.harness_working_dir.clone();
         let repositories = prepared.repositories.clone();
         foreground
             .spawn(move |me, _| {
                 me.harness_working_dir = working_dir;
                 me.workspace = Some(WorkspaceState::Prepared(StandbyWorkspace {
+                    harness,
                     configuration: prepared_configuration,
                     repositories,
                 }));
             })
             .await?;
+        if harness != Harness::Oz {
+            return Ok(prepared.harness_working_dir);
+        }
         let managed_mcp_client = foreground
             .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_managed_mcp_client())
             .await?;
@@ -540,7 +562,11 @@ pub(crate) async fn load_skills_dirs(foreground: &ModelSpawner<AgentDriver>) {
     let load_result = foreground
         .spawn(move |me, ctx| {
             let dirs = resolve_skills_dirs(&me.working_dir, dirs);
-            let skills = read_skills_for_skills_dirs(&dirs);
+            let mut skills = read_skills_for_skills_dirs(&dirs);
+            if me.skill_dirs_first_name_wins {
+                let mut names = HashSet::new();
+                skills.retain(|skill| names.insert(skill.name.clone()));
+            }
             if skills.is_empty() {
                 log::info!("WARP_SKILL_DIRS: no skills found");
             } else {
@@ -554,6 +580,38 @@ pub(crate) async fn load_skills_dirs(foreground: &ModelSpawner<AgentDriver>) {
     if let Err(err) = load_result {
         log::warn!("Failed to load WARP_SKILL_DIRS skills: {err}");
     }
+}
+
+/// Prepares the run's agent hooks before its first request: records the run on the hook runtime
+/// and loads the sources its execution configuration selected, once, finding repository sources
+/// among `cloned_repositories`. Fails when a strict source cannot be loaded; any other problem is a
+/// diagnostic.
+pub(crate) async fn setup_hooks_for_run(
+    foreground: &ModelSpawner<AgentDriver>,
+    cloned_repositories: Vec<SourceRepo>,
+) -> Result<(), AgentDriverError> {
+    foreground
+        .spawn(|me, ctx| me.prepare_hooks_for_run(ctx))
+        .await?;
+    foreground
+        .spawn(move |me, ctx| me.load_hook_sources_for_run(&cloned_repositories, ctx))
+        .await?
+}
+
+/// Fails a run whose execution configuration selected hooks for a harness that does not run them.
+pub(crate) async fn refuse_hooks_for_other_harness(
+    foreground: &ModelSpawner<AgentDriver>,
+    harness: &HarnessKind,
+) -> Result<(), AgentDriverError> {
+    let has_hooks = foreground
+        .spawn(|me, _| !me.hooks.sources.is_empty())
+        .await?;
+    if has_hooks {
+        return Err(AgentDriverError::HooksRequireOzHarness {
+            harness: format!("{harness:?}"),
+        });
+    }
+    Ok(())
 }
 
 /// Loads the bundled instructions that let an active Factory run discover and clone deferred repos.

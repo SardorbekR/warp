@@ -45,8 +45,11 @@ impl PrewarmedSandboxClient for FakeClient {
     async fn fetch_configuration(
         &self,
         sandbox_id: &str,
+        supports_deferred_repositories: bool,
     ) -> anyhow::Result<PrewarmedSandboxConfiguration> {
-        panic!("Unexpected configuration fetch for {sandbox_id}")
+        panic!(
+            "Unexpected configuration fetch for {sandbox_id}: support={supports_deferred_repositories}"
+        )
     }
 
     async fn report_status(
@@ -254,6 +257,7 @@ pub(super) fn execution_config() -> ExecutionConfiguration {
         idle_on_complete_seconds: None,
         idle_on_fail_seconds: None,
         snapshot_disabled: true,
+        agent_hook_sources: Vec::new(),
     }
 }
 
@@ -276,6 +280,25 @@ pub(super) async fn drive(
     clock: &TestClock,
     hooks: &Hooks,
     standby_seconds: i64,
+) -> anyhow::Result<()> {
+    drive_with_renewal(
+        preparation,
+        connections,
+        clock,
+        hooks,
+        standby_seconds,
+        future::pending(),
+    )
+    .await
+}
+
+pub(super) async fn drive_with_renewal(
+    preparation: impl Future<Output = anyhow::Result<usize>>,
+    connections: async_channel::Receiver<ConnectionAttempt>,
+    clock: &TestClock,
+    hooks: &Hooks,
+    standby_seconds: i64,
+    renewal: impl Future<Output = anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     run_lifecycle(
         "abc123",
@@ -314,6 +337,7 @@ pub(super) async fn drive(
             .boxed()
         },
         &clock.clock(),
+        renewal,
     )
     .await
 }

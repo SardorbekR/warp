@@ -24,6 +24,9 @@ fn lifecycle_pending_event(
         api::LifecycleEventType::InProgress => {
             Some(api::agent_event::lifecycle_event::Detail::InProgress(()))
         }
+        api::LifecycleEventType::Waiting => {
+            Some(api::agent_event::lifecycle_event::Detail::Waiting(()))
+        }
         api::LifecycleEventType::Succeeded => {
             Some(api::agent_event::lifecycle_event::Detail::Succeeded(()))
         }
@@ -33,9 +36,9 @@ fn lifecycle_pending_event(
                 error_message: String::new(),
             },
         )),
-        api::LifecycleEventType::Cancelled => {
-            Some(api::agent_event::lifecycle_event::Detail::Cancelled(()))
-        }
+        api::LifecycleEventType::Cancelled => Some(
+            api::agent_event::lifecycle_event::Detail::Cancelled(Default::default()),
+        ),
         api::LifecycleEventType::Blocked => {
             Some(api::agent_event::lifecycle_event::Detail::Blocked(
                 api::agent_event::lifecycle_event::Blocked {

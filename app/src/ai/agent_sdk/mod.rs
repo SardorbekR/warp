@@ -15,6 +15,7 @@ use anyhow::Context;
 pub use driver::AgentDriver;
 use driver::AgentDriverError;
 use driver::agent_setup::configured_skills::{self, merge_skill_dirs};
+use driver::git_credentials::restricted::{CredentialStoreGuard, ManagedStoreOwner};
 pub(crate) use driver::harness::{ClaudeHarness, task_env_vars, validate_cli_installed};
 use telemetry::CliTelemetryEvent;
 use tracing::Instrument as _;
@@ -40,9 +41,10 @@ use warp_cli::skill::SkillSpec;
 use warp_cli::task::{MessageCommand, TaskCommand};
 use warp_cli::{CliCommand, GlobalOptions, OZ_HARNESS_ENV};
 use warp_core::features::FeatureFlag;
-use warp_errors::report_error;
+use warp_errors::{report_error, report_if_error};
 use warp_graphql::object_permissions::OwnerType;
 use warp_graphql::queries::execution_config::ExecutionConfiguration;
+use warp_graphql::queries::task_restricted_git_credentials::GitHubCredentialMode;
 use warp_isolation_platform::IsolationPlatformError;
 #[cfg(not(target_family = "wasm"))]
 use warp_logging::log_file_path;
@@ -129,6 +131,7 @@ mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod text_layout;
+mod transport_report;
 
 /// Prints a non-blocking warning to stderr when the CLI is invoked with a team-scoped API key.
 fn maybe_warn_team_api_key(ctx: &AppContext) {
@@ -632,8 +635,10 @@ struct RepositoryContract {
     use_factory_repositories: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_execution_task_and_options(
     args: Option<&RunAgentArgs>,
+    harness_transport: HarnessTransport,
     config: ExecutionConfiguration,
     repository_contract: RepositoryContract,
     working_dir: PathBuf,
@@ -674,9 +679,6 @@ fn build_execution_task_and_options(
         !execution_id.is_empty() && config.execution_id.inner() == execution_id,
         "Execution configuration execution mismatch"
     );
-    let harness_transport = args
-        .and_then(|args| args.harness_transport)
-        .unwrap_or_default();
     let selected_harness = execution_config::harness(&config.harness)?;
     let model = if selected_harness == Harness::Oz {
         config
@@ -711,7 +713,12 @@ fn build_execution_task_and_options(
         anyhow::bail!("An execution that skips its initial turn requires an idle window");
     }
     let providers = execution_config::providers(config.providers);
+    let hooks = driver::hooks::RunHooks {
+        sources: execution_config::agent_hook_sources(config.agent_hook_sources)?,
+        surface: driver::hooks::run_surface_for(true),
+    };
     let mut factory_skill_dirs = execution_config::factory_skill_dirs(config.factory_skill_dirs)?;
+    let definition_skill_dirs = factory_skill_dirs.clone();
     merge_skill_dirs(&mut factory_skill_dirs, skill_discovery_dirs);
     let task = Task {
         prompt: AgentRunPrompt::ServerSide {
@@ -726,7 +733,10 @@ fn build_execution_task_and_options(
     let options = AgentDriverOptions {
         working_dir: working_dir.clone(),
         task_id: Some(task_id),
+        execution_id: Some(execution_id.to_owned()),
         use_factory_repositories,
+        github_credential_mode: GitHubCredentialMode::Legacy,
+        credential_store_owner: None,
         experimental: None,
         parent_run_id: config.parent_run_id.map(|id| id.into_inner()),
         should_share: FeatureFlag::AgentSharedSessions.is_enabled(),
@@ -749,6 +759,7 @@ fn build_execution_task_and_options(
                 supports_deferred_repositories,
             )?;
             workspace.factory_skill_dirs = Some(factory_skill_dirs);
+            workspace.definition_skill_dirs = Some(definition_skill_dirs);
             workspace
         },
         computer_use_config: (selected_harness == Harness::Oz).then(|| {
@@ -759,6 +770,7 @@ fn build_execution_task_and_options(
         }),
         selected_harness,
         harness_transport,
+        harness_transport_fallback: None,
         third_party_harness_model_config,
         team_scope: None,
         bedrock_oidc_credentials: None,
@@ -775,6 +787,7 @@ fn build_execution_task_and_options(
         mcp_startup_timeout: args
             .and_then(|args| args.mcp_startup_timeout)
             .map(Into::into),
+        hooks,
     };
     Ok((
         options,
@@ -903,6 +916,8 @@ impl AgentDriverRunner {
         // Local CLI-created runs may not have a task yet, so those setup events explicitly no-op.
         let mut task_id: Option<AmbientAgentTaskId> =
             args.task_id.as_deref().and_then(|s| s.parse().ok());
+        let credentials = task_id
+            .map(|task_id| CredentialStoreGuard::new(ManagedStoreOwner::Task(task_id.to_string())));
         // Set up and run the driver, reporting any errors back to the server.
         let result: Result<(), AgentDriverError> = async {
             Self::set_ambient_agent_task_id(&foreground, task_id).await?;
@@ -990,7 +1005,7 @@ impl AgentDriverRunner {
             // For the `--task-id` path, `task_conversation_id` is the `conversation_id` read off
             // the fetched `AmbientAgentTask` (set by the server when linking the task to an
             // existing conversation, e.g. via `run-cloud --conversation`).
-            let (mut driver_options, task, task_conversation_id) =
+            let (mut driver_options, mut task, task_conversation_id) =
                 Self::build_driver_options_and_task(
                     &foreground,
                     args,
@@ -1042,6 +1057,7 @@ impl AgentDriverRunner {
                 HarnessKind::Unsupported(harness) => {
                     return Err(AgentDriverError::HarnessSetupFailed {
                         harness: harness.to_string(),
+                        stage: None,
                         reason: format!(
                             "The {harness} harness is only supported for local child agent launches."
                         ),
@@ -1050,6 +1066,18 @@ impl AgentDriverRunner {
                 HarnessKind::Oz | HarnessKind::ThirdParty(_) => {}
             }
 
+            // A run requested over ACP whose sandbox has no ACP adapter is driven over a PTY
+            // instead. This runs before anything reads the transport: the native prompt
+            // queue, the harness environment, the terminal launch and the resume path.
+            let transport_fallback = driver::harness::apply_transport_fallback(
+                &mut task.harness,
+                &mut driver_options.harness_transport,
+            )?;
+            if let Some(reason) = transport_fallback {
+                Self::note_transport_fallback(&foreground, task.harness.harness(), reason).await;
+            }
+            driver_options.harness_transport_fallback = transport_fallback;
+
             // Validate that the third-party harness is installed and authed.
             if let HarnessKind::ThirdParty(harness) = &task.harness {
                 harness.validate()?;
@@ -1057,6 +1085,23 @@ impl AgentDriverRunner {
 
             if let Some(task_id) = driver_options.task_id {
                 driver::write_run_started(&task_id.to_string(), output_format);
+                // Tell the server which transport the run actually got, so follow-up
+                // attachments and session links agree with it. The report is retried in the
+                // background, so setup does not wait on the server. A harness whose transport
+                // is fixed (Pi) is skipped: the server rejects a report for it.
+                if task.harness.reports_transport() {
+                    let transport = driver_options.harness_transport;
+                    foreground
+                        .spawn(move |_, ctx| {
+                            transport_report::report_transport_in_background(
+                                &ctx.background_executor(),
+                                ServerApiProvider::as_ref(ctx).get_harness_support_client(),
+                                transport,
+                                transport_fallback.map(driver::harness::TransportFallbackReason::as_str),
+                            );
+                        })
+                        .await?;
+                }
             }
 
             // Pull conversation information, if we have it
@@ -1082,6 +1127,7 @@ impl AgentDriverRunner {
                         output_format,
                         share_requests,
                         task,
+                        credentials,
                     )
                 })
                 .await??;
@@ -1093,6 +1139,9 @@ impl AgentDriverRunner {
         if let Err(ref err) = result
             && let Some(task_id) = task_id
         {
+            report_if_error!(driver::git_credentials::close_restricted_credentials(
+                &task_id.to_string()
+            ));
             driver::report_driver_error(task_id, err, &server_api).await;
         }
         result
@@ -1258,7 +1307,20 @@ impl AgentDriverRunner {
         task_id_str: &str,
         configure_git_credentials_with_github: bool,
         use_factory_repositories: bool,
+        github_credential_mode: GitHubCredentialMode,
     ) -> Result<(), AgentDriverError> {
+        if github_credential_mode == GitHubCredentialMode::RestrictedInstallation {
+            let ai_client = foreground
+                .spawn(|_, ctx| ServerApiProvider::as_ref(ctx).get_ai_client())
+                .await?;
+            return driver::git_credentials::bootstrap_restricted_credentials(
+                task_id_str,
+                &ai_client,
+                use_factory_repositories,
+            )
+            .await
+            .map_err(AgentDriverError::GitCredentialsFetchFailed);
+        }
         // The gh CLI only covers github.com, so this must not replace the
         // server fetch below — other forges (GitLab, Azure DevOps) get their
         // credentials exclusively from the server.
@@ -1420,12 +1482,17 @@ impl AgentDriverRunner {
                     std::env::var_os(FACTORY_ID_ENV),
                 )
             });
+        let github_credential_mode = driver::git_credentials::credential_mode(
+            std::env::var("WARP_GITHUB_CREDENTIAL_MODE").ok().as_deref(),
+        )
+        .map_err(AgentDriverError::ConfigBuildFailed)?;
         if let Some(task_id_str) = args.task_id.as_ref() {
             Self::bootstrap_git_credentials_for_task(
                 foreground,
                 task_id_str,
                 args.configure_git_credentials_with_github,
                 use_factory_repositories,
+                github_credential_mode,
             )
             .await?;
         }
@@ -1459,6 +1526,7 @@ impl AgentDriverRunner {
                 .spawn(move |_, ctx| {
                     build_execution_task_and_options(
                         Some(&args),
+                        args.harness_transport.unwrap_or_default(),
                         config,
                         repository_contract,
                         working_dir,
@@ -1469,6 +1537,7 @@ impl AgentDriverRunner {
                 })
                 .await?
                 .map_err(AgentDriverError::ConfigBuildFailed)?;
+            options.github_credential_mode = github_credential_mode;
             options.team_scope = agent_driver_team_scope;
             let task_id = options
                 .task_id
@@ -1488,14 +1557,9 @@ impl AgentDriverRunner {
                 )
                 .await?;
             if FeatureFlag::OzIdentityFederation.is_enabled() {
-                options.cloud_providers = driver::cloud_provider::load_providers(
-                    &providers,
-                    &options
-                        .task_id
-                        .ok_or(AgentDriverError::InvalidRuntimeState)?
-                        .to_string(),
-                )
-                .map_err(AgentDriverError::CloudProviderSetupFailed)?;
+                options.cloud_providers =
+                    driver::cloud_provider::load_providers(&providers, Some(&task_id.to_string()))
+                        .map_err(AgentDriverError::CloudProviderSetupFailed)?;
             }
             return Ok((options, task, conversation_id));
         }
@@ -1538,7 +1602,10 @@ impl AgentDriverRunner {
                 let driver_options = driver::AgentDriverOptions {
                     working_dir: working_dir.clone(),
                     task_id,
+                    execution_id: args.execution_id.clone(),
                     use_factory_repositories,
+                    github_credential_mode,
+                    credential_store_owner: None,
                     experimental: None,
                     parent_run_id: None,
                     should_share,
@@ -1552,6 +1619,7 @@ impl AgentDriverRunner {
                     computer_use_config: None,
                     selected_harness: args.harness,
                     harness_transport: args.harness_transport.unwrap_or_default(),
+                    harness_transport_fallback: None,
                     third_party_harness_model_config,
                     team_scope: None,
                     bedrock_oidc_credentials: None,
@@ -1568,6 +1636,7 @@ impl AgentDriverRunner {
                     skip_initial_turn: args.skip_initial_turn,
                     strict_mcp_startup: args.strict_mcp_startup,
                     mcp_startup_timeout: args.mcp_startup_timeout.map(|duration| duration.into()),
+                    hooks: Default::default(),
                 };
 
                 Ok((
@@ -1980,6 +2049,28 @@ impl AgentDriverRunner {
         Ok((task_conversation_id, additional_source_repos))
     }
 
+    /// Logs and records in telemetry that a run requested over ACP is driven over a PTY.
+    async fn note_transport_fallback(
+        foreground: &ModelSpawner<Self>,
+        harness: Harness,
+        reason: driver::harness::TransportFallbackReason,
+    ) {
+        log::info!(
+            "No ACP adapter for the {harness} harness in this sandbox ({reason}); driving it over a PTY"
+        );
+        let harness_name = harness.to_string();
+        let _ = foreground
+            .spawn(move |_, ctx| {
+                use warp_core::telemetry::TelemetryEvent as _;
+                let event = driver::harness::ThirdPartyHarnessTelemetryEvent::TransportFallback {
+                    harness: harness_name,
+                    reason: reason.as_str(),
+                };
+                crate::send_telemetry_from_app_ctx!(event, ctx);
+            })
+            .await;
+    }
+
     /// If we are starting this agent run from an existing conversation, load the conversation
     /// data from the server and return the harness-specific [`ResumeOptions`] payload that the
     /// caller plugs onto [`AgentDriverOptions::resume`].
@@ -1994,8 +2085,8 @@ impl AgentDriverRunner {
     /// [`driver::ResumeOptions::ThirdParty`]; each harness owns its server call and error
     /// mapping. Returns `None` if a third-party harness has no resume payload to surface.
     #[tracing::instrument(skip_all, err, fields(tags.cloud_agent = true, conversation_id = conversation_id))]
-    async fn load_conversation_information(
-        foreground: &ModelSpawner<Self>,
+    async fn load_conversation_information<E: Entity>(
+        foreground: &ModelSpawner<E>,
         conversation_id: String,
         harness: &HarnessKind,
     ) -> Result<Option<driver::ResumeOptions>, AgentDriverError> {
@@ -2003,6 +2094,7 @@ impl AgentDriverRunner {
             HarnessKind::Unsupported(harness) => {
                 return Err(AgentDriverError::HarnessSetupFailed {
                     harness: harness.to_string(),
+                    stage: None,
                     reason: format!(
                         "The {harness} harness is only supported for local child agent launches."
                     ),
@@ -2091,12 +2183,9 @@ impl AgentDriverRunner {
             .await??;
 
         if FeatureFlag::OzIdentityFederation.is_enabled() {
-            let run_id = driver_options
-                .task_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "local".to_string());
+            let run_id = driver_options.task_id.map(|id| id.to_string());
             driver_options.cloud_providers =
-                driver::cloud_provider::load_providers(&environment.providers, &run_id)
+                driver::cloud_provider::load_providers(&environment.providers, run_id.as_deref())
                     .map_err(AgentDriverError::CloudProviderSetupFailed)?;
         }
 
@@ -2111,6 +2200,7 @@ impl AgentDriverRunner {
         output_format: OutputFormat,
         share_requests: Option<Vec<ShareRequest>>,
         task: driver::Task,
+        credentials: Option<CredentialStoreGuard>,
     ) -> Result<(), AgentDriverError> {
         maybe_warn_team_api_key(ctx);
         let driver = AgentDriver::create(driver_options, ctx)?;
@@ -2126,7 +2216,10 @@ impl AgentDriverRunner {
                 .in_scope(|| driver.run(task, ctx))
                 .instrument(span);
 
-            ctx.spawn(agent_future, |_, result, ctx| match result {
+            ctx.spawn(async move {
+                let _credentials = credentials;
+                agent_future.await
+            }, |_, result, ctx| match result {
                 Ok(()) => {
                     ctx.terminate_app(TerminationMode::ForceTerminate, None);
                 }
@@ -2221,7 +2314,6 @@ fn launch_command(
     command: CliCommand,
     global_options: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let parent_span = tracing::Span::current();
     let requires_auth = command_requires_auth(&command);
 
     if !requires_auth {
@@ -2229,24 +2321,38 @@ fn launch_command(
     }
 
     let cli_name = warp_cli::binary_name().unwrap_or_else(|| "warp".to_string());
+    authenticate_then_execute(
+        global_options.api_key.clone(),
+        &format!("You are not logged in - please log in with `{cli_name} login` to continue."),
+        ctx,
+        move |ctx| dispatch_command(ctx, command.clone(), global_options.clone()),
+    )
+}
+
+/// Establishes IAP access and validates credentials before executing a command once.
+pub fn authenticate_then_execute(
+    pending_api_key: Option<String>,
+    login_hint: &str,
+    ctx: &mut AppContext,
+    execute: impl FnOnce(&mut AppContext) -> anyhow::Result<()> + 'static,
+) -> anyhow::Result<()> {
+    let parent_span = tracing::Span::current();
 
     let auth_state = AuthStateProvider::handle(ctx).as_ref(ctx).get();
-    let Some(authentication) =
-        command_authentication(global_options.api_key.clone(), auth_state.is_logged_in())
+    let Some(authentication) = command_authentication(pending_api_key, auth_state.is_logged_in())
     else {
-        return Err(anyhow::anyhow!(
-            "You are not logged in - please log in with `{cli_name} login` to continue."
-        ));
+        return Err(anyhow::anyhow!("{}", login_hint));
     };
 
     // On staging the warp-server is fronted by IAP, so establish an IAP token
     // before *any* warp-server request.
     let iap = IapManager::handle(ctx);
     if !iap.as_ref(ctx).is_enabled() || iap.as_ref(ctx).has_valid_token() {
-        authenticate_and_dispatch(ctx, command, global_options, authentication, parent_span);
+        authenticate_and_execute(ctx, parent_span, authentication, execute);
         return Ok(());
     }
 
+    let mut execute = Some(execute);
     let mut handled = false;
     let parent_span_for_iap = parent_span.clone();
     ctx.subscribe_to_model(&iap, move |_, event, ctx| {
@@ -2259,16 +2365,18 @@ fn launch_command(
                 if IapManager::handle(ctx).as_ref(ctx).has_valid_token() =>
             {
                 handled = true;
-                authenticate_and_dispatch(
-                    ctx,
-                    command.clone(),
-                    global_options.clone(),
-                    authentication.clone(),
-                    parent_span.clone(),
-                );
+                if let Some(execute) = execute.take() {
+                    authenticate_and_execute(
+                        ctx,
+                        parent_span.clone(),
+                        authentication.clone(),
+                        execute,
+                    );
+                }
             }
             IapManagerEvent::AccessUnavailable => {
                 handled = true;
+                execute = None;
                 report_fatal_error(
                     anyhow::anyhow!("Timed out establishing IAP access to warp-server."),
                     ctx,
@@ -2283,18 +2391,18 @@ fn launch_command(
     Ok(())
 }
 
-/// Subscribes to auth events, authenticates, and dispatches the command once
+/// Subscribes to auth events, authenticates, and execute the closure once
 /// auth completes. Assumes IAP access (if applicable) is already established.
-fn authenticate_and_dispatch(
+fn authenticate_and_execute(
     ctx: &mut AppContext,
-    command: CliCommand,
-    global_options: GlobalOptions,
-    authentication: CommandAuthentication,
     parent_span: tracing::Span,
+    authentication: CommandAuthentication,
+    execute: impl FnOnce(&mut AppContext) -> anyhow::Result<()> + 'static,
 ) {
     let cli_name = warp_cli::binary_name().unwrap_or_else(|| "warp".to_string());
 
     // Subscribe to auth events and wait for validation before running the command.
+    let mut execute_once = Some(execute);
     let mut dispatched = false;
     ctx.subscribe_to_model(&AuthManager::handle(ctx), move |_, event, ctx| {
         let _guard = parent_span.enter();
@@ -2304,12 +2412,15 @@ fn authenticate_and_dispatch(
         match event {
             AuthManagerEvent::AuthComplete => {
                 dispatched = true;
-                if let Err(err) = dispatch_command(ctx, command.clone(), global_options.clone()) {
+                if let Some(execute) = execute_once.take()
+                    && let Err(err) = execute(ctx)
+                {
                     report_fatal_error(err, ctx);
                 }
             }
             AuthManagerEvent::NeedsReauth => {
                 dispatched = true;
+                execute_once = None;
                 let auth_state = AuthStateProvider::handle(ctx).as_ref(ctx).get();
                 let message = if auth_state.is_api_key_authenticated() {
                     "Your API key is invalid. Please provide a valid key via '--api-key' or the WARP_API_KEY environment variable.".to_string()
@@ -2320,6 +2431,7 @@ fn authenticate_and_dispatch(
             }
             AuthManagerEvent::AuthFailed(err) => {
                 dispatched = true;
+                execute_once = None;
                 report_fatal_error(anyhow::anyhow!("Authentication failed: {err:#}"), ctx);
             }
             _ => {}
@@ -2391,6 +2503,10 @@ fn command_to_telemetry_event(command: &CliCommand) -> CliTelemetryEvent {
             has_environment: args.environment.is_some(),
             task_id: args.task_id.clone(),
             harness: args.harness.to_string(),
+            requested_transport: args.harness_transport.map(|transport| match transport {
+                HarnessTransport::Acp => "acp",
+                HarnessTransport::Pty => "pty",
+            }),
         },
         CliCommand::Agent(AgentCommand::RunCloud(_)) => CliTelemetryEvent::AgentRunAmbient,
         CliCommand::Agent(AgentCommand::RunCloudStandby(_)) => {

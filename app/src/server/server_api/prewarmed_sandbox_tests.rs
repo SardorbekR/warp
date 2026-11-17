@@ -56,6 +56,42 @@ fn control_socket_url_uses_websocket_schemes_and_binds_the_generation() {
 }
 
 #[test]
+#[serial_test::serial]
+fn control_origin_override_leaves_status_on_the_server_root() {
+    let server_root = ChannelState::server_root_url();
+    assert_eq!(
+        control_socket_url(&ServerApi::prewarmed_sandbox_url("sb", "ws"), "abc123").unwrap(),
+        control_socket_url(
+            &format!("{server_root}/internal/prewarmed-sandboxes/sb/ws"),
+            "abc123"
+        )
+        .unwrap()
+    );
+    for (origin, expected) in [
+        (
+            "https://platform.warp.dev",
+            "wss://platform.warp.dev/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+        (
+            "http://localhost:8082",
+            "ws://localhost:8082/internal/prewarmed-sandboxes/sb/ws?generation=abc123",
+        ),
+    ] {
+        ChannelState::override_prewarmed_sandbox_control_url(origin).unwrap();
+        assert_eq!(
+            control_socket_url(&ServerApi::prewarmed_sandbox_url("sb", "ws"), "abc123").unwrap(),
+            expected
+        );
+        assert_eq!(
+            ServerApi::prewarmed_sandbox_url("sb", "status"),
+            format!("{server_root}/internal/prewarmed-sandboxes/sb/status")
+        );
+        assert_eq!(ChannelState::server_root_url(), server_root);
+    }
+    ChannelState::set(ChannelState::init());
+}
+
+#[test]
 #[cfg(not(target_family = "wasm"))]
 fn native_control_headers_are_sensitive() {
     let request =
@@ -99,7 +135,7 @@ fn configuration_errors_return_after_one_request() {
             .create();
         drop(server);
 
-        let error = block_on(api.fetch_configuration("sandbox")).unwrap_err();
+        let error = block_on(api.fetch_configuration("sandbox", true)).unwrap_err();
         assert_eq!(
             match error
                 .downcast_ref::<warp_graphql::client::GraphQLError>()
@@ -149,6 +185,12 @@ fn deserializes_a_server_configuration() {
     assert_eq!(config.preparation.skills, ["warpdotdev/warp:review"]);
     assert_eq!(config.preparation.factory_skill_dirs, [".agents/skills"]);
     assert!(config.preparation.computer_use_enabled);
+    let providers = config.preparation.providers.as_ref().unwrap();
+    assert_eq!(providers.gcp.as_ref().unwrap().project_number, "123456789");
+    assert_eq!(
+        providers.aws.as_ref().unwrap().role_arn,
+        "arn:aws:iam::123456789012:role/OzAgent"
+    );
 
     assert_eq!(
         config.environment_variables.get("WARP_FACTORY_REPO_DIR"),
@@ -242,7 +284,11 @@ fn configuration_uses_default_graphql_timeout_and_authentication() {
         assert!(payload["variables"]["requestContext"].is_object());
         assert_eq!(
             payload["variables"]["input"],
-            serde_json::json!({"sandboxId": "sandbox"})
+            serde_json::json!({
+                "sandboxId": "11111111-2222-3333-4444-555555555555",
+                "githubCredentialContractVersion": 1,
+                "supportsDeferredRepositories": true
+            })
         );
     }));
     let api = authenticated_client_with_http(http_client);
@@ -255,7 +301,7 @@ fn configuration_uses_default_graphql_timeout_and_authentication() {
         .create();
     drop(server);
     assert_eq!(
-        block_on(api.fetch_configuration("sandbox"))
+        block_on(api.fetch_configuration("11111111-2222-3333-4444-555555555555", true))
             .unwrap()
             .generation,
         "abc123"
@@ -293,7 +339,7 @@ fn configuration_rejects_user_errors_unknown_results_and_missing_data() {
             .with_body(body.to_string())
             .create();
         drop(server);
-        let error = block_on(api.fetch_configuration("sandbox")).unwrap_err();
+        let error = block_on(api.fetch_configuration("sandbox", true)).unwrap_err();
         assert_eq!(error.to_string(), expected);
         assert!(!format!("{error:#}").contains("private-server-detail"));
         request.assert();
@@ -502,6 +548,40 @@ fn fresh_assignment_fixture_decodes_nullable_control_fields() {
     assert_eq!(expires_at.to_rfc3339(), "2026-01-01T00:00:00+00:00");
 }
 
+fn assignment_hook_sources(fixture: serde_json::Value) -> usize {
+    let event: PrewarmedSandboxControlEvent = serde_json::from_value(fixture).unwrap();
+    let PrewarmedSandboxControlEvent::Assignment {
+        execution_config, ..
+    } = event
+    else {
+        panic!("expected assignment event");
+    };
+    execution_config.agent_hook_sources.len()
+}
+
+/// A server that predates agent hooks sends no `agentHookSources`; the assignment still decodes,
+/// with no hook sources.
+#[test]
+fn an_assignment_without_hook_sources_decodes_with_none() {
+    let mut fixture: serde_json::Value =
+        serde_json::from_str(include_str!("testdata/prewarmed_assignment_fresh_run.json")).unwrap();
+    assert_eq!(assignment_hook_sources(fixture.clone()), 0);
+    fixture["execution_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("agentHookSources");
+    assert_eq!(assignment_hook_sources(fixture.clone()), 0);
+    fixture["execution_config"]["agentHookSources"] = serde_json::json!([{
+        "format": "CURSOR",
+        "repository": null,
+        "path": "/etc/hooks",
+        "level": "FACTORY",
+        "strict": false,
+        "onAsk": "DENY"
+    }]);
+    assert_eq!(assignment_hook_sources(fixture), 1);
+}
+
 #[test]
 fn assignment_debug_omits_run_credentials_and_embedded_config_values() {
     let mut event: PrewarmedSandboxControlEvent =
@@ -569,7 +649,7 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
         .match_header("authorization", "Bearer test-access-token")
         .match_body(Matcher::PartialJson(serde_json::json!({
             "variables": {
-                "input": { "sandboxId": "sandbox" }
+                "input": { "sandboxId": "11111111-2222-3333-4444-555555555555" }
             }
         })))
         .with_status(200)
@@ -590,7 +670,10 @@ fn all_endpoints_use_cached_credentials_and_expected_payloads() {
     drop(server);
     block_on(async {
         assert_eq!(
-            api.fetch_configuration("sandbox").await.unwrap().generation,
+            api.fetch_configuration("11111111-2222-3333-4444-555555555555", true)
+                .await
+                .unwrap()
+                .generation,
             "abc123"
         );
         api.report_status("sandbox", "abc123", PrewarmedSandboxState::Ready)
@@ -653,4 +736,126 @@ fn rejects_requests_without_access_credentials() {
         error.to_string().contains("requires an access token"),
         "{error:#}"
     );
+}
+
+#[test]
+fn restricted_configuration_preserves_mode_scope_expiry_and_identity() {
+    let mut wire: serde_json::Value = serde_json::from_str(CONFIGURATION_JSON).unwrap();
+    let config = &mut wire["data"]["prewarmedSandboxConfig"];
+    config["githubCredentialMode"] = "RESTRICTED_INSTALLATION".into();
+    config["gitCredentials"][0]["username"] = "warp[bot]".into();
+    config["gitCredentials"][0]["email"] = "warp@users.noreply.github.com".into();
+    config["gitCredentials"][0]["expiresAt"] = "2027-01-01T01:00:00Z".into();
+    config["gitCredentials"][0]["repositoryScope"] = "warpdotdev/warp".into();
+    let response: cynic::GraphQlResponse<PrewarmedSandboxConfig> =
+        serde_json::from_value(wire).unwrap();
+    let PrewarmedSandboxConfigResult::PrewarmedSandboxConfiguration(config) =
+        response.data.unwrap().prewarmed_sandbox_config
+    else {
+        panic!("configuration")
+    };
+    let config = PrewarmedSandboxConfiguration::try_from(*config).unwrap();
+    assert_eq!(
+        config.github_credential_mode,
+        GitHubCredentialMode::RestrictedInstallation
+    );
+    assert_eq!(config.sandbox_id, "11111111-2222-3333-4444-555555555555");
+    assert_eq!(
+        config.git_credentials[0].repository_scope.as_deref(),
+        Some("warpdotdev/warp")
+    );
+    assert_eq!(
+        config.git_credentials[0].username.as_deref(),
+        Some("warp[bot]")
+    );
+    assert_eq!(
+        config.git_credentials[0].email.as_deref(),
+        Some("warp@users.noreply.github.com")
+    );
+    assert_eq!(
+        config.git_credentials[0]
+            .expires_at
+            .unwrap()
+            .utc()
+            .to_rfc3339(),
+        "2027-01-01T01:00:00+00:00"
+    );
+}
+
+#[test]
+fn restricted_configuration_without_tokens_keeps_its_mode() {
+    let mut wire = wire_configuration();
+    wire.github_credential_mode = GitHubCredentialMode::RestrictedInstallation;
+    wire.git_credentials.clear();
+    let config = PrewarmedSandboxConfiguration::try_from(wire).unwrap();
+    assert_eq!(
+        config.github_credential_mode,
+        GitHubCredentialMode::RestrictedInstallation
+    );
+    assert!(config.git_credentials.is_empty());
+}
+
+#[test]
+#[cfg(not(feature = "skip_login"))]
+fn config_gone_requires_the_structured_lifecycle_marker() {
+    let api = authenticated_client();
+    for (code, status, retryable, reason, expected) in [
+        (
+            "OPERATION_NOT_SUPPORTED",
+            410,
+            false,
+            "prewarmed_sandbox_unavailable",
+            true,
+        ),
+        (
+            "NOT_AUTHORIZED",
+            410,
+            false,
+            "prewarmed_sandbox_unavailable",
+            false,
+        ),
+        (
+            "OPERATION_NOT_SUPPORTED",
+            403,
+            false,
+            "prewarmed_sandbox_unavailable",
+            false,
+        ),
+        (
+            "OPERATION_NOT_SUPPORTED",
+            410,
+            true,
+            "prewarmed_sandbox_unavailable",
+            false,
+        ),
+        (
+            "OPERATION_NOT_SUPPORTED",
+            410,
+            false,
+            "another_reason",
+            false,
+        ),
+    ] {
+        let response = serde_json::json!({"data": {
+            "prewarmedSandboxConfig": {
+                "__typename": "UserFacingError", "responseContext": {"serverVersion": null},
+                "error": {"__typename": "PlatformError", "message": "private-server-detail", "detail": "private-server-detail",
+                    "info": {"errorMessage": "unavailable", "code": code, "httpStatus": status,
+                        "userFacingMessages": [], "detail": null, "retryable": retryable,
+                        "isUserError": false, "metadata": [{"key": "reason", "value": reason}],
+                        "debug": null, "metricsCategory": "prewarmed", "traceId": null}
+                }
+            }
+        }});
+        let mut server = ChannelState::mock_server();
+        let request = server
+            .mock("POST", "/graphql/v2?op=PrewarmedSandboxConfig")
+            .with_body(response.to_string())
+            .create();
+        drop(server);
+        let error = block_on(api.fetch_configuration("sandbox", true)).unwrap_err();
+        assert_eq!(is_prewarmed_sandbox_unavailable(&error), expected);
+        assert!(!format!("{error:#}").contains("private-server-detail"));
+        request.assert();
+    }
 }

@@ -126,6 +126,7 @@ fn verify_standby_bootstrap() {
                         "__typename": "PrewarmedSandboxConfiguration",
                         "sandboxId": "bootstrap-test",
                         "fingerprint": "bootstrap-generation",
+                        "githubCredentialMode": "LEGACY",
                         "spec": {
                             "harness": "oz",
                             "repositories": [],
@@ -134,7 +135,8 @@ fn verify_standby_bootstrap() {
                             "mcpServersJson": "{}",
                             "skills": [],
                             "factorySkillDirs": [],
-                            "computerUseEnabled": false
+                            "computerUseEnabled": false,
+                            "providers": null
                         },
                         "environmentVariables": [
                             {"name": "STANDBY_TEST_ENV", "value": "prepared"}
