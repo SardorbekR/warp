@@ -146,6 +146,9 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_detect_powerlevel10k);
     register_test!(test_open_and_close_resource_center);
     register_test!(test_block_based_snackbar_scroll_to_top);
+    register_test!(test_scroll_position_survives_tab_switch_finished_block);
+    register_test!(test_scroll_position_survives_tab_switch_running_agent);
+    register_test!(test_scroll_position_survives_tab_switch_claude_session);
     register_test!(test_block_based_snackbar_small_window);
     register_test!(test_block_based_snackbar_appears_for_running_command_input_at_bottom);
     register_test!(test_block_based_snackbar_not_visible_for_pager_command_input_at_bottom);
