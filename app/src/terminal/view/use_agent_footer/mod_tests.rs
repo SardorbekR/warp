@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use warp_core::settings::Setting as _;
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
-use warpui::{App, AppContext, SingletonEntity, ViewContext};
+use warpui::units::IntoLines;
+use warpui::{App, AppContext, SingletonEntity, ViewContext, ViewHandle};
 
 use super::super::{AIBlockMetadata, RichContentMetadata, RichContentType};
 use super::*;
@@ -18,7 +19,8 @@ use crate::ai::blocklist::model::{
 use crate::ai::blocklist::{AIBlock, ClientIdentifiers};
 use crate::ai::llms::LLMId;
 use crate::features::FeatureFlag;
-use crate::settings::AISettings;
+use crate::settings::{AISettings, FocusedTerminalInfo};
+use crate::terminal::block_list_viewport::ScrollPosition;
 use crate::terminal::cli_agent_sessions::{
     CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
     CLIAgentSessionsModel,
@@ -98,6 +100,47 @@ fn simulate_user_started_long_running_command(view: &mut TerminalView) {
         });
         model.simulate_long_running_block("ssh localhost", "Password:");
     }
+}
+
+fn start_claude_session(view: &TerminalView, ctx: &mut ViewContext<TerminalView>) {
+    let view_id = view.id();
+    CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+        sessions.set_session(
+            view_id,
+            CLIAgentSession {
+                agent: CLIAgent::Claude,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: CLIAgentSessionContext::default(),
+                input_state: CLIAgentInputState::Closed,
+                listener: None,
+                plugin_version: None,
+                remote_host: None,
+                draft_text: None,
+                custom_command_prefix: None,
+                received_rich_notification: false,
+                should_auto_toggle_input: false,
+            },
+            ctx,
+        );
+    });
+}
+
+fn is_use_agent_footer_in_blocklist(view: &TerminalView) -> bool {
+    view.model
+        .lock()
+        .block_list()
+        .removable_blocklist_item_position(&RemovableBlocklistItem::RichContent(
+            view.use_agent_footer.id(),
+        ))
+        .is_some()
+}
+
+/// Records `terminal` as the focused terminal, as focusing it in a tab or pane does. Returns
+/// whether that changed the focused terminal.
+fn move_terminal_focus_to(app: &mut App, terminal: &ViewHandle<TerminalView>) -> bool {
+    let terminal = terminal.downgrade();
+    FocusedTerminalInfo::handle(&*app)
+        .update(app, |info, ctx| info.update(terminal, false, false, ctx))
 }
 
 fn transition_to_user_handoff_state(
@@ -527,5 +570,81 @@ fn insert_cli_agent_voice_text_hermes_multiline_uses_bracketed_paste_without_sub
         expected_paste.extend_from_slice(b"line1\nline2");
         expected_paste.extend_from_slice(BRACKETED_PASTE_END);
         assert_eq!(writes[0], expected_paste);
+    })
+}
+
+/// Moving focus to another terminal (switching tabs, panes or windows) makes `AISettings`
+/// re-emit `IsAnyAIEnabled` to every terminal. A terminal whose CLI agent footer is already shown
+/// must leave it in place: re-inserting it scrolled the terminal to the bottom, so the user lost
+/// their place in an agent's output after switching to another tab and back.
+#[test]
+fn cli_agent_footer_keeps_scroll_position_when_focus_moves_to_another_terminal() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let scrolled_position = terminal.update(&mut app, |view, ctx| {
+            {
+                let mut model = view.model.lock();
+                model.simulate_long_running_block("claude", "");
+                model.process_bytes("agent output\r\n".repeat(200).as_str());
+            }
+            start_claude_session(view, ctx);
+            view.maybe_show_use_agent_footer_in_blocklist(ctx);
+            assert!(is_use_agent_footer_in_blocklist(view));
+
+            view.scroll(5.into_lines(), ctx);
+            let position = view.scroll_position();
+            assert!(
+                matches!(position, ScrollPosition::FixedWithinLongRunningBlock { .. }),
+                "scrolling up should fix the position inside the agent's output, got {position:?}",
+            );
+            position
+        });
+
+        // Focus this terminal, then another one, as switching to another tab does.
+        let other_terminal = add_window_with_terminal(&mut app, None);
+        move_terminal_focus_to(&mut app, &terminal);
+        assert!(
+            move_terminal_focus_to(&mut app, &other_terminal),
+            "focus should move to the other terminal",
+        );
+
+        terminal.read(&app, |view, _| {
+            assert_eq!(view.scroll_position(), scrolled_position);
+            assert!(is_use_agent_footer_in_blocklist(view));
+        });
+    })
+}
+
+/// Settings changes still hide and re-show the CLI agent footer; only a footer that stays
+/// visible is left in place.
+#[test]
+fn cli_agent_footer_follows_toolbar_setting() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            simulate_user_started_long_running_command(view);
+            start_claude_session(view, ctx);
+            view.maybe_show_use_agent_footer_in_blocklist(ctx);
+            assert!(is_use_agent_footer_in_blocklist(view));
+        });
+
+        for show_toolbar in [false, true] {
+            AISettings::handle(&app).update(&mut app, |settings, ctx| {
+                let _ = settings
+                    .should_render_cli_agent_footer
+                    .set_value(show_toolbar, ctx);
+            });
+            terminal.read(&app, |view, _| {
+                assert_eq!(
+                    is_use_agent_footer_in_blocklist(view),
+                    show_toolbar,
+                    "footer visibility should follow the toolbar setting",
+                );
+            });
+        }
     })
 }

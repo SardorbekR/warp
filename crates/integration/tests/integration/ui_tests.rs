@@ -89,6 +89,9 @@ integration_tests! {
     #[ignore]
     test_session_navigation_recency_navigate_to_window,
     test_block_based_snackbar_scroll_to_top,
+    test_scroll_position_survives_tab_switch_finished_block,
+    test_scroll_position_survives_tab_switch_running_agent,
+    test_scroll_position_survives_tab_switch_claude_session,
     test_block_based_snackbar_small_window,
     test_block_based_snackbar_appears_for_running_command_input_at_bottom,
     test_block_based_snackbar_not_visible_for_pager_command_input_at_bottom,

@@ -58,6 +58,7 @@ use crate::settings::{
 pub use crate::terminal::CLIAgent;
 use crate::terminal::TerminalModel;
 use crate::terminal::cli_agent_sessions::CLIAgentRichInputCloseReason;
+use crate::terminal::model::blocks::RemovableBlocklistItem;
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
@@ -156,7 +157,7 @@ impl TerminalView {
         ctx.subscribe_to_model(&ai_settings, |me, _, event, ctx| match event {
             AISettingsChangedEvent::IsAnyAIEnabled { .. }
             | AISettingsChangedEvent::ShouldRenderCLIAgentToolbar { .. } => {
-                me.maybe_show_use_agent_footer_in_blocklist(ctx);
+                me.refresh_use_agent_footer_after_settings_change(ctx);
             }
             AISettingsChangedEvent::ShouldRenderUseAgentToolbarForUserCommands { .. } => {
                 // When the setting is re-enabled (e.g. from the AI settings page),
@@ -169,10 +170,10 @@ impl TerminalView {
                         footer.did_user_dismiss = false;
                     });
                 }
-                me.maybe_show_use_agent_footer_in_blocklist(ctx);
+                me.refresh_use_agent_footer_after_settings_change(ctx);
             }
             AISettingsChangedEvent::CLIAgentToolbarEnabledCommands { .. } => {
-                me.maybe_show_use_agent_footer_in_blocklist(ctx);
+                me.refresh_use_agent_footer_after_settings_change(ctx);
             }
             _ => (),
         });
@@ -525,6 +526,38 @@ impl TerminalView {
             },
             ctx
         );
+    }
+
+    /// Re-checks whether the footer should be visible after an AI settings change, leaving a
+    /// footer that is already shown where it is.
+    ///
+    /// `AISettings` re-emits `IsAnyAIEnabled` whenever focus moves to another terminal, so this
+    /// runs in every terminal on each tab, pane or window switch. Re-inserting a footer that is
+    /// already in the blocklist would count as new content and scroll the terminal to the
+    /// bottom, losing the user's scroll position in every terminal that shows the footer. A
+    /// settings change never changes where the footer belongs, so a footer that stays visible is
+    /// kept in place and only re-measured, in case the change affects what it shows.
+    fn refresh_use_agent_footer_after_settings_change(&mut self, ctx: &mut ViewContext<Self>) {
+        let footer_id = self.use_agent_footer.id();
+        let keep_in_place = {
+            let mut model = self.model.lock();
+            let keep_in_place = model
+                .block_list()
+                .removable_blocklist_item_position(&RemovableBlocklistItem::RichContent(footer_id))
+                .is_some()
+                && !model.is_alt_screen_active()
+                && self.should_render_use_agent_footer(&model, ctx);
+            if keep_in_place {
+                model.block_list_mut().mark_rich_content_dirty(footer_id);
+            }
+            keep_in_place
+        };
+
+        if keep_in_place {
+            ctx.notify();
+        } else {
+            self.maybe_show_use_agent_footer_in_blocklist(ctx);
+        }
     }
 
     pub(super) fn maybe_show_use_agent_footer_in_blocklist(&mut self, ctx: &mut ViewContext<Self>) {
