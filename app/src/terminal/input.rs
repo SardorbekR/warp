@@ -13829,7 +13829,7 @@ impl Input {
     /// Withdraws a pending command that hasn't run, so a later prompt doesn't execute whatever
     /// the editor holds by then. Leaves the editor text as is. Returns whether one was pending.
     pub fn cancel_pending_command(&mut self) -> bool {
-        std::mem::take(&mut self.has_pending_command)
+        self.pending_command.take().is_some()
     }
 
     fn should_enter_accept_completion_suggestion(&self, app: &AppContext) -> bool {
