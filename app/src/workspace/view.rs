@@ -22128,7 +22128,54 @@ impl Workspace {
         .finish()
     }
 
+    /// Whether the account button shows the subtle autoupdate dot: an update is ready and it isn't
+    /// a prominent one (those get the pill instead).
+    fn should_show_subtle_update_dot(ctx: &AppContext) -> bool {
+        let autoupdate_stage = autoupdate::get_update_state(ctx);
+        FeatureFlag::AutoupdateUIRevamp.is_enabled()
+            && autoupdate_stage.ready_for_update()
+            && autoupdate_stage
+                .available_new_version()
+                .map(|version| {
+                    !is_incoming_version_past_current(version.last_prominent_update.as_deref())
+                })
+                .unwrap_or(false)
+    }
+
+    /// Fork: a signed-out user's account button is a plain gear drawn like the bar's other icon
+    /// buttons, with their hover, instead of upstream's gear on a disc in the theme's accent,
+    /// which clashed with them. It opens the same menu and shows the same update dot.
+    fn render_signed_out_account_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        let mut button = Self::tab_bar_icon_button(
+            appearance,
+            icons::Icon::Gear,
+            &self.mouse_states.avatar_icon,
+            self.is_user_menu_open,
+        )
+        .build()
+        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::ToggleUserMenu))
+        .finish();
+
+        if Self::should_show_subtle_update_dot(ctx) {
+            button = RedNotificationDot::render_with_offset(
+                button,
+                &RedNotificationDot::default_styles(appearance),
+                (0., 0.),
+            );
+        }
+
+        SavePosition::new(Align::new(button).finish(), USER_AVATAR_BUTTON_POSITION_ID).finish()
+    }
+
     fn render_avatar_button(&self, appearance: &Appearance, ctx: &AppContext) -> Box<dyn Element> {
+        if self.auth_state.is_anonymous_or_logged_out() {
+            return self.render_signed_out_account_button(appearance, ctx);
+        }
+
         let is_anonymous = self.auth_state.is_anonymous_or_logged_out();
         let display_name = self
             .auth_state
@@ -22163,16 +22210,7 @@ impl Workspace {
         );
 
         // Render the subtle autoupdate UI if autoupdate is ready and there is no incoming prominent update version.
-        let autoupdate_stage = autoupdate::get_update_state(ctx);
-        if FeatureFlag::AutoupdateUIRevamp.is_enabled()
-            && autoupdate_stage.ready_for_update()
-            && autoupdate_stage
-                .available_new_version()
-                .map(|version| {
-                    !is_incoming_version_past_current(version.last_prominent_update.as_deref())
-                })
-                .unwrap_or(false)
-        {
+        if Self::should_show_subtle_update_dot(ctx) {
             avatar = avatar.with_status_element(
                 StatusElementTypes::Circle,
                 RedNotificationDot::default_styles(appearance),
@@ -22368,18 +22406,14 @@ impl Workspace {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_tab_bar_icon_button(
-        &self,
+    /// The look of the bar's icon buttons: the icon in the bar's text colors, and the bar's
+    /// hover, pressed and active backgrounds.
+    fn tab_bar_icon_button(
         appearance: &Appearance,
         icon_type: icons::Icon,
         mouse_state_handle: &MouseStateHandle,
-        action: WorkspaceAction,
-        tool_tip_label_text: String,
-        tool_tip_sublabel_text: Option<String>,
         is_active: bool,
-        disable: bool,
-    ) -> Hoverable {
+    ) -> Button {
         let theme = appearance.theme();
         let icon_color = if is_active {
             theme.main_text_color(theme.background())
@@ -22411,6 +22445,24 @@ impl Workspace {
                 ..UiComponentStyles::default()
             });
         }
+        button
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_tab_bar_icon_button(
+        &self,
+        appearance: &Appearance,
+        icon_type: icons::Icon,
+        mouse_state_handle: &MouseStateHandle,
+        action: WorkspaceAction,
+        tool_tip_label_text: String,
+        tool_tip_sublabel_text: Option<String>,
+        is_active: bool,
+        disable: bool,
+    ) -> Hoverable {
+        let theme = appearance.theme();
+        let mut button =
+            Self::tab_bar_icon_button(appearance, icon_type, mouse_state_handle, is_active);
 
         if disable {
             button = button.with_style(UiComponentStyles {

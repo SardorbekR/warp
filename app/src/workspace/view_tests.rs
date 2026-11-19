@@ -583,6 +583,69 @@ fn test_theme_chooser_does_not_suppress_tab_bar_traffic_light_padding() {
     });
 }
 
+/// Fork: a signed-out user's account button is a plain gear drawn like the bar's other icon
+/// buttons, in their icon color, not upstream's gear on a disc in the theme's accent.
+#[test]
+fn signed_out_account_button_is_a_plain_gear_like_the_bar_icon_buttons() {
+    let _avatar_guard = FeatureFlag::AvatarInTabBar.override_enabled(true);
+    let _skip_anon_guard = FeatureFlag::SkipFirebaseAnonymousUser.override_enabled(true);
+
+    // The bundled assets, so that icons are drawn.
+    App::test(crate::ASSETS, |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            let auth_state = AuthStateProvider::as_ref(ctx).get();
+            auth_state.set_user(None);
+            auth_state.set_credentials(None);
+        });
+
+        let workspace = mock_workspace(&mut app);
+        // Unit tests build the scene as soon as a window is invalidated.
+        let window_id = workspace.update(&mut app, |workspace, ctx| {
+            assert!(workspace.auth_state.is_anonymous_or_logged_out());
+            ctx.notify();
+            workspace.window_id
+        });
+
+        let button_bounds = app
+            .read(|ctx| {
+                ctx.element_position_by_id_at_last_frame(window_id, USER_AVATAR_BUTTON_POSITION_ID)
+            })
+            .expect("the account button should be in the tab bar");
+        let (bar_icon_color, accent) = app.read(|ctx| {
+            let theme = Appearance::as_ref(ctx).theme();
+            (
+                theme.sub_text_color(theme.background()).into_solid(),
+                warpui::elements::Fill::from(theme.accent()),
+            )
+        });
+
+        let presenter = app
+            .presenter(window_id)
+            .expect("the window should have rendered");
+        let presenter = presenter.borrow();
+        let scene = presenter.scene().expect("the window should have a scene");
+        let icon_colors: Vec<ColorU> = scene
+            .layers()
+            .flat_map(|layer| layer.icons.iter())
+            .filter(|icon| button_bounds.contains_rect(icon.bounds))
+            .map(|icon| icon.color)
+            .collect();
+        assert_eq!(
+            icon_colors,
+            vec![bar_icon_color],
+            "one gear, in the color of the bar's other icons"
+        );
+        assert!(
+            !scene
+                .layers()
+                .flat_map(|layer| layer.rects.iter())
+                .any(|rect| button_bounds.contains_rect(rect.bounds) && rect.background == accent),
+            "no disc in the theme's accent behind the gear"
+        );
+    });
+}
+
 /// Regression for account-first onboarding users who select Warp Drive and
 /// conversation history, skip signup, and create an account later. The stored
 /// preferences should remain true while unavailable, then take effect
