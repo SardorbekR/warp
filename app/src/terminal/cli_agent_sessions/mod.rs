@@ -520,6 +520,26 @@ impl CLIAgentSession {
         self.status = new_status.clone();
         Some(new_status)
     }
+
+    /// Fork: [`Self::apply_event`] for a client someone sits at, where a `Stop` that reports
+    /// pending background work (a background shell, an idle teammate, a session cron) still ends
+    /// the reply. The agent then waits at its prompt for the user, so the session shows as done.
+    /// [`Self::apply_event`] keeps such a session in progress until a `Stop` without pending
+    /// work, which never comes while a repeating cron or an idle teammate stays attached, so the
+    /// session showed as running forever. A turn that work starts later (a scheduled task's run,
+    /// for one) reports `PromptSubmit` like a typed prompt, which shows it in progress again.
+    /// Only the status changes: the turn stays open as [`Self::apply_event`] left it.
+    fn apply_event_for_user(&mut self, event: &CLIAgentEvent) -> Option<CLIAgentSessionStatus> {
+        let new_status = self.apply_event(event);
+        if new_status.is_some()
+            || event.event != CLIAgentEventType::Stop
+            || !event.payload.has_pending_background_work()
+        {
+            return new_status;
+        }
+        self.status = CLIAgentSessionStatus::Success;
+        Some(CLIAgentSessionStatus::Success)
+    }
 }
 
 /// Events emitted by `CLIAgentSessionsModel` for subscribers (e.g., `AgentNotificationsModel`).
@@ -871,6 +891,13 @@ impl CLIAgentSessionsModel {
             && !AppExecutionMode::as_ref(ctx).is_autonomous()
         {
             None
+        } else if event.event == CLIAgentEventType::Stop
+            && event.payload.has_pending_background_work()
+            && !AppExecutionMode::as_ref(ctx).is_autonomous()
+        {
+            // Fork: unattended runs keep the upstream rule, because the agent SDK driver starts
+            // winding its run down once the session is no longer in progress.
+            session.apply_event_for_user(event)
         } else {
             session.apply_event(event)
         };

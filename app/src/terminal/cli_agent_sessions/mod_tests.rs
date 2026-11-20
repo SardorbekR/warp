@@ -868,6 +868,145 @@ fn stop_with_pending_background_work_keeps_session_in_progress() {
     );
 }
 
+/// A `Stop` from session "main" while an idle teammate and a session cron stay attached.
+fn stop_with_background_work_attached() -> CLIAgentEvent {
+    let body = r#"{"v":1,"agent":"claude","event":"stop","session_id":"main","cwd":"/repo","query":"ship the release","response":"Shipped. I'll check the review status twice a day.","background_task_count":1,"session_cron_count":1}"#;
+    parse_event(Some("warp://cli-agent"), body).unwrap()
+}
+
+#[test]
+fn stop_with_pending_background_work_ends_the_reply_for_a_user() {
+    let mut session = session_mid_turn();
+
+    assert_eq!(
+        session.apply_event_for_user(&stop_with_background_work_attached()),
+        Some(CLIAgentSessionStatus::Success)
+    );
+
+    assert_eq!(session.status, CLIAgentSessionStatus::Success);
+    assert_eq!(
+        session.session_context.response.as_deref(),
+        Some("Shipped. I'll check the review status twice a day.")
+    );
+    // Only the status changes: the turn stays open, as `apply_event` leaves it.
+    assert!(session.session_context.resume_turn_in_progress);
+}
+
+#[test]
+fn scheduled_run_after_a_reply_with_background_work_shows_progress_then_done() {
+    let mut session = session_mid_turn();
+    session.apply_event_for_user(&stop_with_background_work_attached());
+
+    // The cron fires: Claude Code runs the prompt hook for the scheduled prompt too.
+    let scheduled_prompt = session_event(
+        CLIAgentEventType::PromptSubmit,
+        Some("main"),
+        Some("/repo"),
+        CLIAgentEventPayload {
+            query: Some("check the review status".to_owned()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        session.apply_event_for_user(&scheduled_prompt),
+        Some(CLIAgentSessionStatus::InProgress)
+    );
+    assert_eq!(
+        session.apply_event_for_user(&stop_with_background_work_attached()),
+        Some(CLIAgentSessionStatus::Success)
+    );
+}
+
+#[test]
+fn apply_event_for_user_matches_apply_event_for_other_events() {
+    let events = [
+        session_event(
+            CLIAgentEventType::Stop,
+            Some("main"),
+            Some("/repo"),
+            CLIAgentEventPayload {
+                pending_background_work_count: Some(0),
+                ..Default::default()
+            },
+        ),
+        session_event(
+            CLIAgentEventType::Stop,
+            Some("main"),
+            Some("/repo"),
+            CLIAgentEventPayload::default(),
+        ),
+        rich_event(CLIAgentEventType::IdlePrompt),
+        rich_event(CLIAgentEventType::ToolComplete),
+        rich_event(CLIAgentEventType::PermissionRequest),
+        rich_event(CLIAgentEventType::StopFailure),
+        rich_event(CLIAgentEventType::PromptSubmit),
+    ];
+    for event in events {
+        let mut upstream = session_mid_turn();
+        let mut for_user = session_mid_turn();
+
+        assert_eq!(
+            for_user.apply_event_for_user(&event),
+            upstream.apply_event(&event),
+            "{:?}",
+            event.event
+        );
+        assert_eq!(for_user.status, upstream.status, "{:?}", event.event);
+    }
+}
+
+/// Checks the status, and how many status changes were emitted, after a `Stop` with background
+/// work attached reaches a client in `mode`.
+fn assert_after_stop_with_background_work_in_mode(
+    mode: ExecutionMode,
+    expected_status: CLIAgentSessionStatus,
+    expected_status_changes: usize,
+) {
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|ctx| AppExecutionMode::new(mode, false, ctx));
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(view_id, session_mid_turn(), ctx);
+        });
+        let status_changes = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let counter = status_changes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&model, move |_, event, _| {
+                if matches!(event, CLIAgentSessionsModelEvent::StatusChanged { .. }) {
+                    counter.set(counter.get().saturating_add(1));
+                }
+            });
+        });
+
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(view_id, &stop_with_background_work_attached(), ctx);
+        });
+
+        let status = model.read(&app, |m, _| m.session(view_id).map(|s| s.status.clone()));
+        assert_eq!(status, Some(expected_status));
+        assert_eq!(status_changes.get(), expected_status_changes);
+    });
+}
+
+#[test]
+fn stop_with_pending_background_work_shows_done_in_the_desktop_app() {
+    assert_after_stop_with_background_work_in_mode(
+        ExecutionMode::App,
+        CLIAgentSessionStatus::Success,
+        1,
+    );
+}
+
+#[test]
+fn stop_with_pending_background_work_keeps_unattended_runs_in_progress() {
+    assert_after_stop_with_background_work_in_mode(
+        ExecutionMode::Sdk,
+        CLIAgentSessionStatus::InProgress,
+        0,
+    );
+}
+
 #[test]
 fn stop_without_pending_background_work_succeeds() {
     let body = r#"{"v":1,"agent":"claude","event":"stop","background_task_count":0,"session_cron_count":0}"#;
