@@ -12838,7 +12838,11 @@ impl TerminalView {
                     .is_some_and(|workspace| {
                         workspace.as_ref(ctx).is_inline_rename_editor_focused(ctx)
                     });
-                if !inline_rename_editor_is_focused {
+                // Also skipped while the user is typing a command into a new tab's input:
+                // otherwise the keys typed after the shell's startup output appears go to the
+                // shell, which hands them back as typeahead in front of the typed text
+                // ("git p" + "ush" became "ushgit p").
+                if !inline_rename_editor_is_focused && !self.is_typing_in_input(ctx) {
                     self.focus_terminal(ctx);
                 }
             }
@@ -21057,6 +21061,12 @@ impl TerminalView {
         ctx.notify();
     }
 
+    /// Whether the input holds text the user is typing, so shell startup must not move focus
+    /// (and the following keystrokes) to the terminal.
+    fn is_typing_in_input(&self, ctx: &AppContext) -> bool {
+        !self.input.as_ref(ctx).buffer_text(ctx).is_empty()
+    }
+
     fn rerender_rich_content_blocks(&mut self, ctx: &mut ViewContext<Self>) {
         for rich_content in self.rich_content_views.iter() {
             if let Some(ai_metadata) = rich_content.ai_block_metadata() {
@@ -22139,6 +22149,7 @@ impl TerminalView {
             let model = self.model.lock();
             self.is_input_box_visible(&model, ctx)
         };
+        let is_typing_in_input = self.is_typing_in_input(ctx);
         let should_focus_terminal = {
             let semantic_selection = SemanticSelection::as_ref(ctx);
             let model = self.model.lock();
@@ -22151,8 +22162,9 @@ impl TerminalView {
                 // The only case where terminal can take focus _while_ input is visible is
                 // pre-bootstrap, for example when oh-my-zsh prompts you to update -- at this point
                 // the input is visible but you should still be able to click into the block for the
-                // oh-my-zsh prompt and send input directly to the pty.
-                && (!is_input_visible || !has_bootstrapped);
+                // oh-my-zsh prompt and send input directly to the pty. Not while the user is
+                // already typing a command, though: the rest of it would go to the shell.
+                && (!is_input_visible || (!has_bootstrapped && !is_typing_in_input));
 
             let is_shell_mode = !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
             let are_blocks_selected = !self.selected_blocks.is_empty();

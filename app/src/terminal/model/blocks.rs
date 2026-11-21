@@ -3100,6 +3100,11 @@ impl BlockList {
         self.bootstrap_stage = BootstrapStage::Bootstrapped;
     }
 
+    #[cfg(test)]
+    pub fn set_bootstrap_stage_for_test(&mut self, bootstrap_stage: BootstrapStage) {
+        self.bootstrap_stage = bootstrap_stage;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.block_heights().summary().height.as_f64() < f64::EPSILON
     }

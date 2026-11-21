@@ -10971,6 +10971,44 @@ fn visible_bootstrap_block_leaves_focus_on_tab_rename_editor() {
     });
 }
 
+/// A new tab whose shell startup prints output: with an empty input the block still takes
+/// focus (so an rc prompt can be answered), but a command the user is already typing keeps it.
+/// Taking it made the rest of the command go to the shell and come back in front of the typed
+/// text ("git p" + "ush" became "ushgit p").
+#[test]
+fn visible_bootstrap_block_leaves_focus_on_typed_command() {
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let (window, terminal) = workspace.update(&mut app, |workspace, ctx| {
+            let terminal = workspace
+                .active_tab_pane_group()
+                .as_ref(ctx)
+                .active_session_view(ctx)
+                .expect("tab should contain a terminal");
+            (ctx.window_id(), terminal)
+        });
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+
+        input.update(&mut app, |input, ctx| input.focus_input_box(ctx));
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::VisibleBootstrapBlock, ctx);
+        });
+        assert_eq!(app.focused_view_id(window), Some(terminal.id()));
+
+        input.update(&mut app, |input, ctx| {
+            input.focus_input_box(ctx);
+            input.replace_buffer_content("git p", ctx);
+        });
+        let focused_while_typing = app.focused_view_id(window);
+        assert_ne!(focused_while_typing, Some(terminal.id()));
+        terminal.update(&mut app, |view, ctx| {
+            view.handle_terminal_event(&ModelEvent::VisibleBootstrapBlock, ctx);
+        });
+        assert_eq!(app.focused_view_id(window), focused_while_typing);
+    });
+}
+
 #[test]
 fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
     let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);

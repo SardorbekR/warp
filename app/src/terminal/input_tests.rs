@@ -11554,3 +11554,45 @@ mod completion_sources_resolution_tests {
         );
     }
 }
+
+/// A new tab: Enter pressed while the shell is still starting used to be refused, leaving the
+/// command in the input. It must run as soon as the shell is ready instead.
+#[test]
+fn enter_before_shell_is_ready_runs_command_once_ready() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let terminal = add_window_with_bootstrapped_terminal(&mut app, None, None).await;
+        let events = subscribe_to_execute_command_events(&mut app, &terminal);
+        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
+        // The shell is still running its startup files.
+        terminal.update(&mut app, |terminal, _| {
+            terminal
+                .model
+                .lock()
+                .block_list_mut()
+                .set_bootstrap_stage_for_test(
+                    crate::terminal::model::bootstrap::BootstrapStage::ScriptExecution,
+                );
+        });
+
+        input.update(&mut app, |input, ctx| {
+            input.user_insert("git status", ctx);
+            input.input_enter(ctx);
+        });
+        assert!(events.borrow().is_empty());
+        assert!(input.read(&app, |input, _| input.has_pending_command()));
+
+        terminal.update(&mut app, |terminal, _| {
+            terminal.model.lock().block_list_mut().set_bootstrapped();
+        });
+        finish_bootstrap_precmd(&terminal, &mut app);
+
+        assert_eq!(events.borrow().len(), 1);
+        assert_eq!(events.borrow()[0].0, "git status");
+        assert!(matches!(
+            &events.borrow()[0].1,
+            CommandExecutionSource::User
+        ));
+        assert!(!input.read(&app, |input, _| input.has_pending_command()));
+    });
+}
