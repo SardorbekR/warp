@@ -1,0 +1,11 @@
+{
+  "name": "sardor-mods",
+  "owner": { "name": "SardorbekR" },
+  "plugins": [
+    {
+      "name": "queue",
+      "source": "./queue",
+      "description": "Enter while Claude works queues the prompt until Claude finishes; Cmd+Enter sends it now."
+    }
+  ]
+}
