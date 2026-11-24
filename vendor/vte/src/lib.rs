@@ -268,13 +268,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
                 let idx = self.osc_raw.len();
 
-                // Param separator
-                if byte == b';' {
+                // Param separator. Once only the last param slot is left, separators are kept as
+                // data, so the last param holds the rest of the message instead of losing it (an
+                // OSC 777 JSON body can hold any number of semicolons).
+                if byte == b';' && self.osc_num_params < MAX_OSC_PARAMS - 1 {
                     let param_idx = self.osc_num_params;
                     match param_idx {
-                        // Only process up to MAX_OSC_PARAMS
-                        MAX_OSC_PARAMS => return,
-
                         // First param is special - 0 to current byte index
                         0 => {
                             self.osc_params[param_idx] = (0, idx);
@@ -528,6 +527,7 @@ extern crate std;
 mod tests {
     use super::*;
 
+    use std::string::String;
     use std::vec::Vec;
 
     static OSC_BYTES: &[u8] = &[
@@ -680,10 +680,79 @@ mod tests {
         match &dispatcher.dispatched[0] {
             Sequence::Osc(params, _) => {
                 assert_eq!(params.len(), MAX_OSC_PARAMS);
-                assert!(params.iter().all(Vec::is_empty));
+                assert!(params[..MAX_OSC_PARAMS - 1].iter().all(Vec::is_empty));
+                let rest = params::MAX_PARAMS + 1 - (MAX_OSC_PARAMS - 1);
+                assert_eq!(params[MAX_OSC_PARAMS - 1], ";".repeat(rest).into_bytes());
             },
             _ => panic!("expected osc sequence"),
         }
+    }
+
+    fn parse_osc_bytes(input: &[u8]) -> Vec<Vec<u8>> {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        for byte in input {
+            parser.advance(&mut dispatcher, *byte);
+        }
+        assert_eq!(dispatcher.dispatched.len(), 1);
+        match dispatcher.dispatched.pop() {
+            Some(Sequence::Osc(params, true)) => params,
+            other => panic!("expected a bell-terminated osc sequence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn osc_last_param_keeps_the_rest_of_the_message() {
+        let body = (0..40).map(|i| format!("\"k{i}\":\"a;b\"")).collect::<Vec<_>>().join(",");
+        let body = format!("{{{body}}}");
+        assert!(body.matches(';').count() > MAX_OSC_PARAMS);
+        let params =
+            parse_osc_bytes(format!("\x1b]777;notify;warp://cli-agent;{body}\x07").as_bytes());
+
+        assert_eq!(params.len(), MAX_OSC_PARAMS);
+        assert_eq!(params[0], b"777");
+        assert_eq!(params[1], b"notify");
+        assert_eq!(params[2], b"warp://cli-agent");
+        assert_eq!(params[3..].join(&b';'), body.into_bytes());
+    }
+
+    #[test]
+    fn osc_params_below_the_limit_split_as_before() {
+        let fields: Vec<String> = (0..MAX_OSC_PARAMS).map(|i| format!("p{i}")).collect();
+        let params = parse_osc_bytes(format!("\x1b]{}\x07", fields.join(";")).as_bytes());
+        let expected: Vec<Vec<u8>> = fields.iter().map(|f| f.clone().into_bytes()).collect();
+        assert_eq!(params, expected);
+    }
+
+    #[test]
+    fn osc_one_param_over_the_limit_joins_the_last_two() {
+        let fields: Vec<String> = (0..=MAX_OSC_PARAMS).map(|i| format!("p{i}")).collect();
+        let params = parse_osc_bytes(format!("\x1b]{}\x07", fields.join(";")).as_bytes());
+        assert_eq!(params.len(), MAX_OSC_PARAMS);
+        assert_eq!(
+            params[..MAX_OSC_PARAMS - 1],
+            fields[..MAX_OSC_PARAMS - 1].iter().map(|f| f.clone().into_bytes()).collect::<Vec<_>>()
+                [..]
+        );
+        assert_eq!(
+            params[MAX_OSC_PARAMS - 1],
+            format!("p{};p{}", MAX_OSC_PARAMS - 1, MAX_OSC_PARAMS).into_bytes()
+        );
+    }
+
+    #[test]
+    fn osc_params_reset_between_sequences() {
+        let long = format!("\x1b]0;{}\x07", ";".repeat(40));
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        for byte in long.as_bytes().iter().chain(b"\x1b]2;a;b\x07") {
+            parser.advance(&mut dispatcher, *byte);
+        }
+        assert_eq!(dispatcher.dispatched.len(), 2);
+        assert_eq!(
+            dispatcher.dispatched[1],
+            Sequence::Osc(vec![b"2".to_vec(), b"a".to_vec(), b"b".to_vec()], true)
+        );
     }
 
     #[test]

@@ -1273,6 +1273,25 @@ fn parse_osc777_notification_with_semicolons_in_body() {
 }
 
 #[test]
+fn parse_osc777_json_body_with_many_semicolons_arrives_whole() {
+    let summary = (1..=30)
+        .map(|step| format!("step {step}; check it"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        r#"{{"v":1,"agent":"claude","event":"permission_request","session_id":"s1","summary":"{summary}","tool_name":"ExitPlanMode"}}"#
+    );
+    assert!(body.matches(';').count() > 16);
+    let bytes = format!("\x1b]777;notify;warp://cli-agent;{body}\x07");
+    let (_, handler) = parse_bytes(bytes.as_bytes());
+
+    assert_eq!(handler.pluggable_notifications.len(), 1);
+    let (title, received) = &handler.pluggable_notifications[0];
+    assert_eq!(title.as_deref(), Some("warp://cli-agent"));
+    assert_eq!(received, &body);
+}
+
+#[test]
 fn parse_osc777_non_notify_subcommand_ignored() {
     let bytes: &[u8] = b"\x1b]777;other;title;body\x07";
     let (_, handler) = parse_bytes(bytes);

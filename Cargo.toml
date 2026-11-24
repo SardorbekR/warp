@@ -3,6 +3,8 @@ members = [
   "crates/*",
   "app",
 ]
+# Third-party crates patched in this repo (see the [patch] sections) are not workspace members.
+exclude = ["vendor"]
 resolver = "2"
 
 # Include all members except serve-wasm (since it's a helper helper for serving
@@ -582,6 +584,12 @@ tink-hybrid = { git = "https://github.com/warpdotdev/tink-rust", rev = "54b9ac9a
 
 tikv-jemallocator = { git = "https://github.com/warpdotdev/jemallocator.git", rev = "2ee30bfdf7059223b54810e4ea6c666f0a379e0b" }
 tikv-jemalloc-sys = { git = "https://github.com/warpdotdev/jemallocator.git", rev = "2ee30bfdf7059223b54810e4ea6c666f0a379e0b" }
+
+[patch."https://github.com/warpdotdev/vte.git"]
+# warpdotdev/vte at the same rev as above, except that an OSC sequence's last parameter keeps the
+# rest of the sequence after the 16th `;` instead of dropping it, so OSC 777 bodies with many
+# semicolons (agent notifications carrying JSON) arrive whole.
+vte = { path = "vendor/vte" }
 
 [patch."https://github.com/warpdotdev/warp-proto-apis.git"]
 # Uncomment for local development of warp-proto-apis
