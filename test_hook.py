@@ -124,7 +124,6 @@ def boundary_agrees(make):
     fits, over = make(lo), make(lo + 1)
     return run(SHIM, fits) is None and len(run(PLUGIN, over).encode()) > LIMIT and run(SHIM, over) is not None
 chunk = 'Line "quoted" \\ back\\slash\ttab; emoji \U0001F600; done\n'
-chunk = chunk.encode().decode("unicode_escape").encode("latin-1").decode("utf-8")
 def mixed(n): return payload("ExitPlanMode", {"plan": (chunk * 200)[:n], "planFilePath": "/Users/me/.claude/plans/ipad-duo-layout.md"})
 def bash_cmd(n): return payload("Bash", {"command": ("cd ~/x && make test; " * 400)[:n], "description": "Run tests"})
 check("escapes, quotes, emoji: hook agrees with the plugin at the boundary", boundary_agrees(mixed))
@@ -138,6 +137,17 @@ w = payload("Write", {"file_path": "/Users/me/app/Layout.swift", "content": "let
 shim5 = run(SHIM, w); ev5 = shim5 and warposs_event(shim5)
 check("large Write: short copy keeps file_path", bool(ev5) and ev5["tool_input"] == {"file_path": "/Users/me/app/Layout.swift"}, ev5)
 check("large Write: summary names the file", bool(ev5) and ev5["summary"] == "Wants to run Write: /Users/me/app/Layout.swift", ev5)
+
+# 5b. A tool input too big for jq's command line (over 128 KB on Linux, about 1 MB on macOS): the
+# plugin's message comes out with an empty body that WarpOss ignores, so the hook must speak.
+huge = payload("Write", {"file_path": "/Users/me/app/Big.swift", "content": "a" * 2_000_000})
+plug5b, shim5b = run(PLUGIN, huge), run(SHIM, huge)
+check("huge Write: the plugin's message has no body (WarpOss ignores it)",
+      plug5b is None or warposs_event(plug5b) is None, plug5b and len(plug5b))
+ev5b = shim5b and warposs_event(shim5b)
+check("huge Write: hook sends a short copy that WarpOss reads",
+      bool(ev5b) and claude_accepts(shim5b) and ev5b["event"] == "permission_request"
+      and ev5b["tool_input"] == {"file_path": "/Users/me/app/Big.swift"}, ev5b)
 
 # 6. A long Bash command full of semicolons: command cut to 200 chars, semicolons gone.
 b = payload("Bash", {"command": "echo a; " * 600, "description": "loop"})

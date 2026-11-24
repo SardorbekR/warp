@@ -100,8 +100,12 @@ byte_length() {
     printf '%s' "$1" | LC_ALL=C wc -c | tr -d ' '
 }
 
-PLUGIN_SEQUENCE=$(build_sequence "$SUMMARY" "$TOOL_INPUT") || exit 0
-[ "$(byte_length "$PLUGIN_SEQUENCE")" -gt "$LIMIT" ] || exit 0
+# When the rebuild itself fails, the tool input is too big for jq's command line (about 1 MB on
+# macOS, 128 KB per argument on Linux). The plugin passes it the same way, so its message failed
+# too, and the short copy is the only one.
+if PLUGIN_SEQUENCE=$(build_sequence "$SUMMARY" "$TOOL_INPUT"); then
+    [ "$(byte_length "$PLUGIN_SEQUENCE")" -gt "$LIMIT" ] || exit 0
+fi
 
 # The short copy. Semicolons become commas: WarpOss 9.3 and older cut a message with more
 # than 12 of them.
