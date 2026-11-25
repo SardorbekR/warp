@@ -312,7 +312,7 @@ export const register: Register = on => {
           {pause !== null && <Button key="send-next" label="Send next" variant="primary" onPress={sendNext} />}
           {pause !== null && <Button key="clear" label="Clear" onPress={clear} />}
           {pause === null && isWorking && (
-            <Button key="stop-and-send" label="Stop & send 1" variant="primary" onPress={stopAndSend} />
+            <Button key="send-now" label="Send now" variant="primary" onPress={stopAndSend} />
           )}
         </Box>
         {list.map((one, index) => (

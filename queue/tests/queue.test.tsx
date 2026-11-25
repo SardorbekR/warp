@@ -124,3 +124,27 @@ test('/clear carries the held prompts over to the new conversation, paused', asy
   expect(await ui.find({ type: 'Text', text: /kept from before \/clear/ })).toBeDefined()
   await ui.unmount()
 })
+
+test('Send now stops the running turn and sends the first held prompt', async ($, on) => {
+  const entered = engine(on)
+  const aborted: string[] = []
+  on('turn.abort', (_, e) => {
+    aborted.push(e.turnId)
+
+    return { value: undefined }
+  })
+  await $.turn.start({ text: 'working', turnId: 't1' })
+  await $.prompt.submit({ text: 'first', ...typedWhileBusy })
+  await $.prompt.submit({ text: 'second', ...typedWhileBusy })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const sendNow = await ui.find({ type: 'Button', text: 'Send now' })
+  expect(sendNow).toBeDefined()
+  await ui.press({ key: sendNow?.key ?? '' })
+  await ui.unmount()
+  expect(aborted).toEqual(['t1'])
+  expect(entered).toEqual([])
+
+  await $.turn.complete({ turnId: 't1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1, usage: {} } as never)
+  expect(entered).toEqual(['first'])
+})
