@@ -161,9 +161,92 @@ async function afterSwitch($: $, fromId: string, carried: QueuedPrompt[], attemp
   }
 }
 
+// Stops the running turn and sends the first held prompt when it has ended;
+// sends at once when no turn runs.
+async function sendNow($: $, isWorking = true) {
+  await update($, paused, () => null)
+  const turnId = runningTurn
+  if (turnId === null || !isWorking) {
+    await sendFirst($)
+    return
+  }
+  isStopAndSend = true
+  try {
+    await $.turn.abort({ turnId })
+  } catch {
+    isStopAndSend = false
+    await sendFirst($)
+  }
+}
+
+// Moves a held prompt back into the prompt box; the next prompt held from the
+// box goes back to its place. Answers why it could not, or undefined.
+async function editHeld($: $, one: QueuedPrompt): Promise<string | undefined> {
+  const box = await $.prompt.read()
+  if (box.text.trim() !== '') {
+    return 'Empty the prompt box first, then press Edit'
+  }
+  const all = await read($, items)
+  const at = all.findIndex(other => other.id === one.id)
+  if (at < 0) {
+    return undefined
+  }
+  await setItems($, rest => rest.filter(other => other.id !== one.id))
+  editSpot = { afterId: all[at - 1]?.id, beforeId: all[at + 1]?.id }
+  await $.prompt.fill({ text: one.text, mode: 'replace' })
+  return undefined
+}
+
+// "/send-now 2" names held prompt 2; nothing after the name means 1.
+type Picked = { one: QueuedPrompt; error?: undefined } | { one?: undefined; error: string }
+
+function short(text: string) {
+  const line = text.replace(/\s*\n\s*/g, ' ⏎ ')
+  return line.length > 60 ? `${line.slice(0, 59)}…` : line
+}
+
+async function pickHeld($: $, command: string, args: string): Promise<Picked> {
+  const list = await read($, items)
+  const typed = args.trim()
+  if (list.length === 0) {
+    return { error: 'Nothing is queued.' }
+  }
+  if (typed !== '' && !/^[0-9]+$/.test(typed)) {
+    return { error: `Type /${command} for the first held prompt, or /${command} 2 for the second.` }
+  }
+  const index = typed === '' ? 0 : Number(typed) - 1
+  const one = list[index]
+  if (one === undefined) {
+    return { error: `There is no held prompt ${typed}. ${list.length} ${list.length === 1 ? 'is' : 'are'} queued.` }
+  }
+  return { one }
+}
+
+const COMMANDS = [
+  {
+    name: 'send-now',
+    description: 'Stop Claude and send the first held prompt now (or /send-now 2 for the second)',
+    argumentHint: '[number]',
+    immediate: true,
+  },
+  {
+    name: 'edit-queued',
+    description: 'Put the first held prompt back in the prompt box (or /edit-queued 2 for the second)',
+    argumentHint: '[number]',
+    immediate: true,
+  },
+] as const
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    for (const command of COMMANDS) {
+      try {
+        await $.command.register(command)
+      } catch {
+        // The strip's buttons still work without the typed commands.
+      }
+    }
     const now = await $.clock.now()
     const key = await storeKey($)
     for (const other of await $.store.keys()) {
@@ -249,6 +332,35 @@ export const register: Register = on => {
     return changed
   })
 
+  on('command.run', { command: 'send-now' }, async ($, e) => {
+    const picked = await pickHeld($, 'send-now', e.args)
+    if (picked.one === undefined) {
+      return { text: picked.error, isTextDisplayOnly: true }
+    }
+    const one = picked.one
+    await setItems($, list => [one, ...list.filter(other => other.id !== one.id)])
+    // A prompt submitted while this command is still running is refused, so
+    // with no turn to stop, the send waits for the command to finish.
+    if (runningTurn === null) {
+      await update($, paused, () => null)
+      $.clock.after(0, () => sendFirst($))
+    } else {
+      await sendNow($)
+    }
+
+    return { text: `Sending now: ${short(one.text)}`, isTextDisplayOnly: true }
+  })
+
+  on('command.run', { command: 'edit-queued' }, async ($, e) => {
+    const picked = await pickHeld($, 'edit-queued', e.args)
+    if (picked.one === undefined) {
+      return { text: picked.error, isTextDisplayOnly: true }
+    }
+    const why = await editHeld($, picked.one)
+
+    return { text: why ?? 'Back in the prompt box. Enter holds it again in its place.', isTextDisplayOnly: true }
+  })
+
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
       runningTurn = e.turnId
@@ -299,33 +411,12 @@ export const register: Register = on => {
         await sendFirst($)
       }
     }
-    const stopAndSend = async () => {
-      if (isWorking && runningTurn !== null) {
-        isStopAndSend = true
-        try {
-          await $.turn.abort({ turnId: runningTurn })
-        } catch {
-          isStopAndSend = false
-          await sendFirst($)
-        }
-      } else {
-        await sendFirst($)
-      }
-    }
+    const stopAndSend = () => sendNow($, isWorking)
     const edit = async (one: QueuedPrompt) => {
-      const box = await $.prompt.read()
-      if (box.text.trim() !== '') {
-        $.ui.toast('Empty the prompt box first, then press Edit')
-        return
+      const why = await editHeld($, one)
+      if (why !== undefined) {
+        $.ui.toast(why)
       }
-      const all = await read($, items)
-      const at = all.findIndex(other => other.id === one.id)
-      if (at < 0) {
-        return
-      }
-      await setItems($, rest => rest.filter(other => other.id !== one.id))
-      editSpot = { afterId: all[at - 1]?.id, beforeId: all[at + 1]?.id }
-      await $.prompt.fill({ text: one.text, mode: 'replace' })
     }
     const remove = (one: QueuedPrompt) => setItems($, all => all.filter(other => other.id !== one.id))
     const clear = () => setItems($, () => [])

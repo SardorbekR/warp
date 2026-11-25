@@ -195,3 +195,44 @@ test('an edited prompt goes back to its place when held again', async ($, on) =>
   await $.prompt.submit({ text: 'first fixed', ...typedWhileBusy })
   expect(await rows()).toEqual(['third', 'first fixed'])
 })
+
+test('/send-now stops the turn and sends the held prompt it names', async ($, on) => {
+  const entered = engine(on)
+  const aborted: string[] = []
+  on('turn.abort', (_, e) => {
+    aborted.push(e.turnId)
+
+    return { value: undefined }
+  })
+  await $.turn.start({ text: 'working', turnId: 't1' })
+  await $.prompt.submit({ text: 'first', ...typedWhileBusy })
+  await $.prompt.submit({ text: 'second', ...typedWhileBusy })
+
+  expect((await $.command.run({ command: 'send-now', args: '3' } as never)).text).toBe('There is no held prompt 3. 2 are queued.')
+  expect((await $.command.run({ command: 'send-now', args: '2' } as never)).text).toBe('Sending now: second')
+  expect(aborted).toEqual(['t1'])
+
+  await $.turn.complete({ turnId: 't1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1, usage: {} } as never)
+  expect(entered).toEqual(['second'])
+})
+
+test('/edit-queued puts a held prompt back in the box', async ($, on) => {
+  engine(on)
+  const filled: string[] = []
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.fill', (_, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true, text: e.text, cursor: e.text.length }
+  })
+  await $.prompt.submit({ text: 'first', ...typedWhileBusy })
+  await $.prompt.submit({ text: 'second', ...typedWhileBusy })
+
+  expect((await $.command.run({ command: 'edit-queued', args: '2' } as never)).text).toMatch(/Back in the prompt box/)
+  expect(filled).toEqual(['second'])
+  await $.prompt.submit({ text: 'second fixed', ...typedWhileBusy })
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(one => one.text).filter(text => /^(first|second fixed)$/.test(text))
+  await ui.unmount()
+  expect(texts).toEqual(['first', 'second fixed'])
+})

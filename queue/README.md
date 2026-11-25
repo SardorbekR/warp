@@ -29,6 +29,14 @@ Buttons on the strip:
 - **✕**: removes one held prompt.
 - **Send next** and **Clear** appear while the queue is paused.
 
+Typed commands do the same from the prompt box, in any renderer and terminal,
+even while Claude works:
+
+- `/send-now`: what Send now does. `/send-now 2` sends the second held prompt
+  instead (the others keep their order).
+- `/edit-queued`: what Edit does for the first held prompt; `/edit-queued 2`
+  for the second.
+
 To press a button with the keyboard, press Ctrl+X then Tab: the first button is
 highlighted. Tab or the arrow keys move between buttons, Enter presses one, and
 Esc goes back to the prompt box. Typing a digit or a letter never presses one.
