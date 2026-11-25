@@ -22,7 +22,10 @@ Buttons on the strip:
 - **Send now**: stops the current turn, as Esc does, and sends the first held
   prompt.
 - **Edit**: moves a held prompt back into the prompt box (the box must be empty).
-  Press Enter to hold it again or Cmd+Enter to send it now.
+  Press Enter to hold it again in the place it came from, or Cmd+Enter to give
+  it to Claude now. Delete the text to drop it. The next prompt you hold after
+  Edit takes that place, whatever its text; once a prompt from the box is sent
+  any other way, the place is forgotten and new prompts go last.
 - **✕**: removes one held prompt.
 - **Send next** and **Clear** appear while the queue is paused.
 

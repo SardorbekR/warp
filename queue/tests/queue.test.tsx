@@ -148,3 +148,50 @@ test('Send now stops the running turn and sends the first held prompt', async ($
   await $.turn.complete({ turnId: 't1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1, usage: {} } as never)
   expect(entered).toEqual(['first'])
 })
+
+test('an edited prompt goes back to its place when held again', async ($, on) => {
+  const entered = engine(on)
+  const filled: string[] = []
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.fill', (_, e) => {
+    filled.push(e.text)
+
+    return { isFilled: true, text: e.text, cursor: e.text.length }
+  })
+  for (const text of ['first', 'second', 'third']) {
+    await $.prompt.submit({ text, ...typedWhileBusy })
+  }
+
+  const editRow = async (row: number) => {
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    const edit = (await ui.findAll({ type: 'Button', text: 'Edit' }))[row]
+    expect(edit).toBeDefined()
+    await ui.press({ key: edit?.key ?? '' })
+    await ui.unmount()
+  }
+  const prompts = new Set(['first', 'first fixed', 'second', 'second fixed', 'third', 'idle'])
+  const rows = async () => {
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    const texts = (await ui.findAll({ type: 'Text' })).map(one => one.text)
+    await ui.unmount()
+    return texts.filter(text => prompts.has(text))
+  }
+
+  await editRow(0)
+  expect(filled).toEqual(['first'])
+  await $.prompt.submit({ text: 'first fixed', ...typedWhileBusy })
+  expect(await rows()).toEqual(['first fixed', 'second', 'third'])
+
+  // The prompt before it is sent while it is being edited: it goes first.
+  await editRow(1)
+  await $.turn.complete({ turnId: 't1', reason: 'answer', isAborted: false, answer: '', durationMs: 1, usage: {} } as never)
+  expect(entered).toEqual(['first fixed'])
+  await $.prompt.submit({ text: 'second fixed', ...typedWhileBusy })
+  expect(await rows()).toEqual(['second fixed', 'third'])
+
+  // Any other submit from the box forgets the place: a new prompt goes last.
+  await editRow(0)
+  await $.prompt.submit({ text: 'idle', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'first fixed', ...typedWhileBusy })
+  expect(await rows()).toEqual(['third', 'first fixed'])
+})

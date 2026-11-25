@@ -35,6 +35,25 @@ let isStopAndSend = false
 let isSending = false
 let putBack: { text: string; at: number } | null = null
 let counter = 0
+// Where Edit took a prompt from: the next prompt held from the box goes back
+// there. Any other submit from the box forgets it.
+let editSpot: EditSpot | null = null
+
+type EditSpot = { afterId: string | undefined; beforeId: string | undefined }
+
+// After the prompt that stood before it, else before the one that stood after
+// it; with both gone, first if it was first, otherwise last.
+function placeAt(list: QueuedPrompt[], held: QueuedPrompt, spot: EditSpot): QueuedPrompt[] {
+  const after = list.findIndex(one => one.id === spot.afterId)
+  if (after >= 0) {
+    return [...list.slice(0, after + 1), held, ...list.slice(after + 1)]
+  }
+  const before = list.findIndex(one => one.id === spot.beforeId)
+  if (before >= 0) {
+    return [...list.slice(0, before), held, ...list.slice(before)]
+  }
+  return spot.afterId === undefined ? [held, ...list] : [...list, held]
+}
 
 async function storeKey($: $) {
   return `queue:${await $.session.id()}`
@@ -162,6 +181,7 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
+    editSpot = null
     const carried = e.reason === 'clear' ? await read($, items) : []
     const ended = await next(e)
     if (e.reason === 'clear' || e.reason === 'resume') {
@@ -175,6 +195,8 @@ export const register: Register = on => {
     if (e.origin.kind !== 'composer') {
       return next(e)
     }
+    const spot = editSpot
+    editSpot = null
     if (e.turnId === undefined) {
       // Typed while Claude is idle: it goes now, and a queue paused by Esc
       // or an error goes on after it.
@@ -199,7 +221,7 @@ export const register: Register = on => {
     counter += 1
     const held: QueuedPrompt = { id: `${now}-${counter}`, text: e.text }
     try {
-      await update($, items, list => [...list, held])
+      await update($, items, list => (spot === null ? [...list, held] : placeAt(list, held, spot)))
     } catch {
       // Not queued, so it goes to Claude as today rather than being lost.
       return next(e)
@@ -296,7 +318,13 @@ export const register: Register = on => {
         $.ui.toast('Empty the prompt box first, then press Edit')
         return
       }
-      await setItems($, all => all.filter(other => other.id !== one.id))
+      const all = await read($, items)
+      const at = all.findIndex(other => other.id === one.id)
+      if (at < 0) {
+        return
+      }
+      await setItems($, rest => rest.filter(other => other.id !== one.id))
+      editSpot = { afterId: all[at - 1]?.id, beforeId: all[at + 1]?.id }
       await $.prompt.fill({ text: one.text, mode: 'replace' })
     }
     const remove = (one: QueuedPrompt) => setItems($, all => all.filter(other => other.id !== one.id))
