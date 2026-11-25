@@ -19,13 +19,20 @@ working and sends them, one at a time, when Claude finishes.
 
 Buttons on the strip:
 
-- **Send now**: gives Claude the first held prompt without stopping it; Claude
-  reads it at its next step. A plugin cannot add your own message to a running
-  turn, so it goes in as a note that Claude Code labels "Note from the queue
+- **Send now**: gives Claude the first held prompt without stopping it, and
+  Claude gets it exactly once:
+  - while a tool runs, it goes in at once, and Claude reads it as soon as the
+    tool is done;
+  - while Claude is writing or thinking, the row shows `sends after this step`
+    and the prompt waits for that step to end. If Claude then uses a tool, it
+    goes in as above; if that was Claude's last step, it is sent as your own
+    message right after.
+
+  A plugin cannot add your own message to a running turn, so a prompt that
+  goes in mid-turn is a note that Claude Code labels "Note from the queue
   plugin, not from the user"; the note says these are your words, typed while
-  Claude worked. If Claude finishes before reading it, the prompt goes back to
-  the top of the queue and is sent as your own message. While Claude is idle,
-  Send now sends it as your own message at once.
+  Claude worked. Esc keeps a prompt that is still waiting in the queue. While
+  Claude is idle, Send now sends it as your own message at once.
 - **Edit**: moves a held prompt back into the prompt box (the box must be empty).
   Press Cmd+Enter to hold it again in the place it came from, or Enter to give
   it to Claude now. Delete the text to drop it. The next prompt you hold after
