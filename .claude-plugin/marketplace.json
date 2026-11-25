@@ -5,7 +5,7 @@
     {
       "name": "queue",
       "source": "./queue",
-      "description": "Enter while Claude works queues the prompt until Claude finishes; Cmd+Enter sends it now."
+      "description": "Cmd+Enter while Claude works queues the prompt until Claude finishes; Enter sends it now, as always."
     }
   ]
 }

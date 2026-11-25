@@ -16,7 +16,8 @@ const BAND = {
   },
 } as const
 
-const typedWhileBusy = { turnId: 't1', wait: false, origin: { kind: 'composer' } } as const
+// Cmd+Enter (chat:queueSubmit) while Claude works: the prompt the plugin holds.
+const typedWhileBusy = { turnId: 't1', wait: true, origin: { kind: 'composer' } } as const
 
 // Stands for the engine beneath the plugin: records what reaches Claude.
 function engine(on: On) {
@@ -33,12 +34,12 @@ function engine(on: On) {
   return entered
 }
 
-test('Enter while Claude works is held; Cmd+Enter and idle prompts go through', async ($, on) => {
+test('Cmd+Enter while Claude works is held; Enter and idle prompts go through', async ($, on) => {
   const entered = engine(on)
 
   expect(await $.prompt.submit({ text: 'later', ...typedWhileBusy })).toEqual({ drop: 'Queued' })
-  await $.prompt.submit({ text: 'now', turnId: 't1', wait: true, origin: { kind: 'composer' } })
-  await $.prompt.submit({ text: 'idle', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'now', turnId: 't1', wait: false, origin: { kind: 'composer' } })
+  await $.prompt.submit({ text: 'idle', wait: true, origin: { kind: 'composer' } })
   await $.prompt.submit({ text: '/model', ...typedWhileBusy, command: { name: 'model', args: '' } })
   await $.prompt.submit({ text: 'from a schedule', turnId: 't1', wait: false, origin: { kind: 'scheduled-trigger' } })
 
@@ -125,8 +126,9 @@ test('/clear carries the held prompts over to the new conversation, paused', asy
   await ui.unmount()
 })
 
-test('Send now stops the running turn and sends the first held prompt', async ($, on) => {
+test('Send now gives Claude the first held prompt as a note, without stopping it', async ($, on) => {
   const entered = engine(on)
+  const session = mock.session(on)
   const aborted: string[] = []
   on('turn.abort', (_, e) => {
     aborted.push(e.turnId)
@@ -141,11 +143,17 @@ test('Send now stops the running turn and sends the first held prompt', async ($
   const sendNow = await ui.find({ type: 'Button', text: 'Send now' })
   expect(sendNow).toBeDefined()
   await ui.press({ key: sendNow?.key ?? '' })
+  expect(await ui.find({ type: 'Text', text: 'first' })).toBeUndefined()
   await ui.unmount()
-  expect(aborted).toEqual(['t1'])
+  expect(aborted).toEqual([])
   expect(entered).toEqual([])
+  const rows = session.appended()
+  expect(rows.length).toBe(1)
+  expect(JSON.stringify(rows[0]?.message)).toMatch(/they just chose to send it now:\\n\\nfirst/)
 
-  await $.turn.complete({ turnId: 't1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1, usage: {} } as never)
+  // No request took the note before the turn ended: the prompt goes back to
+  // the top and is sent as the person's own.
+  await $.turn.complete({ turnId: 't1', reason: 'answer', isAborted: false, answer: '', durationMs: 1, usage: {} } as never)
   expect(entered).toEqual(['first'])
 })
 
@@ -196,8 +204,9 @@ test('an edited prompt goes back to its place when held again', async ($, on) =>
   expect(await rows()).toEqual(['third', 'first fixed'])
 })
 
-test('/send-now stops the turn and sends the held prompt it names', async ($, on) => {
-  const entered = engine(on)
+test('/send-now gives Claude the held prompt it names, without stopping it', async ($, on) => {
+  engine(on)
+  const session = mock.session(on)
   const aborted: string[] = []
   on('turn.abort', (_, e) => {
     aborted.push(e.turnId)
@@ -209,11 +218,14 @@ test('/send-now stops the turn and sends the held prompt it names', async ($, on
   await $.prompt.submit({ text: 'second', ...typedWhileBusy })
 
   expect((await $.command.run({ command: 'send-now', args: '3' } as never)).text).toBe('There is no held prompt 3. 2 are queued.')
-  expect((await $.command.run({ command: 'send-now', args: '2' } as never)).text).toBe('Sending now: second')
-  expect(aborted).toEqual(['t1'])
+  expect((await $.command.run({ command: 'send-now', args: '2' } as never)).text).toMatch(/without stopping it.*: second$/)
+  expect(aborted).toEqual([])
+  expect(JSON.stringify(session.appended()[0]?.message)).toMatch(/\\n\\nsecond/)
 
-  await $.turn.complete({ turnId: 't1', reason: 'aborted', isAborted: true, answer: '', durationMs: 1, usage: {} } as never)
-  expect(entered).toEqual(['second'])
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const texts = (await ui.findAll({ type: 'Text' })).map(one => one.text).filter(text => /^(first|second)$/.test(text))
+  await ui.unmount()
+  expect(texts).toEqual(['first'])
 })
 
 test('/edit-queued puts a held prompt back in the box', async ($, on) => {

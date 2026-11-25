@@ -1,7 +1,7 @@
 {
   "name": "queue",
   "version": "0.1.0",
-  "description": "Enter while Claude works queues the prompt until Claude finishes; Cmd+Enter (bound to chat:queueSubmit) sends it now.",
+  "description": "Cmd+Enter (bound to chat:queueSubmit) while Claude works queues the prompt until Claude finishes; Enter sends it now, as always.",
   "types": "./types/index.d.ts",
   "author": {
     "name": "SardorbekR"

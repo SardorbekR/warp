@@ -1,28 +1,33 @@
 # queue
 
-A Claude Code plugin that holds the prompts you type while Claude is working and
-sends them, one at a time, when Claude finishes.
+A Claude Code plugin that holds the prompts you choose to queue while Claude is
+working and sends them, one at a time, when Claude finishes.
 
 ## How it works
 
-- **Enter while Claude works**: the prompt is held. A strip above the prompt box
-  shows `Queued N · sends when Claude finishes` with every held prompt.
+- **Cmd+Enter while Claude works**: the prompt is held. A strip above the prompt
+  box shows `Queued N · sends when Claude finishes` with every held prompt. It
+  needs the key binding below.
 - **Claude finishes a turn**: the first held prompt is sent as your own message
   (the transcript marks it "Prompt from the queue plugin"). One prompt per
   finished turn, so each one gets its own answer.
-- **Cmd+Enter while Claude works**: hands the prompt to Claude without stopping
-  it, the way Enter worked before; Claude reads it at its next step. It needs
-  the key binding below.
-- **Enter while Claude is idle**: sends at once, as always.
+- **Enter while Claude works**: goes to Claude as it always does, without
+  stopping it; Claude reads it at its next step.
+- **Enter or Cmd+Enter while Claude is idle**: sends at once.
 - Slash commands, `!` shell commands, prompts with pasted images, and empty
   prompts are never held.
 
 Buttons on the strip:
 
-- **Send now**: stops the current turn, as Esc does, and sends the first held
-  prompt.
+- **Send now**: gives Claude the first held prompt without stopping it; Claude
+  reads it at its next step. A plugin cannot add your own message to a running
+  turn, so it goes in as a note that Claude Code labels "Note from the queue
+  plugin, not from the user"; the note says these are your words, typed while
+  Claude worked. If Claude finishes before reading it, the prompt goes back to
+  the top of the queue and is sent as your own message. While Claude is idle,
+  Send now sends it as your own message at once.
 - **Edit**: moves a held prompt back into the prompt box (the box must be empty).
-  Press Enter to hold it again in the place it came from, or Cmd+Enter to give
+  Press Cmd+Enter to hold it again in the place it came from, or Enter to give
   it to Claude now. Delete the text to drop it. The next prompt you hold after
   Edit takes that place, whatever its text; once a prompt from the box is sent
   any other way, the place is forgotten and new prompts go last.
@@ -54,16 +59,13 @@ paused by Esc or an error.
 ## Limits
 
 - A held prompt is sent as plain text: `@file` mentions are not expanded.
-- There is no "send this held prompt into the running turn" button. Use Edit and
-  then Cmd+Enter, or Send now.
-- Claude's own send-now keys (Ctrl+Enter, Ctrl+X Ctrl+S) are held like Enter when
-  the box has text, because a plugin cannot tell them apart. To stop Claude and
-  send what you typed, press Esc, then Enter.
+- Claude's own Ctrl+X Enter (its default key for chat:queueSubmit) holds a
+  prompt too, like Cmd+Enter.
 - It covers Claude Code only. Codex has its own queue (Tab).
 
 ## Key binding
 
-Add this to `~/.claude/keybindings.json` so Cmd+Enter sends now:
+Add this to `~/.claude/keybindings.json` so Cmd+Enter holds the prompt:
 
 ```json
 {
@@ -81,6 +83,6 @@ claude plugin install queue@sardor-mods
 ```
 
 New sessions load it on start. A session that was already running loads it after
-you type `/reload-plugins` in it.
+you type `/reload-plugins` in it, best while Claude is idle.
 
 Remove it with `claude plugin uninstall queue@sardor-mods`.

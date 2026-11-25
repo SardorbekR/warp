@@ -3,9 +3,10 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { QueuedPrompt, QueuePause } from '../types'
 
-// Enter while Claude works holds the prompt here; it is sent as the person's
-// own words when the turn ends. Cmd+Enter is bound to chat:queueSubmit, which
-// arrives with `wait` set and goes straight to Claude as today.
+// Cmd+Enter while Claude works holds the prompt here: it is bound to
+// chat:queueSubmit, which arrives with `wait` set, and the prompt is sent as
+// the person's own words when the turn ends. Enter goes to Claude as it always
+// does: into the running turn, read at Claude's next step.
 
 type $ = EngineInterface
 
@@ -31,7 +32,6 @@ type Saved = { savedAt: number; items: QueuedPrompt[] }
 
 // Module values start over at a reload; the queue itself lives in $.state.
 let runningTurn: string | null = null
-let isStopAndSend = false
 let isSending = false
 let putBack: { text: string; at: number } | null = null
 let counter = 0
@@ -161,22 +161,50 @@ async function afterSwitch($: $, fromId: string, carried: QueuedPrompt[], attemp
   }
 }
 
-// Stops the running turn and sends the first held prompt when it has ended;
-// sends at once when no turn runs.
-async function sendNow($: $, isWorking = true) {
-  await update($, paused, () => null)
+// A held prompt sent while Claude works goes in as a note the model reads at
+// its next request, without stopping the turn. A plugin has no way to add the
+// person's own message to a running turn, so Claude Code labels the note as the
+// plugin's ("not from the user"); the text says whose words they are.
+const NOTE_INTRO =
+  'The person typed the message below while you were working. It waited in their queue, and they just chose to send it now:'
+
+// The note sent during the running turn, until a model request carries it.
+let note: { turnId: string; one: QueuedPrompt; isCarried: boolean } | null = null
+
+// Takes the prompt off the list and adds it to the running turn as a note.
+// Answers why it could not, or undefined.
+async function sendAsNote($: $, one: QueuedPrompt, turnId: string): Promise<string | undefined> {
+  await setItems($, list => list.filter(other => other.id !== one.id))
+  try {
+    const appended = await $.session.append({
+      message: { type: 'user', content: [{ type: 'text', text: `${NOTE_INTRO}\n\n${one.text}` }] },
+    })
+    if (appended.deny !== undefined) {
+      throw new Error(appended.deny)
+    }
+  } catch {
+    await update($, items, list => [one, ...list.filter(other => other.id !== one.id)])
+    await persist($)
+    return "Couldn't hand it to Claude now; it is back at the top of the queue."
+  }
+  note = { turnId, one, isCarried: false }
+  return undefined
+}
+
+// Sends the first held prompt: into the running turn as a note, or as the
+// person's prompt when Claude is idle.
+async function sendNow($: $, isWorking = true): Promise<string | undefined> {
+  const first = (await read($, items))[0]
+  if (first === undefined) {
+    return undefined
+  }
   const turnId = runningTurn
   if (turnId === null || !isWorking) {
+    await update($, paused, () => null)
     await sendFirst($)
-    return
+    return undefined
   }
-  isStopAndSend = true
-  try {
-    await $.turn.abort({ turnId })
-  } catch {
-    isStopAndSend = false
-    await sendFirst($)
-  }
+  return sendAsNote($, first, turnId)
 }
 
 // Moves a held prompt back into the prompt box; the next prompt held from the
@@ -225,7 +253,7 @@ async function pickHeld($: $, command: string, args: string): Promise<Picked> {
 const COMMANDS = [
   {
     name: 'send-now',
-    description: 'Stop Claude and send the first held prompt now (or /send-now 2 for the second)',
+    description: 'Give Claude the first held prompt now, without stopping it (or /send-now 2 for the second)',
     argumentHint: '[number]',
     immediate: true,
   },
@@ -265,6 +293,7 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     editSpot = null
+    note = null
     const carried = e.reason === 'clear' ? await read($, items) : []
     const ended = await next(e)
     if (e.reason === 'clear' || e.reason === 'resume') {
@@ -290,7 +319,7 @@ export const register: Register = on => {
       return next(e)
     }
     const isPlainText =
-      !e.wait &&
+      e.wait &&
       e.command === undefined &&
       e.isMeta === undefined &&
       (e.attachments?.length ?? 0) === 0 &&
@@ -338,15 +367,18 @@ export const register: Register = on => {
       return { text: picked.error, isTextDisplayOnly: true }
     }
     const one = picked.one
-    await setItems($, list => [one, ...list.filter(other => other.id !== one.id)])
-    // A prompt submitted while this command is still running is refused, so
-    // with no turn to stop, the send waits for the command to finish.
-    if (runningTurn === null) {
-      await update($, paused, () => null)
-      $.clock.after(0, () => sendFirst($))
-    } else {
-      await sendNow($)
+    const turnId = runningTurn
+    if (turnId !== null) {
+      const why = await sendAsNote($, one, turnId)
+      const sent = `Given to Claude without stopping it; it reads it at its next step: ${short(one.text)}`
+
+      return { text: why ?? sent, isTextDisplayOnly: true }
     }
+    // Claude is idle: it goes as the person's prompt. A prompt submitted while
+    // this command is still running is refused, so it waits for the command.
+    await setItems($, list => [one, ...list.filter(other => other.id !== one.id)])
+    await update($, paused, () => null)
+    $.clock.after(0, () => sendFirst($))
 
     return { text: `Sending now: ${short(one.text)}`, isTextDisplayOnly: true }
   })
@@ -358,7 +390,18 @@ export const register: Register = on => {
     }
     const why = await editHeld($, picked.one)
 
-    return { text: why ?? 'Back in the prompt box. Enter holds it again in its place.', isTextDisplayOnly: true }
+    const back = 'Back in the prompt box. Cmd+Enter holds it again in its place; Enter gives it to Claude now.'
+
+    return { text: why ?? back, isTextDisplayOnly: true }
+  })
+
+  // A request made after the note was added carries it to the model.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined && note !== null && note.turnId === e.turnId) {
+      note.isCarried = true
+    }
+
+    return yield* next(e)
   })
 
   on('turn.start', async ($, e, next) => {
@@ -375,13 +418,15 @@ export const register: Register = on => {
       return completed
     }
     runningTurn = null
-    const list = await read($, items)
-    if (isStopAndSend) {
-      isStopAndSend = false
-      await update($, paused, () => null)
-      await sendFirst($)
-      return completed
+    const sent = note
+    note = null
+    if (sent !== null && !sent.isCarried) {
+      // The turn ended before another request took the note, so the prompt goes
+      // back to the top and is sent as the person's own when the queue goes on.
+      await update($, items, list => [sent.one, ...list.filter(other => other.id !== sent.one.id)])
+      await persist($)
     }
+    const list = await read($, items)
     if (list.length === 0) {
       return completed
     }
@@ -411,7 +456,10 @@ export const register: Register = on => {
         await sendFirst($)
       }
     }
-    const stopAndSend = () => sendNow($, isWorking)
+    const sendNowPressed = async () => {
+      const why = await sendNow($, isWorking)
+      $.ui.toast(why ?? (isWorking ? 'Given to Claude; it reads it at its next step' : 'Sent'))
+    }
     const edit = async (one: QueuedPrompt) => {
       const why = await editHeld($, one)
       if (why !== undefined) {
@@ -431,7 +479,7 @@ export const register: Register = on => {
           {pause !== null && <Button key="send-next" label="Send next" variant="primary" onPress={sendNext} />}
           {pause !== null && <Button key="clear" label="Clear" onPress={clear} />}
           {pause === null && isWorking && (
-            <Button key="send-now" label="Send now" variant="primary" onPress={stopAndSend} />
+            <Button key="send-now" label="Send now" variant="primary" onPress={sendNowPressed} />
           )}
         </Box>
         {list.map((one, index) => (
