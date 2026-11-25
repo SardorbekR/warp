@@ -13826,6 +13826,27 @@ impl Input {
         });
     }
 
+    /// Enter pressed while a new tab's shell is still starting used to be refused (the text
+    /// just sat there). Queue the command instead; `execute_pending_command` runs it once the
+    /// bootstrap precmd lands. Never replaces an already-pending command (e.g. a queued agent
+    /// resume). Returns whether the command was queued.
+    fn queue_command_until_shell_ready(&mut self, command: &str) -> bool {
+        if command.trim().is_empty() || self.pending_command.is_some() {
+            return false;
+        }
+        {
+            let model = self.model.lock();
+            if model.block_list().is_bootstrapping_precmd_done()
+                || model.shared_session_status().is_viewer()
+            {
+                return false;
+            }
+        }
+        log::info!("Queued a command submitted before the shell was ready");
+        self.pending_command = Some(PendingCommand::Exact(command.to_owned()));
+        true
+    }
+
     /// Withdraws a pending command that hasn't run, so a later prompt doesn't execute whatever
     /// the editor holds by then. Leaves the editor text as is. Returns whether one was pending.
     pub fn cancel_pending_command(&mut self) -> bool {
@@ -14313,6 +14334,9 @@ impl Input {
             }
 
             let command = self.get_command(ctx);
+            if self.queue_command_until_shell_ready(&command) {
+                return;
+            }
             if !self.try_execute_command(&command, ctx) {
                 return;
             }
